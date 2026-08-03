@@ -1,6 +1,7 @@
 # smolbox — Implementation Plan
 
-> Status: M0 (scaffolding), M1 (wasm build), and M2 (guest agent + session + CLI) complete. M3 is next.
+> Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), and M3 (read-only host
+> mount under wazero + shared conformance table) complete. M4 is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -60,6 +61,21 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
   the process group (exit 137) with no orphan/zombie, 1 MiB stdout intact, `Truncated` past
   `MaxOutput`, a >4096-byte command round-trip (ICANON guard), stateful cwd, and the `/mnt/host`
   mount read through the agent. Each test boots its own VM; the suite runs in ~76 s.
+
+### Measured at M3 (2026-08-03, this machine)
+
+- **Conformance table (`tests/conformance/cases.json`) landed: 14 cases, 14/14 green.**
+  `make test-conformance` (wazero driver, one fresh VM boot per case) runs in **~103 s** for the
+  whole table. The 10-test M2 matrix moved into the table as the shared declarative source of truth;
+  `tests/integration` is now session-lifecycle only (boot budget/caps, `Close`), ~12 s.
+- The full mount suite is exercised end to end: `cat` of the fixture file, nested subdirectory,
+  `ls -1 /mnt/host` matches the fixture tree, symlink read (`link.txt → hello.txt`), a write
+  rejected with `rc=1` / `can't create ...: Invalid argument` at the host boundary, and the `../`
+  escape case — **`cat /mnt/host/../secret.txt` fails with "No such file or directory" and never
+  exposes the sentinel** (`testdata/secret.txt`, a file sitting next to the mounted dir).
+- **Traversal finding (§2.11.10):** the guest kernel resolves `..` above the `/mnt/host` bind mount
+  inside the guest before any 9p request reaches wazero, so wazero's `WithReadOnlyDirMount` `../`
+  caveat is neutralised in practice — the black-box case holds without guest-side sanitisation.
 
 ---
 
@@ -296,6 +312,12 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
 9. **execve env duplicates resolve to the child libc's first match.** Appending `Request.Env` entries
    to a base env list does not override — the base value wins. The agent strips overridden keys from
    the base before appending (§4.2).
+10. **Guest `..` above the mount root never reaches wazero.** Verified at M3: the guest kernel
+    resolves `..` relative to the `/mnt/host` bind mount inside the guest's own VFS, so a
+    `cat /mnt/host/../secret.txt` yields "No such file or directory" inside the guest — the host
+    file next to the mounted dir stays invisible. wazero's `WithReadOnlyDirMount` `../`-traversal
+    caveat (§2.2) is neutralised by the guest kernel, not by wazero; keep the black-box traversal
+    case in `tests/conformance/cases.json` as the regression guard if the emulator ever changes.
 
 ---
 
@@ -552,7 +574,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `test-integration` | `go test -tags integration ./tests/integration/...`; requires `dist/smolbox.wasm` |
 | `test-web` | `bun test` unit tests for the TS bridge |
 | `test-e2e` | Playwright against `make serve` |
-| `test-conformance` | drives `tests/conformance/cases.json` through both the Go and browser sessions |
+| `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver (browser driver at M5) |
 | `lint` | `golangci-lint run` + `tsc --noEmit` |
 | `clean` | remove `dist bin web/dist` |
 | `all` | `build wasm web` |
@@ -568,7 +590,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | M0 | Go module, layout, Makefile skeleton, CI | `make lint test` green — **done** |
 | M1 | `vm/Dockerfile`, `build/Dockerfile.c2w`, `make wasm` | `dist/smolbox.wasm` exists; raw wazero runs `echo hello`; **artifact size and boot time measured and recorded in this file** — **done** (§1) |
 | M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green | **done** (§1) |
-| M3 | Read-only host mount under wazero | mount cases in the conformance table green |
+| M3 | Read-only host mount under wazero + shared conformance table + Go driver | mount cases in the conformance table green — **done** (§1) |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go |
 | M6 | `make wasm-js` emscripten target | boots in browser; documented as no-mount |
@@ -579,8 +601,12 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 ## 7. Verification
 
 **Shared conformance table (`tests/conformance/cases.json`)** is the core of the strategy: one
-declarative list of `{name, request, expect}` cases, executed by a Go driver against wazero and by a
-Playwright driver against the browser. Behaviour cannot silently diverge between runtimes.
+declarative list of `{name, steps[{request, expect}]}` cases, executed by a Go driver against wazero
+(`tests/conformance`, **M3 done**) and later by a Playwright driver against the browser (M5).
+`expect` is a partial `protocol.Response` matcher (`exit_code`, exact `stdout`/`stderr`,
+`stdout_contains`/`stdout_not_contains`/`stderr_contains`, `stdout_len`, `timed_out`, `truncated`);
+each case boots a fresh session and its steps run in order. Behaviour cannot silently diverge
+between runtimes — the browser driver must run this **same** file.
 
 Cases:
 
@@ -598,8 +624,10 @@ Cases:
   `../` escape above the mount root fails
 
 **Go unit tests** (no Docker): `internal/protocol` framing round-trips — lines missing the prefix,
-interleaved kernel noise, reads split across buffer boundaries, oversized frames.
-`internal/hostfs` provider conformance.
+interleaved kernel noise, reads split across buffer boundaries, oversized frames. The read-only
+provider boundary (`internal/hostfs` is a plain `Mount` struct; wazero's `ReadOnlyDirMount` is the
+implementation) is covered end-to-end by the mount cases in the conformance table rather than a
+standalone unit test.
 
 **TS unit tests** (`bun test`): SAB encode/decode; `HostDirFd` against a fake synchronous backend,
 asserting every write op returns `ERRNO_ROFS`; chunked reads of a file larger than the payload
@@ -608,8 +636,8 @@ window; cache invalidation on `remount()`.
 **Manual smoke:** `make wasm web serve`, open the page, pick a folder, `ls -la /mnt/host`.
 
 **CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`); `make wasm` +
-integration + e2e on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed on the hashes of
-`vm/Dockerfile`, `guest/`, and the c2w version.
+integration + conformance on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed on the
+hashes of `vm/Dockerfile`, `guest/`, and the c2w version.
 
 ---
 

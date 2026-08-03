@@ -69,7 +69,8 @@ test-e2e:
 	@echo "note: Playwright e2e lands in M4/M5; requires 'make serve' running"
 
 test-conformance:
-	@echo "note: shared conformance table lands in M3/M5"
+	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first (M1)" >&2; exit 1; }
+	go test -tags integration ./tests/conformance/...
 
 lint:
 	golangci-lint run

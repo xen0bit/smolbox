@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -63,3 +64,6 @@ jobs:
 
       - name: Integration tests
         run: make test-integration
+
+      - name: Conformance table (wazero driver)
+        run: make test-conformance

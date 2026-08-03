@@ -4,10 +4,11 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: M2 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
+> **Status: M3 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
 > guest agent's ready banner under wazero in ~3.2 s, with the read-only host mount working. The
-> `smolbox` CLI (`exec`/`repl`) drives it over the framed protocol. The browser runtime is the next
-> milestone. See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
+> `smolbox` CLI (`exec`/`repl`) drives it over the framed protocol, and a shared conformance table
+> (`tests/conformance/cases.json`) pins the behaviour. The browser runtime is the next milestone.
+> See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
 
 ---
 
