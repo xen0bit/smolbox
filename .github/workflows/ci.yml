@@ -39,3 +39,25 @@ jobs:
 
       - name: Unit tests
         run: make test
+
+  wasm-integration:
+    name: wasm build + integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.3"
+
+      - name: Cache dist/smolbox.wasm
+        uses: actions/cache@v4
+        with:
+          path: dist/smolbox.wasm
+          key: smolbox-wasm-${{ hashFiles('vm/Dockerfile', 'guest/**', 'build/Dockerfile.c2w', 'go.mod', 'go.sum') }}
+
+      - name: Build wasm
+        run: make wasm
+
+      - name: Integration tests
+        run: make test-integration

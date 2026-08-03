@@ -1,6 +1,6 @@
 # smolbox — Implementation Plan
 
-> Status: planning complete, implementation not started.
+> Status: M0 (scaffolding) and M1 (wasm build) complete. M2 is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -37,6 +37,17 @@ Web tooling runs on **bun**, not npm/Node: `bun install` (deps → `bun.lock`), 
 `bun test` (TS unit tests), `bunx --bun tsc --noEmit` (typecheck), and `web/serve.ts` (`Bun.serve`
 dev server with COOP/COEP headers). The only remaining Node dependency is Playwright's own test
 runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern Node for e2e only.
+
+### Measured at M1 (2026-08-03, this machine)
+
+- **Artifact:** `dist/smolbox.wasm` = **112 852 843 bytes** (107.6 MiB). Bochs + pre-booted kernel +
+  rootfs.bin + boot.iso, embedded. Below the ~130 MiB limit seen for full-featured images; no
+  `--external-bundle` needed.
+- **Boot → shell ready:** **~2.5–2.7 s** under wazero (`go test -tags integration`), on the same
+  machine. The wizer pre-boot does its job — nothing like the 16 s riscv64 datapoint (§2.8).
+- **`make wasm` wall time:** ~5–6 min cold (everything compiled from source in BuildKit); nearly
+  free after caching. CI caches `dist/smolbox.wasm` (§7).
+- `smolbox exec`/`repl` are M2; today's driver is the integration harness (`tests/integration`).
 
 ---
 
@@ -220,12 +231,48 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
 
 ### 2.10 Open questions to resolve during implementation
 
-- Exact semantics of c2w's `--dockerfile` and `--assets` flags (conversion-time customisation vs.
-  source image). Not needed for the happy path — we build the guest image ourselves and pass a tag.
+- Exact semantics of c2w's `--dockerfile` and `--assets` flags. **Resolved at M1:** `--assets <dir>`
+  passes a named build context `assets=<dir>`; when the embedded Dockerfile declares a stage with
+  the same name, the named context **shadows it** (verified with a minimal Dockerfile), so the broken
+  `assets-base` clone is skipped entirely.
 - Whether c2w resolves a locally-built image tag from the host Docker image store without a registry
-  push. Upstream integration tests build local images and convert them, so this is expected to work;
-  confirm at M1.
-- Actual artifact size for minimal Alpine, and whether `--external-bundle` becomes necessary.
+  push. **Confirmed at M1:** `c2w smolbox/vm:dev …` reads the locally-built tag straight from the
+  daemon store. No push needed.
+- Actual artifact size for minimal Alpine. **Measured at M1:** 107.6 MiB; `--external-bundle` not
+  needed (§1).
+
+### 2.11 Gotchas discovered at M1 (recorded so M2+ does not re-derive them)
+
+1. **c2w v0.8.4's embedded Dockerfile is broken without `--assets`.** Its `assets-base` stage runs
+   `git clone -b v0.8.4 https://github.com/ktock/container2wasm`, but that branch does not exist
+   (repo has no tags). Workaround: bake a pinned `container2wasm/container2wasm@v0.8.4` checkout
+   into the builder image at `/assets` and pass `--assets /assets` (§4.1). The org moved to
+   `container2wasm/` after v0.8.4; only `SOURCE_REPO` differs on `main`, no tool versions changed.
+2. **The emulator exits with code 1 the instant the guest reads stdin and hits EOF.**
+   `bochs/wasm.cc` → `console_read_stdin()`:
+   ```c
+   ret = read(s->stdin_fd, buf, len);
+   if (ret < 0) return 0;      /* EAGAIN: safe, guest keeps waiting */
+   if (ret == 0) exit(1);      /* EOF: whole VM dies */
+   ```
+   Every harness — wazero and wasmtime — must keep stdin **open for the VM's lifetime** (a pipe that
+   is never closed; nonblocking reads return `EAGAIN`, which is the safe path). Closing stdin kills
+   the VM with exit 1, which wasted an entire debug session masquerading as "the module is broken".
+   The in-memory `io.Pipe` reader does not work under wazero's nonblocking path; use a real
+   `os.Pipe()` read end (`WithStdin(*os.File)`), matching the upstream harness.
+3. **The host mapdir reaches the guest via a `m:` line in the virtual `info` file.** The emulator
+   (`write_preopen_info`) emits `m: <guestpath>` for every WASI preopen except `pack`/root; the guest
+   init's `parseInfo` turns each into a bind mount of `/mnt/wasi0/<path>` at `<path>`. So
+   `WithReadOnlyDirMount(host, "/mnt/host")` is exactly the right API, and writes fail (the guest
+   shell reports `can't create …: Invalid argument`) because wazero's `ReadFS` rejects them — the
+   read-only boundary holds at the host FS layer as designed.
+4. **The `=\n` "handshake" is not a runtime concern.** At runtime the emulator serves the first
+   post-boot reads from a hardcoded `"=\n"` buffer (`init_done_str`), so no host cooperation is
+   needed; stdin is only consumed by actual guest input afterwards.
+5. **wazero v1.12+ requires go ≥ 1.25.** smolbox pins wazero **v1.11.0** to stay on the pinned
+   `go 1.24.3` toolchain.
+6. **`go mod tidy` drops the `integration`-tagged dependency** if run before `tests/integration`
+   exists; keep the file present when adding deps used only behind the tag.
 
 ---
 
@@ -304,16 +351,21 @@ Tagged `smolbox/vm:dev`.
 - `ENTRYPOINT ["/usr/local/bin/c2w"]`.
 
 Run with the host Docker socket mounted, because c2w drives BuildKit through the host daemon and
-reads the source image from its image store:
+reads the source image from its image store. The `--assets /assets` flag is a **required workaround**
+(§2.11.1): it shadows the broken `assets-base` stage in c2w's embedded Dockerfile.
 
 ```
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v $(PWD)/dist:/out \
-  smolbox/c2w-builder:dev smolbox/vm:dev /out/smolbox.wasm
+  smolbox/c2w-builder:dev --assets /assets smolbox/vm:dev /out/smolbox.wasm
 ```
 
 This is why `make wasm` depends on `make vm-image` — the tag must already exist locally.
+
+> **M1 guest entrypoint.** The guest image currently runs `ENTRYPOINT ["/bin/sh"]`, so the converted
+> module is an interactive shell — the fastest thing to drive from a raw wazero harness. M2 swaps the
+> entrypoint to `/sbin/smolagentd` once the agent speaks the framed protocol.
 
 ### 4.2 Guest agent and the exec protocol
 
@@ -476,8 +528,8 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 
 | # | Deliverable | Done when |
 |---|---|---|
-| M0 | Go module, layout, Makefile skeleton, CI | `make lint test` green |
-| M1 | `vm/Dockerfile`, `build/Dockerfile.c2w`, `make wasm` | `dist/smolbox.wasm` exists; raw wazero runs `echo hello`; **artifact size and boot time measured and recorded in this file** |
+| M0 | Go module, layout, Makefile skeleton, CI | `make lint test` green — **done** |
+| M1 | `vm/Dockerfile`, `build/Dockerfile.c2w`, `make wasm` | `dist/smolbox.wasm` exists; raw wazero runs `echo hello`; **artifact size and boot time measured and recorded in this file** — **done** (§1) |
 | M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green |
 | M3 | Read-only host mount under wazero | mount cases in the conformance table green |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` |
@@ -526,18 +578,18 @@ integration + e2e on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed 
 
 ## 8. Risks and mitigations
 
-1. **Boot latency.** Bochs interprets x86 inside wasm; the only public datapoint is ~16 s for a
-   hello-world on a weak device (§2.8), boot-dominated. The persistent session confines this to a
-   one-time cost — which is exactly why the stateful design was chosen. M1 records a real number.
-   If intolerable, `--target-arch riscv64` (TinyEMU) is the escape hatch, at the cost of the x86_64
-   requirement.
+1. **Boot latency.** The only public datapoint (~16 s hello-world, riscv64, §2.8) badly oversold the
+   fear. Measured **~2.5–2.7 s** to a shell under wazero on x86_64 (M1, §1), boot-dominated and paid
+   once thanks to the persistent-session design. If it ever becomes a problem, `--target-arch riscv64`
+   (TinyEMU) is the escape hatch, at the cost of the x86_64 requirement.
 2. **Browser WASI mapdir is unproven upstream.** No upstream test covers a host-directory mount in
    the browser (§2.3); the `/.wasmenv` `certDir` precedent shows the mechanism works (§2.4).
    **Mitigation: M4 opens by spiking a hardcoded in-memory `PreopenDirectory` at `/mnt/host` and
    confirming the guest sees it, before any bridge code is written.** Everything downstream depends
    on this, so it must be the first browser task.
-3. **Wasm artifact size.** Bochs + kernel + Alpine rootfs is large. Measure at M1; if delivery is
-   painful, `c2w --external-bundle` mounts the image at runtime instead of embedding it.
+3. **Wasm artifact size.** **Measured 107.6 MiB for minimal Alpine + BusyBox tooling** (§1). Under the
+   pain threshold; if delivery ever hurts, `c2w --external-bundle` mounts the image at runtime
+   instead of embedding it.
 4. **COOP/COEP required.** Non-negotiable for `SharedArrayBuffer`. `make serve` sets the headers;
    deployment docs must call it out; the page detects `crossOriginIsolated === false` and fails
    clearly.
@@ -546,3 +598,9 @@ integration + e2e on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed 
 6. **c2w needs the host Docker socket** (§4.1). Documented in the Makefile and README.
 7. **Node 18 is EOL — and unused.** All web tooling runs on bun. Playwright's runner at M4 is the
    only Node dependency; verify `bunx playwright` under bun, else pin a modern Node for e2e only.
+8. **stdin EOF kills the VM.** The emulator exits 1 on any guest stdin read returning EOF
+   (§2.11.2). Every host harness must keep stdin open for the VM's lifetime. This is why the session
+   owns a persistent `os.Pipe`.
+9. **c2w's embedded Dockerfile needs the `--assets` workaround** (§2.11.1, §4.1). The builder image
+   bakes the pinned `container2wasm@v0.8.4` checkout and every `make wasm`/`wasm-js` passes
+   `--assets /assets`.

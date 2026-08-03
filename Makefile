@@ -32,14 +32,14 @@ wasm: vm-image builder-image
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
-		$(C2W_IMAGE) $(VM_IMAGE) /out/smolbox.wasm
+		$(C2W_IMAGE) --assets /assets $(VM_IMAGE) /out/smolbox.wasm
 
 wasm-js: vm-image builder-image
 	@echo "note: the emscripten --to-js target is M6 and has no host-mount support"
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
-		$(C2W_IMAGE) --to-js $(VM_IMAGE) /out/js/
+		$(C2W_IMAGE) --assets /assets --to-js $(VM_IMAGE) /out/js/
 
 build:
 	mkdir -p $(BIN)
