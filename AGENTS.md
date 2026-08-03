@@ -10,8 +10,8 @@ with [container2wasm](https://github.com/container2wasm/container2wasm); the sam
 runs under [wazero](https://wazero.io) (local CLI, tests) and later in a browser, mounting a host
 directory read-only at `/mnt/host`. A future on-device LLM will drive it through a framed exec API.
 
-Milestone status: **M0 (scaffolding) and M1 (wasm build + wazero boot) done. M2 (guest agent +
-session + CLI) is next.**
+Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), and M2 (guest agent + session +
+CLI) done. M3 (read-only host mount under wazero, conformance table) is next.**
 
 ## Toolchain
 
@@ -34,8 +34,8 @@ session + CLI) is next.**
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
 | `make builder-image` | build `smolbox/c2w-builder:dev` from `build/Dockerfile.c2w` |
 | `make wasm` | convert the guest to `dist/smolbox.wasm` (needs Docker) |
-| `make test-integration` | boot `dist/smolbox.wasm` under wazero, run command/mount/state checks |
-| `make build` | `bin/smolbox` CLI (placeholder until M2) |
+| `make test-integration` | boot `dist/smolbox.wasm` under wazero, run the framed protocol matrix |
+| `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + Bun dev server with COOP/COEP |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
@@ -44,8 +44,8 @@ Everything gate = `make lint test` then `make test-integration` (needs `dist/smo
 ## How the VM is built (the two Dockerfiles)
 
 1. `vm/Dockerfile` — **the VM**: builds `guest/smolagentd` (Go, static linux/amd64) and layers it on
-   pinned `alpine:3.21` with coreutils/findutils/grep. Entrypoint is currently `/bin/sh` for M1
-   debugging; **M2 swaps it to `/sbin/smolagentd`**.
+   pinned `alpine:3.21` with coreutils/findutils/grep. Entrypoint is `/sbin/smolagentd` (M2+); M1
+   used `/bin/sh` for harness debugging.
 2. `build/Dockerfile.c2w` — **builds** the VM: installs docker CLI + buildx + the pinned c2w release
    (checksum-verified). It also clones `container2wasm/container2wasm@v0.8.4` to `/assets`.
 3. `make wasm` runs `c2w --assets /assets smolbox/vm:dev /out/smolbox.wasm` against the host daemon.
@@ -60,11 +60,12 @@ Rebuilds are cached by BuildKit; editing `guest/` alone makes `make wasm` cheap.
 ### The session stdin must never EOF (critical)
 The emulator (`bochs/wasm.cc`) calls `exit(1)` the instant the guest reads stdin and hits EOF.
 Keep stdin as a persistent `os.Pipe` whose write end stays open for the VM's lifetime (see
-`tests/integration/boot_test.go`). Never use an `io.Pipe` reader for stdin — wazero's nonblocking
-path mishandles it. End the session by sending `exit` to the shell, not by closing stdin.
+`internal/vm/vm.go`). Never use an `io.Pipe` reader for stdin — wazero's nonblocking
+path mishandles it. End the session with the `shutdown` op (`Session.Close`), not by closing stdin;
+closing stdin is only the forced-termination fallback.
 
 ### The read-only mount is enforced at the host FS boundary
-`internal/vm` (M2) will use `wazero.WithReadOnlyDirMount(host, "/mnt/host")`; the browser uses an
+`internal/vm` mounts with `wazero.WithReadOnlyDirMount(host, "/mnt/host")`; the browser uses an
 `ERRNO_ROFS`-returning `Fd`. Writes surface in the guest as `can't create ...: Invalid argument`.
 Do not rely on guest-side `mount -o ro`.
 

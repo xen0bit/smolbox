@@ -1,6 +1,6 @@
 # smolbox — Implementation Plan
 
-> Status: M0 (scaffolding) and M1 (wasm build) complete. M2 is next.
+> Status: M0 (scaffolding), M1 (wasm build), and M2 (guest agent + session + CLI) complete. M3 is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -48,6 +48,18 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
 - **`make wasm` wall time:** ~5–6 min cold (everything compiled from source in BuildKit); nearly
   free after caching. CI caches `dist/smolbox.wasm` (§7).
 - `smolbox exec`/`repl` are M2; today's driver is the integration harness (`tests/integration`).
+
+### Measured at M2 (2026-08-03, this machine)
+
+- **Guest boot → ready banner:** ~3.1–3.2 s under wazero (VM-only, from `InstantiateModule` to the
+  `#SMOLBOX-READY#` frame), up from ~2.5 s for the M1 shell — the Go agent (~2.1 MB static binary)
+  init on the interpreted Bochs CPU. Total session start including the host-side compile of the
+  114 MB module is ~5.1–5.7 s; `Session.BootLatency` reports the VM-only number.
+- **M2 integration matrix: 10/10 green** (`make test-integration`): ready within budget, echo
+  round-trip, non-zero exit propagation, stdout/stderr separation, `sleep 5` + 500 ms timeout kills
+  the process group (exit 137) with no orphan/zombie, 1 MiB stdout intact, `Truncated` past
+  `MaxOutput`, a >4096-byte command round-trip (ICANON guard), stateful cwd, and the `/mnt/host`
+  mount read through the agent. Each test boots its own VM; the suite runs in ~76 s.
 
 ---
 
@@ -277,6 +289,13 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
    `*.tar.gz.sbom.json`; `install.sh` greps the bare tarball name from `*-checksums.txt`, which also
    matches the `.sbom.json` line, so the "expected" checksum becomes two lines and never verifies.
    Use `golangci/golangci-lint-action@v7+` in CI (v6 rejects golangci-lint v2 outright).
+8. **PID 1 must reap orphans.** After a timeout `kill(-pgid)` the shell dies first and its children
+   are reparented to the agent (PID 1); unless the agent `wait4`s them they linger as zombies
+   (surfaced as `/proc/<pid>/comm` still showing the dead `sleep`). The agent runs a `WNOHANG` reap
+   pass after every exec.
+9. **execve env duplicates resolve to the child libc's first match.** Appending `Request.Env` entries
+   to a base env list does not override — the base value wins. The agent strips overridden keys from
+   the base before appending (§4.2).
 
 ---
 
@@ -423,10 +442,24 @@ leaking children. `stdout` and `stderr` go to separate capped buffers, so child 
 the console and never corrupts the frame stream. `Cwd` defaults to the previous command's directory —
 that is what makes the session stateful.
 
+**Implementation notes (M2).** The agent tracks the session cwd itself: it `os.Chdir`s to the current
+cwd before spawning (so the child inherits it — no shell-quoting of paths), wraps the user command as
+`sh -c '<cmd>; rc=$?; pwd >&3; exit $rc'`, and reads the child's final cwd off an `ExtraFiles` fd-3
+pipe. A command ending in `exit`/`exec` skips the `pwd`, so cwd is left unchanged (best-effort).
+**Environment is per-request only** (decided at M2): `Request.Env` is merged over the agent's env with
+overridden keys stripped first so the overlay wins (execve env duplicates resolve to the child libc's
+*first* match — appending alone would let the base value win); guest-side `export` does not carry
+over. Raw mode matters twice: `ICANON` off so >4096-byte REQ frames read whole, and `ECHO` off so the
+host's REQ lines are not echoed back to stdout, where the host scanner would mistake them for a guest
+request. As PID 1 the agent must reap orphans: a process-group kill on timeout orphans the command's
+grandchildren to the agent, so `exec` runs a `wait4(-1, WNOHANG)` reap pass after every command —
+without it, timed-out commands leave zombies that live forever.
+
 **`internal/vm`** mirrors §2.2:
 
-- `Boot(ctx, Options)` compiles `dist/smolbox.wasm`, wires an `io.Pipe` for stdin and a pipe for
-  stdout, and calls `InstantiateModule` **in a goroutine** — it blocks for the life of the VM.
+- `Boot(ctx, Options)` compiles `dist/smolbox.wasm`, wires an `os.Pipe` for stdin (never an
+  `io.Pipe` — wazero's nonblocking path mishandles it, §2.11.2) and a pipe for stdout, and calls
+  `InstantiateModule` **in a goroutine** — it blocks for the life of the VM.
 - Mounts: `Options.Mounts []hostfs.Mount{HostPath, GuestPath}` → `fsConfig.WithReadOnlyDirMount(host, guest)`.
   Default guest path `/mnt/host`.
 - A reader goroutine scans framed lines and dispatches responses by `seq`.
@@ -534,7 +567,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 |---|---|---|
 | M0 | Go module, layout, Makefile skeleton, CI | `make lint test` green — **done** |
 | M1 | `vm/Dockerfile`, `build/Dockerfile.c2w`, `make wasm` | `dist/smolbox.wasm` exists; raw wazero runs `echo hello`; **artifact size and boot time measured and recorded in this file** — **done** (§1) |
-| M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green |
+| M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green | **done** (§1) |
 | M3 | Read-only host mount under wazero | mount cases in the conformance table green |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go |

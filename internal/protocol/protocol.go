@@ -18,6 +18,8 @@ const (
 )
 
 const (
+	Version = "0.0.1"
+
 	MaxFrameSize     = 4 << 20
 	DefaultMaxOutput = 1 << 20
 )
