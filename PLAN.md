@@ -276,7 +276,7 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
 7. **golangci-lint's `install.sh` is broken for v2.x** (caught in CI). Releases now publish
    `*.tar.gz.sbom.json`; `install.sh` greps the bare tarball name from `*-checksums.txt`, which also
    matches the `.sbom.json` line, so the "expected" checksum becomes two lines and never verifies.
-   Use `golangci/golangci-lint-action@v6` in CI instead.
+   Use `golangci/golangci-lint-action@v7+` in CI (v6 rejects golangci-lint v2 outright).
 
 ---
 

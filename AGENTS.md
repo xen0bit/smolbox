@@ -21,8 +21,9 @@ session + CLI) is next.**
 - **bun 1.2.x** for all web tooling (bundle, `bun test`, `bunx --bun tsc`, dev server). Node is
   irrelevant; Playwright (M4) may need a Node pin — revisit then.
 - **golangci-lint v2** (`~/.golangci.yml` uses the v2 schema). In CI it is installed via
-  `golangci/golangci-lint-action@v6`, **not** golangci's `install.sh`: that script's checksum grep
-  also matches the release `*.tar.gz.sbom.json` line and always fails for v2.x releases.
+  `golangci/golangci-lint-action@v7`, **not** golangci's `install.sh`: that script's checksum grep
+  also matches the release `*.tar.gz.sbom.json` line and always fails for v2.x releases. (v6 of the
+  action rejects golangci-lint v2 outright; v7+ is required.)
 
 ## Commands
 
