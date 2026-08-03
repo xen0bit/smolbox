@@ -106,6 +106,10 @@ make web serve   # bundle and serve the browser runtime on localhost:8080
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
+Toolchain: **Go 1.24+** for the CLI, **Docker** for the conversion, and **bun** for the web tooling
+(bundling, unit tests, typecheck, and the dev server). Run `bun install` once to fetch the web
+dependencies.
+
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. The directory picker is
 Chromium-only today; other browsers get a labelled fallback.
@@ -166,4 +170,5 @@ xterm-pty already uses for terminal I/O, which is why cross-origin isolation is 
 [wazero](https://github.com/wazero/wazero) ·
 [browser_wasi_shim](https://github.com/bjorn3/browser_wasi_shim) ·
 [xterm-pty](https://github.com/mame/xterm-pty) ·
+[Bun](https://bun.sh) ·
 [Alpine Linux](https://alpinelinux.org)

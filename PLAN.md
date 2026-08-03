@@ -31,9 +31,12 @@ tool-call surface plus a mock caller that exercises it end to end.
 
 ### Local toolchain (verified 2026-08-03)
 
-`go1.24.3 linux/amd64` · `Docker 29.7.1` · `node v18.17.1`
+`go1.24.3 linux/amd64` · `Docker 29.7.1` · `bun 1.2.18`
 
-Node 18 is at end of life; bump to 20+ before starting M4 (Playwright and current bundlers assume it).
+Web tooling runs on **bun**, not npm/Node: `bun install` (deps → `bun.lock`), `bun build` (bundling),
+`bun test` (TS unit tests), `bunx --bun tsc --noEmit` (typecheck), and `web/serve.ts` (`Bun.serve`
+dev server with COOP/COEP headers). The only remaining Node dependency is Playwright's own test
+runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern Node for e2e only.
 
 ---
 
@@ -232,6 +235,7 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
 Makefile
 PLAN.md                       # this file
 README.md                     # ideal end-state scope
+package.json + bun.lock       # web deps (typescript, @types/bun) — bun manages these
 vm/Dockerfile                 # (1) THE VM: minimal Alpine guest image
 build/Dockerfile.c2w          # (2) BUILDS THE VM: c2w toolchain -> dist/smolbox.wasm
 cmd/smolbox/                  # CLI: one-shot exec + interactive REPL
@@ -240,6 +244,7 @@ internal/protocol/            # wire types + framing, shared by host and guest
 internal/vm/                  # wazero wiring, boot, session lifecycle
 internal/hostfs/              # read-only mount provider interface + os-backed impl
 web/
+  serve.ts                    # dev server: Bun.serve with COOP/COEP headers
   src/
     worker.ts                 # wasm + WASI shim in a dedicated worker
     stdio.ts                  # stdio router: session decoder + optional terminal mirror
@@ -452,11 +457,11 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `wasm` | deps `vm-image builder-image` → `dist/smolbox.wasm` (WASI, primary) |
 | `wasm-js` | same via `c2w --to-js` → `dist/js/` (emscripten, **no host mount**) |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
-| `web` | bundle `web/src` (esbuild) → `web/dist`, copying `dist/smolbox.wasm` |
-| `serve` | static server for `web/dist` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
+| `web` | bundle `web/src` with `bun build` → `web/dist`, copying `dist/smolbox.wasm` |
+| `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
 | `test` | Go unit tests; no Docker required |
 | `test-integration` | `go test -tags integration ./tests/integration/...`; requires `dist/smolbox.wasm` |
-| `test-web` | vitest unit tests for the TS bridge |
+| `test-web` | `bun test` unit tests for the TS bridge |
 | `test-e2e` | Playwright against `make serve` |
 | `test-conformance` | drives `tests/conformance/cases.json` through both the Go and browser sessions |
 | `lint` | `golangci-lint run` + `tsc --noEmit` |
@@ -507,15 +512,15 @@ Cases:
 interleaved kernel noise, reads split across buffer boundaries, oversized frames.
 `internal/hostfs` provider conformance.
 
-**TS unit tests** (vitest): SAB encode/decode; `HostDirFd` against a fake synchronous backend,
+**TS unit tests** (`bun test`): SAB encode/decode; `HostDirFd` against a fake synchronous backend,
 asserting every write op returns `ERRNO_ROFS`; chunked reads of a file larger than the payload
 window; cache invalidation on `remount()`.
 
 **Manual smoke:** `make wasm web serve`, open the page, pick a folder, `ls -la /mnt/host`.
 
-**CI** (GitHub Actions): unit tests on every push; `make wasm` + integration + e2e on a
-Docker-enabled runner, caching `dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`,
-and the c2w version.
+**CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`); `make wasm` +
+integration + e2e on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed on the hashes of
+`vm/Dockerfile`, `guest/`, and the c2w version.
 
 ---
 
@@ -539,4 +544,5 @@ and the c2w version.
 5. **Emscripten target cannot mount host directories** (§2.7). Ships as a fast, explicitly no-mount
    fallback. Wiring virtio-9p through emscripten's FS is out of scope.
 6. **c2w needs the host Docker socket** (§4.1). Documented in the Makefile and README.
-7. **Node 18 is EOL.** Bump to 20+ before M4.
+7. **Node 18 is EOL — and unused.** All web tooling runs on bun. Playwright's runner at M4 is the
+   only Node dependency; verify `bunx playwright` under bun, else pin a modern Node for e2e only.
