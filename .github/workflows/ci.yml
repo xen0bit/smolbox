@@ -35,7 +35,6 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
-          args: run
 
       - name: Typecheck (tsc)
         run: bunx --bun tsc --noEmit -p web/tsconfig.json
