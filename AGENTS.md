@@ -20,7 +20,9 @@ session + CLI) is next.**
 - **Docker 29.x** with the daemon socket at `/var/run/docker.sock` — required for `make wasm`.
 - **bun 1.2.x** for all web tooling (bundle, `bun test`, `bunx --bun tsc`, dev server). Node is
   irrelevant; Playwright (M4) may need a Node pin — revisit then.
-- **golangci-lint v2** (`~/.golangci.yml` uses the v2 schema).
+- **golangci-lint v2** (`~/.golangci.yml` uses the v2 schema). In CI it is installed via
+  `golangci/golangci-lint-action@v6`, **not** golangci's `install.sh`: that script's checksum grep
+  also matches the release `*.tar.gz.sbom.json` line and always fails for v2.x releases.
 
 ## Commands
 

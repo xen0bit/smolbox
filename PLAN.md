@@ -273,6 +273,10 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
    `go 1.24.3` toolchain.
 6. **`go mod tidy` drops the `integration`-tagged dependency** if run before `tests/integration`
    exists; keep the file present when adding deps used only behind the tag.
+7. **golangci-lint's `install.sh` is broken for v2.x** (caught in CI). Releases now publish
+   `*.tar.gz.sbom.json`; `install.sh` greps the bare tarball name from `*-checksums.txt`, which also
+   matches the `.sbom.json` line, so the "expected" checksum becomes two lines and never verifies.
+   Use `golangci/golangci-lint-action@v6` in CI instead.
 
 ---
 
