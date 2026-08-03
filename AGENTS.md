@@ -10,9 +10,10 @@ with [container2wasm](https://github.com/container2wasm/container2wasm); the sam
 runs under [wazero](https://wazero.io) (local CLI, tests) and later in a browser, mounting a host
 directory read-only at `/mnt/host`. A future on-device LLM will drive it through a framed exec API.
 
-Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session + CLI),
-and M3 (read-only host mount under wazero + shared conformance table) done. M4 (browser worker +
-stdio router + TS session) is next.**
+Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
+CLI), M3 (read-only host mount under wazero + shared conformance table), and M4 (browser worker +
+stdio router + TS session, preopen spike proven) done. M5 (sync FS bridge + browser mount) is
+next.**
 
 ## Toolchain
 
@@ -38,7 +39,9 @@ stdio router + TS session) is next.**
 | `make test-integration` | boot `dist/smolbox.wasm` under wazero, session-lifecycle tests only |
 | `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
-| `make web` / `make serve` | bundle browser worker + Bun dev server with COOP/COEP |
+| `make web` / `make serve` | bundle browser worker + page, copy `smolbox.wasm` + `index.html`; Bun dev server with COOP/COEP |
+| `make test-web` | `bun test web/src` (protocol framing + session unit tests) |
+| `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium, `echo hello` + preopen spike (M4) |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
@@ -86,6 +89,22 @@ The exec API (`internal/protocol`) is line-oriented base64 with magic prefixes
 prefix (kernel noise). Guest and host share the same Go types, so the wire cannot drift. TS mirrors
 it at M4+; docs say one definition, two runtimes.
 
+### The browser worker cannot receive postMessage while the VM runs
+`wasi.start()` blocks the worker thread for the VM's lifetime, so REQ frames cannot be delivered by
+message. The worker hands the main thread a `SharedArrayBuffer` stdin channel at startup
+(`web/src/stdio.ts` `StdinChannel`) and the main thread writes whole REQ frames straight into it;
+the emulator's `fd_read` consumes them and `Atomics.wait` lets the worker sleep on an empty queue.
+Responses come back over postMessage, raised inside the worker's `fd_write`. This is the stdin half
+of the M5 fsbridge.
+
+### Browser poll_oneoff: convert every clock into one timeline
+The base browser_wasi_shim `poll_oneoff` only handles a single clock subscription and busy-loops;
+`web/src/worker.ts` replaces it entirely (the guest kernel polls fd 0 for console input, driven by
+the emulator's `select(0)`). The shim's MONOTONIC clock is `performance.now()*1e6` but its REALTIME
+clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now()` and you get a
+~24.8-day `Atomics.wait` and a VM that boots forever. Normalise all deadlines to
+`performance.now()` ms before waiting. (PLAN §2.11.11-12.)
+
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
@@ -94,6 +113,10 @@ it at M4+; docs say one definition, two runtimes.
   expect}]}` where `expect` is a partial `protocol.Response` matcher. The wazero driver (M3) runs it
   today; the browser driver (M5) must run the **same** file so behaviour cannot diverge. Each case
   boots a fresh session; ordered steps give stateful cases (timeout→orphan-check, cd persists).
+- `tests/e2e/` (Playwright, M4) boots `dist/smolbox.wasm` in headless Chromium through the real
+  worker + `window.__smolbox` hook: `echo hello` and the preopen spike (in-memory `/mnt/host`).
+  Playwright runs under bun (`bunx --bun playwright test`); install browsers with
+  `bunx --bun playwright install chromium`. The e2e suite is not in CI yet (M5).
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
   (busybox sorts alphabetically) or the fixture/table drift silently.
 

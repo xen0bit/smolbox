@@ -2,5 +2,7 @@ bin/
 dist/
 web/dist/
 node_modules/
+test-results/
+playwright-report/
 *.log
 .DS_Store

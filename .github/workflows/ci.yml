@@ -43,6 +43,9 @@ jobs:
       - name: Unit tests
         run: make test
 
+      - name: Web unit tests (bun)
+        run: make test-web
+
   wasm-integration:
     name: wasm build + integration
     runs-on: ubuntu-latest
