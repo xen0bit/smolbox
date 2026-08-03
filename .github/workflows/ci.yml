@@ -63,3 +63,6 @@ jobs:
 
       - name: Integration tests
         run: make test-integration
+
+      - name: Conformance table (wazero driver)
+        run: make test-conformance

@@ -10,8 +10,9 @@ with [container2wasm](https://github.com/container2wasm/container2wasm); the sam
 runs under [wazero](https://wazero.io) (local CLI, tests) and later in a browser, mounting a host
 directory read-only at `/mnt/host`. A future on-device LLM will drive it through a framed exec API.
 
-Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), and M2 (guest agent + session +
-CLI) done. M3 (read-only host mount under wazero, conformance table) is next.**
+Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session + CLI),
+and M3 (read-only host mount under wazero + shared conformance table) done. M4 (browser worker +
+stdio router + TS session) is next.**
 
 ## Toolchain
 
@@ -34,12 +35,14 @@ CLI) done. M3 (read-only host mount under wazero, conformance table) is next.**
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
 | `make builder-image` | build `smolbox/c2w-builder:dev` from `build/Dockerfile.c2w` |
 | `make wasm` | convert the guest to `dist/smolbox.wasm` (needs Docker) |
-| `make test-integration` | boot `dist/smolbox.wasm` under wazero, run the framed protocol matrix |
+| `make test-integration` | boot `dist/smolbox.wasm` under wazero, session-lifecycle tests only |
+| `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + Bun dev server with COOP/COEP |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
-Everything gate = `make lint test` then `make test-integration` (needs `dist/smolbox.wasm`).
+Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
+`dist/smolbox.wasm`).
 
 ## How the VM is built (the two Dockerfiles)
 
@@ -69,6 +72,14 @@ closing stdin is only the forced-termination fallback.
 `ERRNO_ROFS`-returning `Fd`. Writes surface in the guest as `can't create ...: Invalid argument`.
 Do not rely on guest-side `mount -o ro`.
 
+### Guest `..` above the mount root resolves inside the guest, never to the host
+The wazero `WithReadOnlyDirMount` doc warns it does not by itself prevent `../` traversal. In
+smolbox that caveat is neutralised by the guest kernel: `..` above the `/mnt/host` bind mount is
+resolved by the guest's VFS before any 9p request reaches wazero, so a host file sitting next to the
+mounted dir stays invisible (the conformance table asserts `cat /mnt/host/../secret.txt` fails
+without leaking its sentinel). Do not weaken the black-box traversal case if the emulator ever
+changes this.
+
 ### Protocol framing
 The exec API (`internal/protocol`) is line-oriented base64 with magic prefixes
 (`#SMOLBOX-READY#`, `#SMOLBOX-REQ#seq#`, `#SMOLBOX-RES#seq#`); the Scanner discards lines without a
@@ -76,9 +87,15 @@ prefix (kernel noise). Guest and host share the same Go types, so the wire canno
 it at M4+; docs say one definition, two runtimes.
 
 ### Testing
-- `tests/integration/` is behind the `integration` build tag and requires `dist/smolbox.wasm`.
-- The Go and browser drivers must execute the same `tests/conformance/cases.json` table (M3/M5) so
-  behaviour cannot diverge between runtimes.
+- `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
+  `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
+  shared conformance table.
+- `tests/conformance/cases.json` is the single declarative table: `{name, steps[{request,
+  expect}]}` where `expect` is a partial `protocol.Response` matcher. The wazero driver (M3) runs it
+  today; the browser driver (M5) must run the **same** file so behaviour cannot diverge. Each case
+  boots a fresh session; ordered steps give stateful cases (timeout→orphan-check, cd persists).
+- When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
+  (busybox sorts alphabetically) or the fixture/table drift silently.
 
 ### Conventions
 - **Do not add comments to code unless asked.** One-line doc comments on exported Go identifiers are
@@ -91,5 +108,6 @@ it at M4+; docs say one definition, two runtimes.
 ## Verify before committing
 1. `make lint test` green (M0 gate).
 2. If the VM or guest changed: `make wasm` succeeds and `make test-integration` passes.
-3. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
-4. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
+3. If the conformance table or a `testdata/` fixture changed: `make test-conformance` passes.
+4. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
+5. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
