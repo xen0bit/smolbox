@@ -4,4 +4,6 @@ linters:
   default: standard
 
 formatters:
-  default: standard
+  enable:
+    - gofmt
+    - goimports
