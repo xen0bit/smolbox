@@ -1,0 +1,61 @@
+ARG C2W_VERSION=0.8.4
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG C2W_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG DOCKER_CLI_VERSION=29.4.0
+RUN for i in $(seq 1 10); do \
+        curl -fsSL -o /tmp/docker.tgz \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+            && break; \
+        echo "docker CLI download attempt $i failed, retrying"; sleep 3; \
+    done \
+    && tar -xz --strip-components=1 -C /usr/local/bin -f /tmp/docker.tgz docker/docker \
+    && rm /tmp/docker.tgz
+
+ARG BUILDX_VERSION=0.36.0
+RUN mkdir -p /usr/lib/docker/cli-plugins \
+    && for i in $(seq 1 10); do \
+        curl -fsSL -o /tmp/buildx \
+            "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" \
+            && break; \
+        echo "buildx download attempt $i failed, retrying"; sleep 3; \
+    done \
+    && mv /tmp/buildx /usr/lib/docker/cli-plugins/docker-buildx \
+    && chmod +x /usr/lib/docker/cli-plugins/docker-buildx
+
+RUN for i in $(seq 1 10); do \
+        curl -fsSL -o /tmp/container2wasm-v${C2W_VERSION}-linux-amd64.tar.gz \
+            "https://github.com/container2wasm/container2wasm/releases/download/v${C2W_VERSION}/container2wasm-v${C2W_VERSION}-linux-amd64.tar.gz" \
+            && break; \
+        echo "c2w download attempt $i failed, retrying"; sleep 3; \
+    done \
+    && for i in $(seq 1 10); do \
+        curl -fsSL -o /tmp/SHA256SUMS \
+            "https://github.com/container2wasm/container2wasm/releases/download/v${C2W_VERSION}/SHA256SUMS" \
+            && break; \
+        echo "SHA256SUMS download attempt $i failed, retrying"; sleep 3; \
+    done \
+    && cd /tmp \
+    && sha256sum -c --ignore-missing SHA256SUMS \
+    && tar -xzf container2wasm-v${C2W_VERSION}-linux-amd64.tar.gz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/c2w /usr/local/bin/c2w-net \
+    && rm /tmp/container2wasm-v${C2W_VERSION}-linux-amd64.tar.gz /tmp/SHA256SUMS
+
+# c2w's embedded Dockerfile clones the assets from a ktock branch that does not
+# exist upstream (ktock/container2wasm -b v0.8.4). Ship the release checkout
+# instead and pass it via --assets, which shadows that broken stage.
+RUN for i in $(seq 1 10); do \
+        git clone --depth 1 --branch v${C2W_VERSION} \
+            https://github.com/container2wasm/container2wasm /assets \
+            && break; \
+        echo "assets clone attempt $i failed, retrying"; rm -rf /assets; sleep 3; \
+    done
+
+ENTRYPOINT ["/usr/local/bin/c2w"]

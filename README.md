@@ -4,8 +4,10 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: pre-implementation.** This README describes the intended end state. See
-> [PLAN.md](PLAN.md) for the implementation plan, research notes, and current milestone.
+> **Status: M1 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots a real
+> Alpine shell under wazero in ~2.5 s, with the read-only host mount working. The CLI session
+> (`smolbox exec`/`repl`) and the browser runtime are the next milestones. See [PLAN.md](PLAN.md)
+> for implementation plan, research notes, and current milestone.
 
 ---
 
@@ -106,6 +108,14 @@ make web serve   # bundle and serve the browser runtime on localhost:8080
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
+Toolchain: **Go 1.24+** for the CLI, **Docker** for the conversion, and **bun** for the web tooling
+(bundling, unit tests, typecheck, and the dev server). Run `bun install` once to fetch the web
+dependencies.
+
+The VM artifact is exercised today through `make test-integration` (boots `dist/smolbox.wasm` under
+wazero, runs commands, and checks the `/mnt/host` read-only mount); the `smolbox` CLI session lands
+in M2.
+
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. The directory picker is
 Chromium-only today; other browsers get a labelled fallback.
@@ -166,4 +176,5 @@ xterm-pty already uses for terminal I/O, which is why cross-origin isolation is 
 [wazero](https://github.com/wazero/wazero) ·
 [browser_wasi_shim](https://github.com/bjorn3/browser_wasi_shim) ·
 [xterm-pty](https://github.com/mame/xterm-pty) ·
+[Bun](https://bun.sh) ·
 [Alpine Linux](https://alpinelinux.org)
