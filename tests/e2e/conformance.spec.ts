@@ -9,34 +9,13 @@
 // in OPFS, with its real symlink presented through the bridge's virtual
 // symlink table — the same bytes the Go driver mounts.
 
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
-import {
-  Expect,
-  Request,
-  boot,
-  checkExpect,
-  mountFixturePath,
-  walkFixture,
-} from "./harness.ts";
+import { boot, checkExpect, loadCases, mountFixturePath, walkFixture } from "./harness.ts";
 
-interface CaseSpec {
-  name: string;
-  steps: Array<{ request: Request; expect: Expect }>;
-}
-
-interface Table {
-  cases: CaseSpec[];
-}
-
-const cases = JSON.parse(
-  await readFile(fileURLToPath(new URL("../../tests/conformance/cases.json", import.meta.url)), "utf8"),
-) as Table;
-
+const cases = await loadCases();
 const mountFixture = await walkFixture(mountFixturePath);
 
-for (const c of cases.cases) {
+for (const c of cases) {
   test(`conformance: ${c.name}`, async ({ page }) => {
     const handle = await boot(page, mountFixture);
     const diffs: string[] = [];

@@ -144,6 +144,7 @@
     },
     {
       "name": "mount: read a file through the host mount",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {
@@ -158,6 +159,7 @@
     },
     {
       "name": "mount: nested subdirectory read",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {
@@ -172,6 +174,7 @@
     },
     {
       "name": "mount: directory listing matches the fixture tree",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {
@@ -186,6 +189,7 @@
     },
     {
       "name": "mount: symlink resolves through the mount",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {
@@ -200,6 +204,7 @@
     },
     {
       "name": "mount: writes are rejected (read-only at the host boundary)",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {
@@ -215,6 +220,7 @@
     },
     {
       "name": "mount: ../ escape above the mount root fails without leaking host files",
+      "requires": ["mount"],
       "steps": [
         {
           "request": {

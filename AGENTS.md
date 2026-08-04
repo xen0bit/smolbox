@@ -12,8 +12,9 @@ directory read-only at `/mnt/host`. A future on-device LLM will drive it through
 
 Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
 CLI), M3 (read-only host mount under wazero + shared conformance table), M4 (browser worker +
-stdio router + TS session, preopen spike proven), and M5 (sync FS bridge + browser mount + browser
-conformance driver) done. M6 (emscripten `--to-js` target) is next.**
+stdio router + TS session, preopen spike proven), M5 (sync FS bridge + browser mount + browser
+conformance driver), and M6 (emscripten `--to-js` target + its conformance driver) done. M7
+(tool-API docs, JSON Schema, mock caller) is next.**
 
 ## Toolchain
 
@@ -37,16 +38,19 @@ conformance driver) done. M6 (emscripten `--to-js` target) is next.**
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
 | `make builder-image` | build `smolbox/c2w-builder:dev` from `build/Dockerfile.c2w` |
 | `make wasm` | convert the guest to `dist/smolbox.wasm` (needs Docker) |
+| `make wasm-js` | convert the guest to `dist/js/` via `c2w --to-js` (emscripten/QEMU, **no host mount**) |
 | `make test-integration` | boot `dist/smolbox.wasm` under wazero, session-lifecycle tests only |
 | `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page, copy `smolbox.wasm` + `index.html`; Bun dev server with COOP/COEP |
 | `make test-web` | `bun test web/src` (protocol + session + fsbridge unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
+| `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
-`dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`.
+`dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`; M6 adds `make test-e2e-js`
+(needs `dist/js`).
 
 ## How the VM is built (the two Dockerfiles)
 
@@ -120,6 +124,42 @@ shared"). The fsbridge `.slice()`s request/response bytes out of the SAB before 
 ends (PLAN §2.11.13); the READ payload window is copied with `TypedArray.prototype.slice`, which
 already allocates a non-shared buffer.
 
+### The emscripten (`--to-js`) page: everything is on the main thread
+`web/js.html` + `web/src/emscripten/` is a second page at `/js/` sharing the whole protocol stack
+(`protocol.ts`, `stdio.ts`, `session.ts`) and differing only in the console transport. QEMU's
+`main()` runs on a pthread, but every PTY-touching syscall is in `out.js`'s `proxiedFunctionTable`,
+so `Module['pty']` (`ProtocolPty`) is called on the page — which is why `js-main.ts` can hold the
+`Session` directly and feed it a fake `MessageSink` instead of a worker. Host → guest still goes
+through the same `StdinChannel`; `StdinChannel.onWrite` fires `ProtocolPty.notifyInput()` to wake
+the runtime's pending `onReadable`, and `onReadable` fires immediately via `queueMicrotask` when
+data is already buffered (the lost-wakeup guard). No fsbridge: this target is no-mount.
+
+### The emscripten `TTY.stream_ops.poll` override is mandatory, not cosmetic
+c2w's `out.js` ships a PTY-aware `TTY`, so it looks like it needs no patching — but its `poll`
+calls `PTY_askToWaitAgain` whenever the pty has no input, and the enclosing `PTY_wrapPoll` parks the
+QEMU pthread on `Atomics.wait` until somebody types. With a programmatic console nobody ever does,
+so the VM produces **zero output** and looks dead. `js-main.ts` replaces it in `preRun` with the
+same mask minus the block — `(pty.readable ? 1 : 0) | (pty.writable ? 4 : 0)`; keeping POLLOUT is a
+deliberate improvement on upstream's `1 : 0`. **Leave `TTY.stream_ops.read` blocking**: that is what
+suspends `fd_read` between exec calls. (PLAN §2.11.15.)
+
+### The emscripten console delivers one byte at a time
+QEMU's emulated 16550 UART writes a single byte per `fd_write`, each a `proxyToMainThread` hop.
+That caps console throughput at ~35 kB/s (the WASI build does ~345 kB/s) and it is structural — do
+not chase it. It also means **any console-side buffer must be amortized O(1) per byte**: this is
+what exposed the quadratic `FrameDecoder` (rebuffering *and* rescanning the pending line on every
+chunk), which turned a 1 MiB response into a >300 s hang. (PLAN §2.11.16.)
+
+### The emscripten build has no clean teardown
+c2w's init runs `poweroff -f`, but the kernel is booted with `acpi=off`, so the guest cannot power
+the machine off and QEMU keeps emulating a halted CPU. `Module['onExit']` never fires (verified past
+90 s), and the command line is baked into the restored `vm.state` snapshot, so it cannot be changed.
+`js-main.ts` therefore does not call `Session.close()`: it sends `shutdown` as a plain request and
+treats the reply as the end of the session. Do not "fix" this by extending the close timeout.
+Relatedly, the generated `arg-module.js` always emits `-netdev socket,connect=127.0.0.1:8888`, so
+the page logs a failed WebSocket at boot — that is upstream's no-network mode (the socket is only
+used when `Module['websocket'].url` is set, which smolbox never does). Cosmetic; leave it.
+
 ### Browser poll_oneoff: convert every clock into one timeline
 The base browser_wasi_shim `poll_oneoff` only handles a single clock subscription and busy-loops;
 `web/src/worker.ts` replaces it entirely (the guest kernel polls fd 0 for console input, driven by
@@ -132,16 +172,26 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
   shared conformance table.
-- `tests/conformance/cases.json` is the single declarative table: `{name, steps[{request,
-  expect}]}` where `expect` is a partial `protocol.Response` matcher. The wazero driver (M3) runs it
-  today; the browser driver (M5) runs the **same** file so behaviour cannot diverge. Each case
-  boots a fresh session; ordered steps give stateful cases (timeout→orphan-check, cd persists).
+- `tests/conformance/cases.json` is the single declarative table: `{name, requires?, steps[{request,
+  expect}]}` where `expect` is a partial `protocol.Response` matcher. Three drivers run it: wazero
+  (M3), the WASI browser page (M5), and the emscripten page (M6) — the **same** file, so behaviour
+  cannot diverge. Each case boots a fresh session; ordered steps give stateful cases
+  (timeout→orphan-check, cd persists).
+- `requires` names the capabilities a case needs. Today the only tag is `["mount"]`, on the 6 cases
+  that touch `/mnt/host`; the emscripten driver filters them out because that build has no host
+  mount, while the other two drivers run everything. The Go driver ignores the field (unknown JSON
+  key), so tagging a case can never weaken the wazero run. **Do not add a tag to dodge a failure** —
+  a tag says "this runtime cannot express this", not "this is flaky here".
 - `tests/e2e/` (Playwright, M4/M5) boots `dist/smolbox.wasm` in headless Chromium through the real
   worker + `window.__smolbox` hook: `echo hello`, an OPFS mount smoke, and the full conformance
   table (`conformance.spec.ts`). The mount is an OPFS tree walked from `testdata/mount` on the Node
   side (`tests/e2e/harness.ts` `walkFixture`), with the fixture's symlink registered as a virtual
   link. Playwright runs under bun (`bunx --bun playwright test`); install browsers with
   `bunx --bun playwright install chromium`. `test-e2e` is in CI (M5).
+- `tests/e2e/emscripten.spec.ts` (M6) drives the `/js/` page through `bootJs()` and needs `dist/js`,
+  not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
+  WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.
+  Adding a spec that needs one artifact but not the other means touching both configs.
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
   (busybox sorts alphabetically) or the fixture/table drift silently.
 
@@ -158,6 +208,8 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
 2. If the VM or guest changed: `make wasm` succeeds and `make test-integration` passes.
 3. If the conformance table or a `testdata/` fixture changed: `make test-conformance` passes.
 4. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
-   (the browser must still pass the same conformance table as Go).
+   (the browser must still pass the same conformance table as Go). If shared code under `web/src/`
+   changed, also run `make test-e2e-js` with `dist/js` present — the emscripten page reuses
+   `protocol.ts`, `stdio.ts` and `session.ts` verbatim.
 5. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
 6. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.

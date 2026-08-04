@@ -133,6 +133,36 @@ describe("FrameDecoder", () => {
     big.fill(0x61);
     expect(() => decoder.feed(big)).toThrow(ProtocolError);
   });
+
+  // The emscripten console feeds one byte per call (QEMU's 16550 UART writes
+  // per character), so a large frame arrives as ~1e6 single-byte chunks. Buffer
+  // growth and the newline scan must both stay amortized O(1) per byte; when
+  // they were not, this took minutes instead of milliseconds.
+  test("a large frame delivered one byte at a time stays linear", () => {
+    const decoder = new FrameDecoder();
+    const line = encodeRequest(7, { op: OpExec, cmd: "a".repeat(512 * 1024) });
+    const started = performance.now();
+    let frames: ReturnType<FrameDecoder["feed"]> = [];
+    for (let i = 0; i < line.length; i++) {
+      frames = decoder.feed(line.subarray(i, i + 1));
+    }
+    expect(performance.now() - started).toBeLessThan(5000);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].seq).toBe(7);
+    expect(JSON.parse(frames[0].json).cmd).toBe("a".repeat(512 * 1024));
+  });
+
+  test("consecutive frames reuse the buffer without losing bytes", () => {
+    const decoder = new FrameDecoder();
+    const seqs: number[] = [];
+    for (let i = 1; i <= 200; i++) {
+      const line = encodeRequest(i, { op: OpExec, cmd: `echo ${"x".repeat(i * 7)}` });
+      for (const frame of decoder.feed(line)) {
+        seqs.push(frame.seq);
+      }
+    }
+    expect(seqs).toEqual(Array.from({ length: 200 }, (_, i) => i + 1));
+  });
 });
 
 // encodeRequestFrame wraps a raw JSON payload as a response frame for the

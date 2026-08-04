@@ -107,3 +107,42 @@ jobs:
 
       - name: E2E (boot + browser conformance table)
         run: make test-e2e
+
+  emscripten-e2e:
+    name: emscripten e2e (--to-js, no mount)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.18"
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ hashFiles('bun.lock') }}
+
+      - name: Install web deps
+        run: bun install --frozen-lockfile
+
+      - name: Cache dist/js
+        uses: actions/cache@v4
+        with:
+          path: dist/js
+          key: smolbox-js-${{ hashFiles('vm/Dockerfile', 'guest/**', 'build/Dockerfile.c2w', 'go.mod', 'go.sum') }}
+
+      # This job needs dist/js, not dist/smolbox.wasm: `make web` only warns
+      # when the WASI artifact is absent.
+      - name: Build wasm-js (if not cached)
+        run: |
+          if [ ! -d dist/js ]; then
+            make wasm-js
+          fi
+
+      - name: Install Chromium
+        run: bunx --bun playwright install --with-deps chromium
+
+      - name: E2E (emscripten boot + non-mount conformance cases)
+        run: make test-e2e-js

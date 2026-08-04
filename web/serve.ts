@@ -16,6 +16,9 @@ serve({
     if (pathname === "/") {
       pathname = "/index.html";
     }
+    if (pathname.endsWith("/")) {
+      pathname += "index.html";
+    }
     if (pathname.includes("..")) {
       return new Response("forbidden", { status: 403, headers: isolationHeaders });
     }

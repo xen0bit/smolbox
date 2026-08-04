@@ -2,8 +2,8 @@
 
 > Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), M3 (read-only host
 > mount under wazero + shared conformance table), M4 (browser worker + stdio router + TS session,
-> with the preopen spike), and M5 (sync FS bridge + browser mount + browser conformance driver)
-> complete. M6 (emscripten `--to-js` target) is next.
+> with the preopen spike), M5 (sync FS bridge + browser mount + browser conformance driver), and
+> M6 (emscripten `--to-js` target) complete. M7 (tool-API docs, JSON Schema, mock caller) is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -29,7 +29,7 @@ tool-call surface plus a mock caller that exercises it end to end.
 |---|---|---|
 | Browser filesystem | Lazy sync bridge (`SharedArrayBuffer` + `Atomics.wait`) | True lazy mount, any directory size; costs nothing extra because COOP/COEP is already mandatory (§4.4) |
 | Guest image | Minimal Alpine — busybox, coreutils/findutils/grep, guest agent | Smallest wasm, fastest boot |
-| Build targets | Both; **WASI primary**, emscripten `--to-js` secondary | One artifact runs under wazero *and* the browser; emscripten is faster but **cannot mount host directories** (§4.3) |
+| Build targets | Both; **WASI primary**, emscripten `--to-js` secondary | One artifact runs under wazero *and* the browser; emscripten has a faster CPU but **cannot mount host directories**, and boots and does console I/O more slowly (§4.3, measured at M6) |
 | Exec API | Persistent stateful session over stdio | Boot cost is paid once (§8, risk 1); `cwd`/`env`/`/tmp` persist between tool calls |
 
 ### Local toolchain (verified 2026-08-03)
@@ -129,6 +129,49 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
 - **The VM boots with no mount attached**: the preopen resolves as an empty directory until the user
   (or test) calls `setMount(handle, links)` — mount and remount are main-thread-only and never
   round-trip the worker.
+
+### Measured at M6 (2026-08-04, this machine)
+
+- **The emscripten page passes the non-mount half of the shared table: 10/10 green**
+  (`make test-e2e-js`, `tests/e2e/emscripten.spec.ts`) — the boot smoke, the no-mount guard, and the
+  8 cases of `tests/conformance/cases.json` not tagged `requires: ["mount"]`, one fresh VM each.
+  Suite ~2.0 min, of which the 1 MiB case alone is ~51 s (see console throughput below). The 6 mount
+  cases stay excluded by tag; the Go and WASI-browser drivers still run all 14.
+- **Artifact:** `dist/js` = **121 738 772 bytes (116.1 MiB)** — `qemu-system-x86_64.data` 80.2 MB
+  (bzImage + rootfs.bin + `vm.state` snapshot + BIOS blobs), `qemu-system-x86_64.wasm` 41.2 MB,
+  `out.js` 278 KB, `load.js` 7.6 KB, `arg-module.js` 739 B. Slightly larger than the 107.6 MiB WASI
+  artifact, and it is 5 files instead of 1.
+- **`make wasm-js`:** ~2.3 s fully cached (BuildKit shares almost everything with `make wasm`).
+- **The two browser builds are each faster at different things** (same machine, headless Chromium,
+  warm HTTP cache):
+
+  | | WASI (Bochs + browser_wasi_shim) | emscripten (QEMU/TCG JIT) |
+  |---|---|---|
+  | page open → ready banner | **~1.8 s** | ~7.0 s |
+  | console throughput, 1 MiB response | **~345 kB/s** | ~35 kB/s |
+  | `awk` 1e6-iteration loop | 129.4 s | **44.9 s** (2.9×) |
+  | 20k-iteration `sh` loop | 7.9 s | **5.4 s** (1.5×) |
+  | `head -c 2000000 /dev/zero \| md5sum` | 1.6 s | **1.1 s** (1.4×) |
+
+  So the emscripten target is the faster **CPU**, as upstream claims, but it is *not* the faster
+  build end to end: it pays ~5 s more to boot (116 MiB of assets plus a QEMU snapshot restore,
+  against a wizer pre-booted Bochs) and its console is ~10× slower. It earns its place on long
+  CPU-bound work; the WASI build wins on short calls, and it is the only one with a host mount.
+- **The console is the emscripten target's bottleneck, structurally.** QEMU's emulated 16550 UART
+  writes **one byte per `fd_write`**, and every one of those is a `proxyToMainThread` hop from the
+  QEMU pthread to the page. That is the whole ~35 kB/s. Nothing in smolbox can fix it short of
+  replacing the chardev.
+- **Two real bugs found while wiring the page:**
+  1. The shipped `TTY.stream_ops.poll` blocks the VM forever with a headless console (§2.11.15) —
+     the single reason the first boot attempt hung.
+  2. `FrameDecoder` was **quadratic** and the byte-at-a-time console exposed it (§2.11.16). Fixed in
+     `web/src/protocol.ts`; it made the 1 MiB case go from >300 s (timeout) to ~40 s, and the WASI
+     browser suite got faster too (52 s → 47 s, the 1 MiB case 7.1 s). Two unit tests guard it
+     (`make test-web`, 74 total): a 512 KiB frame fed one byte at a time must decode in under 5 s
+     (it takes ~155 ms; the old decoder took minutes), and 200 consecutive frames must survive the
+     buffer's compact/grow path in order.
+- **QEMU never exits, so there is no clean teardown** (§2.11.17). `SmolboxHandle.close()` on the
+  emscripten page shuts the *agent* down and calls the session over; the runtime dies with the page.
 
 ---
 
@@ -294,6 +337,11 @@ in-memory only.
 - **No directory sharing.** The README documents networking modes only, upstream's README scopes
   directory sharing to WASI images, and `browsers_test.go` has no mapdir case. Wiring virtio-9p
   through emscripten's FS is a research project and is explicitly **out of scope**.
+- Recorded at M6, not acted on: the generated `arg-module.js` *does* pass
+  `-virtfs local,path=/,mount_tag=wasi0`, so the guest can already see emscripten's MEMFS root. A
+  future host mount would therefore be a custom emscripten FS backend rather than new QEMU plumbing.
+  Still out of scope — the mount belongs to the WASI target, which is the one with a real read-only
+  boundary.
 
 ### 2.8 Performance data (thin)
 
@@ -392,6 +440,41 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     ends; the binary payload window is read with `TypedArray.prototype.slice`, which already copies
     into a non-shared buffer. M5's first browser boot hung for a full `BRIDGE_TIMEOUT_MS` on this —
     the worker's stat request was fine, but the main thread's decoder threw and never answered.
+15. **The emscripten build's shipped `TTY.stream_ops.poll` blocks the whole VM on a headless
+    console — the override is mandatory.** c2w's `out.js` looks like it needs no patching (unlike
+    the older upstream examples it already ships a PTY-aware `TTY`), but its `poll` calls
+    `PTY_askToWaitAgain` whenever the pty has no input, which throws `ErrnoError(1006)`; the
+    enclosing `PTY_wrapPoll` then parks the QEMU pthread on `Atomics.wait` until somebody *types*.
+    A terminal user always eventually does; a programmatic session never does, so QEMU's main loop
+    never reaches its first serial write and the VM appears dead with zero output. Both upstream
+    examples (`examples/emscripten{,-simple}/htdocs/index.html`) override
+    `Module['TTY'].stream_ops.poll` in `preRun` for exactly this reason. smolbox installs the same
+    mask minus the block: `(pty.readable ? 1 : 0) | (pty.writable ? 4 : 0)`. Keeping POLLOUT is a
+    deliberate improvement on upstream's `1 : 0`, which drops writability for fd 1/2. **The blocking
+    path must stay in `TTY.stream_ops.read`** — that is what suspends `fd_read` between exec calls,
+    and `StdinChannel.onWrite` → `ProtocolPty.notifyInput` is what wakes it.
+16. **`FrameDecoder` was quadratic, twice over; the emscripten console is what exposed it.** The TS
+    decoder reallocated and recopied its whole pending buffer on every `feed`, *and* restarted the
+    newline search from the beginning of the pending line each time. Both are invisible when chunks
+    are large (the WASI worker's `fd_write` delivers big buffers), and catastrophic when the console
+    delivers one byte at a time: a 1.4 MB base64 response frame became ~1e12 byte copies, i.e. a
+    >300 s exec that never completed. The decoder now grows by doubling and remembers a `scanned`
+    offset, both amortized O(1) per byte. Any future console transport should assume single-byte
+    chunks are legal.
+17. **QEMU does not exit when the guest stops, so the emscripten build has no clean teardown.**
+    c2w's init runs `poweroff -f` once the container command returns, but the kernel is booted with
+    `acpi=off` (see the generated `arg-module.js` `-append`), so there is no power-management path
+    and the CPU just halts inside a still-running emulator. `Module['onExit']` never fires — waiting
+    on it hangs indefinitely (verified past 90 s). The kernel command line lives inside the restored
+    `vm.state` snapshot, so it cannot be changed after the fact. `web/src/emscripten/js-main.ts`
+    therefore does not use `Session.close()`: it sends the `shutdown` op as a plain request, treats
+    the agent's reply as the end of the session, and lets the runtime die with the page.
+18. **`arg-module.js` always emits the netdev args, and that *is* upstream's no-network mode.** The
+    generated arguments carry `-netdev socket,connect=127.0.0.1:8888`, so the page logs a failed
+    `ws://127.0.0.1:8888/` connection at boot. Upstream's example ships the same arguments and
+    documents plain `localhost:8080` (no `?net=` parameter) as "container runs without networking":
+    the socket is only reached when `Module['websocket'].url` is set. smolbox never sets it, so the
+    console error is cosmetic and the sandbox stays offline. Do not "fix" it by editing the args.
 14. **Virtual symlinks are a bridge concern, not an OPFS concern.** The File System Access API has
     no symlink concept, so `MountHost` keeps a path→target table checked before the directory
     handle, and the worker's readdir/stat report `FILETYPE_SYMBOLIC_LINK` for those entries. The
@@ -420,7 +503,11 @@ internal/hostfs/              # read-only mount provider interface + os-backed i
 web/
   serve.ts                    # dev server: Bun.serve with COOP/COEP headers
   index.html                  # minimal page: boot/run UI + crossOriginIsolated check
+  js.html                     # M6: the same UI for the emscripten build, served at /js/
   src/
+    emscripten/               # M6: the --to-js page (no worker, no fsbridge)
+      js-main.ts              #   page entry: Module wiring + window.__smolbox
+      protocol-pty.ts         #   Module['pty'] over the shared StdinChannel
     worker.ts                 # wasm + WASI shim in a dedicated worker (M4)
     main.ts                   # page entry: spins up the worker, exposes window.__smolbox
     protocol.ts               # TS twin of internal/protocol framing + types
@@ -433,9 +520,11 @@ web/
       main-host.ts            #   async service + all caching + virtual symlinks (main thread)
   tsconfig.json
 tests/
-  conformance/cases.json      # shared behaviour table, run by BOTH Go and browser drivers
+  conformance/cases.json      # shared behaviour table, run by ALL THREE drivers (`requires` tags)
   integration/                # Go, build tag `integration`
-  e2e/                        # Playwright (M4/M5): boot + echo hello + OPFS mount + conformance driver
+  e2e/                        # Playwright: boot + echo hello + OPFS mount + conformance drivers
+    conformance.spec.ts       #   M5: the WASI page, all 14 cases
+    emscripten.spec.ts        #   M6: the /js/ page, the 8 non-mount cases
 testdata/mount/               # fixture directory used as the mounted folder
 docs/tool-api.md              # tool-call surface for the future WebGPU LLM
 dist/                         # build output (gitignored)
@@ -601,6 +690,29 @@ with no mount attached** — the preopen resolves as an empty directory until th
 `setMount(handle, links)`, and mount/remount are main-thread-only (they never round-trip the worker,
 so there is no mid-run injection problem).
 
+### 4.3b The emscripten (`--to-js`) page (M6)
+
+`web/js.html` + `web/src/emscripten/` is a second page at `/js/` over the *same* protocol stack:
+`protocol.ts`, `stdio.ts` and `session.ts` are reused verbatim, and only the console transport
+differs. There is no worker of our own and no fsbridge.
+
+- **Everything runs on the main thread.** QEMU's `main()` runs on a pthread, but every PTY-touching
+  syscall (`xterm_pty_old_poll`, `PTY_waitForReadableWithAtomicImpl`, `xterm_pty_old_fd_read`,
+  `_fd_write`, `___syscall_ioctl`) is in `out.js`'s `proxiedFunctionTable`, so `Module['pty']` is
+  called on the page. `js-main.ts` can therefore hold the session directly and feed a fake
+  `MessageSink` — `Session` cannot tell the difference between that and a worker's `onmessage`.
+- **`ProtocolPty`** (`web/src/emscripten/protocol-pty.ts`) implements the xterm-pty contract over the
+  same `StdinChannel` the WASI worker uses: `read`/`readable` drain REQ frames out of the SAB,
+  `write` hands guest console bytes to `StdioRouter`. `StdinChannel.onWrite` fires
+  `notifyInput()` so a published frame wakes the runtime's pending `onReadable` — and `onReadable`
+  fires immediately (via `queueMicrotask`) when data is already buffered, closing the lost-wakeup
+  window between the pthread's EAGAIN probe and its registration of the wait.
+- **`preRun` does two things**: writes `/pack/info` (the `t:` line the guest init needs; no `m:`
+  lines, this target is deliberately no-mount) and replaces `TTY.stream_ops.poll` — mandatory, see
+  §2.11.15.
+- **No host mount and no clean exit.** `setMount` is a no-op that says so; `close()` shuts the agent
+  down by request rather than waiting for a module exit that never comes (§2.11.17).
+
 ### 4.4 The sync FS bridge
 
 ```
@@ -673,6 +785,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `builder-image` | `docker build -f build/Dockerfile.c2w -t smolbox/c2w-builder:dev build/` |
 | `wasm` | deps `vm-image builder-image` → `dist/smolbox.wasm` (WASI, primary) |
 | `wasm-js` | same via `c2w --to-js` → `dist/js/` (emscripten, **no host mount**) |
+| `test-e2e-js` | Playwright against the `/js/` page: boot smoke + the non-mount conformance cases |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
 | `web` | bundle `web/src/{worker,main}.ts` + copy `index.html` and `dist/smolbox.wasm` → `web/dist` |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
@@ -699,7 +812,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | M3 | Read-only host mount under wazero + shared conformance table + Go driver | mount cases in the conformance table green — **done** (§1) |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` | **done** (§1) |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go — **done** (§1) |
-| M6 | `make wasm-js` emscripten target | boots in browser; documented as no-mount |
+| M6 | `make wasm-js` emscripten target | boots in browser; passes the non-mount conformance cases; documented as no-mount — **done** (§1) |
 | M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface |
 
 ---
@@ -707,9 +820,13 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 ## 7. Verification
 
 **Shared conformance table (`tests/conformance/cases.json`)** is the core of the strategy: one
-declarative list of `{name, steps[{request, expect}]}` cases, executed by a Go driver against wazero
-(`tests/conformance`, **M3 done**) and by a Playwright driver against the browser
-(`tests/e2e/conformance.spec.ts`, **M5 done**).
+declarative list of `{name, requires?, steps[{request, expect}]}` cases, executed by a Go driver
+against wazero (`tests/conformance`, **M3 done**), by a Playwright driver against the WASI browser
+page (`tests/e2e/conformance.spec.ts`, **M5 done**), and by a third Playwright driver against the
+emscripten page (`tests/e2e/emscripten.spec.ts`, **M6 done**).
+`requires` names the capabilities a case needs: the first two drivers run everything, while the
+emscripten driver skips `["mount"]` because that build has no host mount. The Go driver ignores the
+field entirely (unknown JSON keys), so tagging a case cannot weaken it.
 `expect` is a partial `protocol.Response` matcher (`exit_code`, exact `stdout`/`stderr`,
 `stdout_contains`/`stdout_not_contains`/`stderr_contains`, `stdout_len`, `timed_out`, `truncated`);
 each case boots a fresh session and its steps run in order. Behaviour cannot silently diverge
@@ -749,13 +866,22 @@ Chromium through the real worker/session code path and asserts the `echo hello` 
 mount smoke (file/nested/list/symlink reads through the sync bridge), and the **full conformance
 table** (`tests/e2e/conformance.spec.ts`, 14/14) — the browser half of the single-table guarantee.
 
+**Emscripten e2e** (`make test-e2e-js`, Playwright, **M6 done**): boots `dist/js` at `/js/` and runs
+the boot smoke, a `/mnt/host is empty` guard for the no-mount non-goal, and the 8 conformance cases
+not tagged `requires: ["mount"]` (10/10). It runs from its own
+`tests/e2e/playwright.emscripten.config.ts` because it needs `dist/js` rather than
+`dist/smolbox.wasm`; the WASI config `testIgnore`s the spec so `make test-e2e` stays buildable
+without it.
+
 **Manual smoke:** `make wasm web serve`, open the page, boot the VM, `echo hello`; pick a folder and
 `ls -la /mnt/host` through the picker, or `setMount` the OPFS root.
 
 **CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`, including
 `make test-web`); `make wasm` + integration + conformance on a Docker-enabled runner, caching
-`dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version; and a
-browser e2e job (restores the wasm cache, installs Chromium, runs `make test-e2e`) — **M5 done**.
+`dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version; a
+browser e2e job (restores the wasm cache, installs Chromium, runs `make test-e2e`) — **M5 done**;
+and an emscripten e2e job on the same shape, caching `dist/js` (~116 MiB) under its own key and
+running `make test-e2e-js` — **M6 done**.
 
 ---
 
@@ -779,8 +905,10 @@ browser e2e job (restores the wasm cache, installs Chromium, runs `make test-e2e
 4. **COOP/COEP required.** Non-negotiable for `SharedArrayBuffer`. `make serve` sets the headers;
    deployment docs must call it out; the page detects `crossOriginIsolated === false` and fails
    clearly.
-5. **Emscripten target cannot mount host directories** (§2.7). Ships as a fast, explicitly no-mount
-   fallback. Wiring virtio-9p through emscripten's FS is out of scope.
+5. **Emscripten target cannot mount host directories** (§2.7). Ships as an explicitly no-mount
+   alternative. Wiring virtio-9p through emscripten's FS is out of scope. **Measured at M6:** it is
+   the faster *CPU* (1.4–2.9×) but not the faster build — it boots ~5 s slower and its console runs
+   ~10× slower, so it only pays off on long CPU-bound work (§1).
 6. **c2w needs the host Docker socket** (§4.1). Documented in the Makefile and README.
 7. **Node 18 is EOL — and unused.** All web tooling runs on bun. Playwright's runner at M4 is the
    only Node dependency. **Resolved at M4:** `bunx --bun playwright test` works under bun, so no

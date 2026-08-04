@@ -10,7 +10,7 @@ C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
 .PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve \
-        test test-integration test-web test-e2e test-conformance lint clean
+        test test-integration test-web test-e2e test-e2e-js test-conformance lint clean
 
 all: build wasm web
 
@@ -35,7 +35,7 @@ wasm: vm-image builder-image
 		$(C2W_IMAGE) --assets /assets $(VM_IMAGE) /out/smolbox.wasm
 
 wasm-js: vm-image builder-image
-	@echo "note: the emscripten --to-js target is M6 and has no host-mount support"
+	@mkdir -p $(DIST)/js
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
@@ -51,6 +51,12 @@ web:
 	cp web/index.html web/dist/index.html
 	@if [ -f "$(WASM)" ]; then cp $(WASM) web/dist/; \
 	else echo "note: $(WASM) not built yet; run 'make wasm' (M1)"; fi
+	@if [ -d "$(DIST)/js" ]; then \
+		mkdir -p web/dist/js && \
+		bun build web/src/emscripten/js-main.ts --target=browser --outfile web/dist/js/main.js && \
+		cp -r $(DIST)/js/. web/dist/js/ && \
+		cp web/js.html web/dist/js/index.html; \
+	else echo "note: dist/js not built yet; run 'make wasm-js' (M6)"; fi
 
 serve:
 	bun web/serve.ts
@@ -67,6 +73,10 @@ test-web:
 
 test-e2e: web
 	bunx --bun playwright test --config tests/e2e/playwright.config.ts
+
+test-e2e-js: web
+	@test -d "$(DIST)/js" || { echo "error: $(DIST)/js missing; run 'make wasm-js' first (M6)" >&2; exit 1; }
+	bunx --bun playwright test --config tests/e2e/playwright.emscripten.config.ts
 
 test-conformance:
 	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first (M1)" >&2; exit 1; }

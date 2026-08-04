@@ -37,6 +37,10 @@ export class StdinChannel {
   readonly sab: SharedArrayBuffer;
   private ints: Int32Array;
   private payload: Uint8Array;
+  // Optional main-thread hook fired after a frame is published. The emscripten
+  // (--to-js) build uses it to wake the runtime's onReadable wait via the pty;
+  // the WASI worker leaves it unset (its poll path watches the same counter).
+  onWrite?: () => void;
 
   static create(): StdinChannel {
     return new StdinChannel(new SharedArrayBuffer(STDIN_PAD + STDIN_PAYLOAD_SIZE));
@@ -86,6 +90,7 @@ export class StdinChannel {
     Atomics.store(this.ints, I_BATCH, bytes.length);
     Atomics.add(this.ints, 0, 1);
     Atomics.notify(this.ints, 0, 1);
+    this.onWrite?.();
   }
 }
 

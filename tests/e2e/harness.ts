@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Page } from "@playwright/test";
 
+export const casesPath = fileURLToPath(new URL("../../tests/conformance/cases.json", import.meta.url));
+
 export interface Caps {
   version: string;
 }
@@ -76,6 +78,7 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
   await page.goto("/");
   await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
 
+
   if (fixture) {
     await page.evaluate(
       async (tree) => {
@@ -120,6 +123,21 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
     );
   }
 
+  return attach(page);
+}
+
+// Boot the emscripten (--to-js) page at /js/. That build has no host mount, so
+// there is no fixture to install: setMount is a no-op there and /mnt/host stays
+// empty. Everything past the page load is the same framed protocol.
+export async function bootJs(page: Page): Promise<Handle> {
+  await page.goto("/js/");
+  await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
+  return attach(page);
+}
+
+// Drive window.__smolbox.boot and wrap the remaining session calls. Shared by
+// both pages: the WASI worker and the emscripten runtime expose the same hook.
+async function attach(page: Page): Promise<Handle> {
   const caps = await page.evaluate(
     (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
     BOOT_TIMEOUT_MS,
@@ -187,3 +205,17 @@ export function checkExpect(e: Expect, r: Response): string[] {
 }
 
 export const mountFixturePath = fileURLToPath(new URL("../../testdata/mount", import.meta.url));
+
+// The shared conformance table. `requires` tags a case with the capabilities it
+// needs; the Go driver and the WASI browser driver run everything, while the
+// emscripten driver skips ["mount"] because that build has no host mount.
+export interface CaseSpec {
+  name: string;
+  requires?: string[];
+  steps: Array<{ request: Request; expect: Expect }>;
+}
+
+export async function loadCases(): Promise<CaseSpec[]> {
+  const table = JSON.parse(await readFile(casesPath, "utf8")) as { cases: CaseSpec[] };
+  return table.cases;
+}
