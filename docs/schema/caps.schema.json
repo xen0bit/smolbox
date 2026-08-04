@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "smolbox session capabilities",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Protocol version the guest agent implements."
+    },
+    "max_output": {
+      "type": "integer",
+      "description": "Default per-stream output cap in bytes, applied when a request leaves `max_output` at 0."
+    },
+    "max_frame": {
+      "type": "integer",
+      "description": "Largest single protocol frame the guest will accept or emit, in bytes."
+    }
+  },
+  "required": [
+    "version"
+  ]
+}
