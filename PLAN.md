@@ -1,7 +1,8 @@
 # smolbox — Implementation Plan
 
-> Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), and M3 (read-only host
-> mount under wazero + shared conformance table) complete. M4 is next.
+> Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), M3 (read-only host
+> mount under wazero + shared conformance table), and M4 (browser worker + stdio router + TS
+> session, with the preopen spike) complete. M5 (sync FS bridge + browser mount) is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -76,6 +77,26 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
 - **Traversal finding (§2.11.10):** the guest kernel resolves `..` above the `/mnt/host` bind mount
   inside the guest before any 9p request reaches wazero, so wazero's `WithReadOnlyDirMount` `../`
   caveat is neutralised in practice — the black-box case holds without guest-side sanitisation.
+
+### Measured at M4 (2026-08-03, this machine)
+
+- **Browser boot → ready: ~2.6 s** (headless Chromium via Playwright, single VM boot from
+  `page.goto` to the `#SMOLBOX-READY#` banner; whole `echo hello` e2e test 2.5–2.6 s, the spike
+  mount test ~3.1 s). The wizer pre-boot plus the browser's native wasm compiler (not an
+  interpreter) make the browser roughly as fast as wazero's ~3.2 s. The single-threaded
+  browser_wasi_shim caveat from §2.4 affects concurrency, not speed.
+- **Preopen spike: proven.** An in-memory `PreopenDirectory` at `/mnt/host` (fd 3, §2.4 pattern)
+  reaches the guest: `cat /mnt/host/hello.txt`, `ls -1 /mnt/host`, and a nested subdirectory read
+  all work from Playwright. The `..`-escape and write-rejection cases are **not** covered yet —
+  they land with the real Fd in M5.
+- **Playwright runner: `bunx --bun playwright test` works under bun.** No Node pin needed after all
+  (risk 7 resolved); system Node 18 stays unused. Browsers install via
+  `bunx --bun playwright install chromium`.
+- **M4 e2e: 2/2 green** (`make test-e2e`): boot + `echo hello` round-trip, and the spike mount
+  suite. Web unit tests: 17/17 (`make test-web`).
+- The browser worker's stdin is a **SharedArrayBuffer batch channel** (main thread writes whole REQ
+  frames, the emulator's fd_read consumes them; `Atomics.wait` sleeps the worker instead of
+  busy-looping). This is a one-way preview of the M5 fsbridge pattern (§4.4).
 
 ---
 
@@ -318,6 +339,21 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     file next to the mounted dir stays invisible. wazero's `WithReadOnlyDirMount` `../`-traversal
     caveat (§2.2) is neutralised by the guest kernel, not by wazero; keep the black-box traversal
     case in `tests/conformance/cases.json` as the regression guard if the emulator ever changes.
+11. **browser_wasi_shim's `poll_oneoff` must be replaced, and its clock timelines mixed carefully.**
+    The base shim only handles a *single* clock subscription and busy-loops on it; the guest kernel
+    polls fd 0 for console input (the emulator's `rx_timer_handler` runs a `select(0)` on stdin,
+    which wasi-libc turns into a `poll_oneoff` with an fd_read + a REALTIME clock subscription). The
+    upstream browser example replaces it entirely — so does M4's worker (§4.3). **The trap:** the
+    shim's MONOTONIC clock is `performance.now()*1e6` but its REALTIME clock is `Date.now()*1e6`;
+    subtracting a REALTIME deadline from `performance.now()` yields a ~24.8-day `Atomics.wait` and a
+    VM that boots forever. Convert every clock deadline into one timeline (`performance.now()` ms)
+    before waiting or comparing.
+12. **The browser console is a synchronous wasm thread — it cannot receive postMessage mid-boot.**
+    `wasi.start()` blocks the worker for the VM's lifetime, so exec requests cannot be delivered by
+    message. The worker instead hands the main thread a `SharedArrayBuffer` stdin channel at startup
+    and the main thread writes REQ frames straight into it; responses still come back over
+    postMessage (raised inside the worker's `fd_write`). This is why `web/src/stdio.ts` owns a
+    `StdinChannel` and why the fsbridge (M5) is the same shape, only two-way.
 
 ---
 
@@ -337,20 +373,20 @@ internal/vm/                  # wazero wiring, boot, session lifecycle
 internal/hostfs/              # read-only mount provider interface + os-backed impl
 web/
   serve.ts                    # dev server: Bun.serve with COOP/COEP headers
+  index.html                  # minimal page: boot/run UI + crossOriginIsolated check
   src/
-    worker.ts                 # wasm + WASI shim in a dedicated worker
-    stdio.ts                  # stdio router: session decoder + optional terminal mirror
+    worker.ts                 # wasm + WASI shim in a dedicated worker (M4)
+    main.ts                   # page entry: spins up the worker, exposes window.__smolbox
+    protocol.ts               # TS twin of internal/protocol framing + types
+    stdio.ts                  # stdio router: FrameDecoder + SAB stdin channel
     session.ts                # TS twin of internal/vm session client
-    mount.ts                  # directory provider (picker / OPFS / drag-drop)
-    fsbridge/
-      protocol.ts             # SAB layout, op codes
-      worker-fd.ts            # Fd subclass, blocks on Atomics.wait
-      main-host.ts            # main-thread async service
-  index.html
+    mount.ts                  # M4 spike: in-memory PreopenDirectory builder (real providers in M5)
+    fsbridge/                 # M5: SAB layout, worker Fd, main-thread async service
+  tsconfig.json
 tests/
   conformance/cases.json      # shared behaviour table, run by BOTH Go and browser drivers
   integration/                # Go, build tag `integration`
-  e2e/                        # Playwright
+  e2e/                        # Playwright (M4): boot + echo hello + preopen spike
 testdata/mount/               # fixture directory used as the mounted folder
 docs/tool-api.md              # tool-call surface for the future WebGPU LLM
 dist/                         # build output (gitignored)
@@ -504,8 +540,13 @@ into xterm-pty's `TtyClient`. We route through `stdio.ts` instead: bytes from fd
 decoder **and** are optionally mirrored to a terminal; fd 0 is fed by the session writer. One worker
 serves both headless agent calls and a visible console.
 
-**2. The mounted directory is injected as `fds[3]`**, replacing upstream's `certDir` slot, with a
-custom `Fd` backed by the sync bridge.
+The worker cannot receive postMessage while the module runs (§2.11.12), so fd 0 is fed through a
+**one-way SharedArrayBuffer batch channel** that the main thread writes REQ frames into and the
+worker's `fd_read`/`poll_oneoff` consume (§1, measured at M4). This is the stdin half of the M5
+fsbridge, minus the request/response protocol.
+
+**2. The mounted directory is injected as `fds[3]`**, replacing upstream's `certDir` slot. M4's spike
+uses an in-memory `PreopenDirectory` (§1); the real `Fd` backed by the sync bridge lands in M5.
 
 ### 4.4 The sync FS bridge
 
@@ -568,12 +609,12 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `wasm` | deps `vm-image builder-image` → `dist/smolbox.wasm` (WASI, primary) |
 | `wasm-js` | same via `c2w --to-js` → `dist/js/` (emscripten, **no host mount**) |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
-| `web` | bundle `web/src` with `bun build` → `web/dist`, copying `dist/smolbox.wasm` |
+| `web` | bundle `web/src/{worker,main}.ts` + copy `index.html` and `dist/smolbox.wasm` → `web/dist` |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
 | `test` | Go unit tests; no Docker required |
 | `test-integration` | `go test -tags integration ./tests/integration/...`; requires `dist/smolbox.wasm` |
-| `test-web` | `bun test` unit tests for the TS bridge |
-| `test-e2e` | Playwright against `make serve` |
+| `test-web` | `bun test web/src` — protocol framing + session unit tests |
+| `test-e2e` | Playwright (`make web` first) against `make serve` |
 | `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver (browser driver at M5) |
 | `lint` | `golangci-lint run` + `tsc --noEmit` |
 | `clean` | remove `dist bin web/dist` |
@@ -591,7 +632,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | M1 | `vm/Dockerfile`, `build/Dockerfile.c2w`, `make wasm` | `dist/smolbox.wasm` exists; raw wazero runs `echo hello`; **artifact size and boot time measured and recorded in this file** — **done** (§1) |
 | M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green | **done** (§1) |
 | M3 | Read-only host mount under wazero + shared conformance table + Go driver | mount cases in the conformance table green — **done** (§1) |
-| M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` |
+| M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` | **done** (§1) |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go |
 | M6 | `make wasm-js` emscripten target | boots in browser; documented as no-mount |
 | M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface |
@@ -629,15 +670,24 @@ provider boundary (`internal/hostfs` is a plain `Mount` struct; wazero's `ReadOn
 implementation) is covered end-to-end by the mount cases in the conformance table rather than a
 standalone unit test.
 
-**TS unit tests** (`bun test`): SAB encode/decode; `HostDirFd` against a fake synchronous backend,
-asserting every write op returns `ERRNO_ROFS`; chunked reads of a file larger than the payload
-window; cache invalidation on `remount()`.
+**TS unit tests** (`bun test`, **M4 done**): the TS framing twin (`protocol.ts`) round-trips
+requests/ready/responses against the Go wire shape and skips noise; the SAB stdin channel and
+`session.ts` against a mock worker (boot, seq'd exec dispatch, close, error paths). M5 adds the
+bridge tests: `HostDirFd` against a fake synchronous backend, every write op returns `ERRNO_ROFS`,
+chunked reads larger than the payload window, and cache invalidation on `remount()`.
 
-**Manual smoke:** `make wasm web serve`, open the page, pick a folder, `ls -la /mnt/host`.
+**Browser e2e** (`make test-e2e`, Playwright, **M4 done**): boots `dist/smolbox.wasm` in headless
+Chromium through the real worker/session code path and asserts the `echo hello` round-trip, plus the
+preopen spike (in-memory `/mnt/host` file/nested/list reads). The browser driver that runs the
+**same** conformance table lands in M5.
 
-**CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`); `make wasm` +
-integration + conformance on a Docker-enabled runner, caching `dist/smolbox.wasm` keyed on the
-hashes of `vm/Dockerfile`, `guest/`, and the c2w version.
+**Manual smoke:** `make wasm web serve`, open the page, boot the VM, `echo hello` (M4); the
+directory picker + `ls -la /mnt/host` smoke is M5.
+
+**CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`, including
+`make test-web`); `make wasm` + integration + conformance on a Docker-enabled runner, caching
+`dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version. Playwright
+e2e is deferred until M5 stabilises the browser suite.
 
 ---
 
@@ -651,7 +701,10 @@ hashes of `vm/Dockerfile`, `guest/`, and the c2w version.
    the browser (§2.3); the `/.wasmenv` `certDir` precedent shows the mechanism works (§2.4).
    **Mitigation: M4 opens by spiking a hardcoded in-memory `PreopenDirectory` at `/mnt/host` and
    confirming the guest sees it, before any bridge code is written.** Everything downstream depends
-   on this, so it must be the first browser task.
+   on this, so it must be the first browser task. **Status: spike passed at M4** — the guest reads
+   files and lists the in-memory `/mnt/host` from the browser (§1). What remains unproven is the
+   *async* bridge: a `FileSystemDirectoryHandle` served through a SAB (M5), and the black-box
+   `../`/write-rejection cases the conformance table asserts.
 3. **Wasm artifact size.** **Measured 107.6 MiB for minimal Alpine + BusyBox tooling** (§1). Under the
    pain threshold; if delivery ever hurts, `c2w --external-bundle` mounts the image at runtime
    instead of embedding it.
@@ -662,7 +715,8 @@ hashes of `vm/Dockerfile`, `guest/`, and the c2w version.
    fallback. Wiring virtio-9p through emscripten's FS is out of scope.
 6. **c2w needs the host Docker socket** (§4.1). Documented in the Makefile and README.
 7. **Node 18 is EOL — and unused.** All web tooling runs on bun. Playwright's runner at M4 is the
-   only Node dependency; verify `bunx playwright` under bun, else pin a modern Node for e2e only.
+   only Node dependency. **Resolved at M4:** `bunx --bun playwright test` works under bun, so no
+   Node pin is needed; browsers install with `bunx --bun playwright install chromium`.
 8. **stdin EOF kills the VM.** The emulator exits 1 on any guest stdin read returning EOF
    (§2.11.2). Every host harness must keep stdin open for the VM's lifetime. This is why the session
    owns a persistent `os.Pipe`.

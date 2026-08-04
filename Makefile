@@ -47,7 +47,8 @@ build:
 
 web:
 	mkdir -p web/dist
-	bun build web/src/worker.ts --target=browser --outdir web/dist
+	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
+	cp web/index.html web/dist/index.html
 	@if [ -f "$(WASM)" ]; then cp $(WASM) web/dist/; \
 	else echo "note: $(WASM) not built yet; run 'make wasm' (M1)"; fi
 
@@ -62,11 +63,10 @@ test-integration:
 	go test -tags integration ./tests/integration/...
 
 test-web:
-	@if ls web/src/*.test.ts >/dev/null 2>&1; then bun test web/src; \
-	else echo "note: no web unit tests yet (M5)"; fi
+	bun test web/src
 
-test-e2e:
-	@echo "note: Playwright e2e lands in M4/M5; requires 'make serve' running"
+test-e2e: web
+	bunx --bun playwright test --config tests/e2e/playwright.config.ts
 
 test-conformance:
 	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first (M1)" >&2; exit 1; }
