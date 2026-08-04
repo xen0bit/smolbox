@@ -44,11 +44,22 @@ export type SmolboxGlobal = { __smolbox?: unknown };
 export const BOOT_TIMEOUT_MS = 180_000;
 export const EXEC_TIMEOUT_MS = 120_000;
 
-// The emscripten console moves ~35 kB/s — QEMU's 16550 UART writes one byte per
-// fd_write, each a proxyToMainThread hop — so the 1 MiB conformance case is ~48 s
-// of pure transfer on a dev machine and ~2 min on a CI runner (~2.6x slower).
-// This is a harness budget, not a behaviour assertion: the case must still pass
-// unchanged, it just needs room to finish.
+// The emscripten runtime gets its own, larger budgets. It is not flakier than
+// the WASI build, just slower and far hungrier, and the shared numbers above are
+// sized for a runtime that boots in ~2 s and moves ~345 kB/s.
+//
+// Boot: ~7 s locally but ~16-22 s on a CI runner, and a live VM burns ~2.4 CPU
+// cores (QEMU's main loop busy-polls; see PLAN §2.11.15) against a 4-vCPU shared
+// runner, so contention spikes are expected. 180 s is 25x the local norm but
+// only ~8x the runner norm — this restores the proportion.
+//
+// Exec: the console moves ~35 kB/s (QEMU's 16550 UART writes one byte per
+// fd_write, each a proxyToMainThread hop), so the 1 MiB conformance case is
+// ~48 s of pure transfer locally and ~3 min in CI.
+//
+// These are harness budgets, not behaviour assertions: every case must still
+// pass unchanged, it just needs room to finish.
+export const EMSCRIPTEN_BOOT_TIMEOUT_MS = 360_000;
 export const EMSCRIPTEN_EXEC_TIMEOUT_MS = 300_000;
 
 // A mount fixture as a serializable tree; symlinks are carried separately so
@@ -139,15 +150,19 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
 export async function bootJs(page: Page): Promise<Handle> {
   await page.goto("/js/");
   await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
-  return attach(page, EMSCRIPTEN_EXEC_TIMEOUT_MS);
+  return attach(page, EMSCRIPTEN_EXEC_TIMEOUT_MS, EMSCRIPTEN_BOOT_TIMEOUT_MS);
 }
 
 // Drive window.__smolbox.boot and wrap the remaining session calls. Shared by
 // both pages: the WASI worker and the emscripten runtime expose the same hook.
-async function attach(page: Page, execTimeoutMs = EXEC_TIMEOUT_MS): Promise<Handle> {
+async function attach(
+  page: Page,
+  execTimeoutMs = EXEC_TIMEOUT_MS,
+  bootTimeoutMs = BOOT_TIMEOUT_MS,
+): Promise<Handle> {
   const caps = await page.evaluate(
     (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
-    BOOT_TIMEOUT_MS,
+    bootTimeoutMs,
   );
 
   return {

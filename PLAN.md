@@ -168,6 +168,17 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
   writes **one byte per `fd_write`**, and every one of those is a `proxyToMainThread` hop from the
   QEMU pthread to the page. That is the whole ~35 kB/s. Nothing in smolbox can fix it short of
   replacing the chardev.
+- **A live emscripten VM costs ~2.1–2.4 CPU cores, even when idle.** Measured across the whole
+  page's processes after `close()` had already stopped the guest agent: QEMU's main loop busy-polls
+  (the unavoidable consequence of §2.11.15 — the alternative is a VM that never boots) and the TCG
+  threads never stop, because QEMU does not exit (§2.11.17). Against a 4-vCPU CI runner that is
+  most of the machine, which is why the e2e suite there boots in 16–22 s rather than ~7 s and why
+  its budgets are sized separately (`EMSCRIPTEN_{BOOT,EXEC}_TIMEOUT_MS`) with one retry.
+  **Teardown is clean, though:** closing the browser context drops CPU back to ~3 % within 3 s, so
+  finished tests do not leave spinning workers behind — verified explicitly, because accumulating
+  zombie VMs was the obvious suspect and it was wrong.
+- The dev server is not a factor: 12 sequential page loads (80 MB `.data` each, ~1 GB served) showed
+  a flat 6.5–6.9 s boot, flat JS heap, and flat asset-fetch times.
 - **Two real bugs found while wiring the page:**
   1. The shipped `TTY.stream_ops.poll` blocks the VM forever with a headless console (§2.11.15) —
      the single reason the first boot attempt hung.
