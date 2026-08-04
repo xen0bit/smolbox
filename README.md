@@ -4,13 +4,14 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: M5 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
+> **Status: M6 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
 > guest agent's ready banner under wazero in ~3.2 s and **in a browser in ~2.6 s**, with the read-only
 > host mount working under wazero and in the browser via the sync FS bridge (a folder picked with the
 > File System Access API is mounted read-only at `/mnt/host`). The `smolbox` CLI (`exec`/`repl`) drives
 > it over the framed protocol, and a shared conformance table (`tests/conformance/cases.json`) pins
-> the behaviour — **the same table passes under both wazero and Chromium**. The emscripten `--to-js`
-> target is the next milestone.
+> the behaviour — **the same table passes under wazero, under Chromium, and (minus the mount cases)
+> under the emscripten `--to-js` build**, which now ships too. Next is M7: the tool-call API docs,
+> JSON Schema, and a mock caller for the future WebGPU model.
 > See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
 
 ---
@@ -56,8 +57,11 @@ one folder they explicitly chose, and cannot write to it.
 - In the browser, the mount is backed lazily by a `FileSystemDirectoryHandle` from
   `showDirectoryPicker()`. Large directories cost nothing until read. A `remount()` picks up changes
   made on disk.
-- A second, faster browser build (`c2w --to-js`, QEMU with JIT and multi-threading) is available for
-  workloads that do not need a host mount.
+- A second browser build (`c2w --to-js`, QEMU with a TCG JIT) is available for workloads that do not
+  need a host mount. It runs the emulated CPU **1.4–2.9× faster**, but it boots slower (~7 s against
+  ~1.8 s, on 116 MB of assets against a wizer pre-booted 108 MB) and its console is ~10× slower, so
+  it only pays off on long CPU-bound work. It passes the same conformance table minus the mount
+  cases.
 
 ### The exec API
 
@@ -92,8 +96,10 @@ resp, err := session.Exec(ctx, protocol.Request{
 - `make wasm` produces the artifact. The guest image and the toolchain that converts it live in
   **two separate Dockerfiles** (`vm/Dockerfile`, `build/Dockerfile.c2w`), so iterating on guest
   packages does not rebuild the conversion toolchain.
-- A **single shared conformance table** is executed by both the Go/wazero driver and the Playwright
-  browser driver. Behaviour cannot silently diverge between runtimes.
+- A **single shared conformance table** is executed by the Go/wazero driver and by both Playwright
+  browser drivers. Behaviour cannot silently diverge between runtimes. Cases carry a `requires` tag
+  naming what they need, so the no-mount emscripten build skips exactly the mount cases and nothing
+  else.
 - Browser tests run without a native file dialog by mounting an OPFS directory handle through the
   identical code path.
 
@@ -103,6 +109,7 @@ resp, err := session.Exec(ctx, protocol.Request{
 
 ```
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
+make wasm-js     # optional: the emscripten build -> dist/js (no host mount)
 make build       # build the smolbox CLI
 
 ./bin/smolbox exec --mount ./testdata/mount -- ls -la /mnt/host
@@ -110,6 +117,8 @@ make build       # build the smolbox CLI
 
 make web serve   # bundle and serve the browser runtime on localhost:8080
 ```
+
+The dev server hosts the WASI build at `/` and, if `dist/js` exists, the emscripten build at `/js/`.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
@@ -121,7 +130,9 @@ The VM artifact is exercised today through `make test-integration` (boots `dist/
 wazero and runs the framed protocol matrix over the guest agent), and by hand through the `smolbox`
 CLI (`exec`/`repl`). In the browser it is exercised through `make test-e2e` (Playwright boots the
 same artifact in headless Chromium: `echo hello`, an OPFS-backed mount smoke, and the **full
-conformance table** — the browser passes the same `cases.json` as the Go driver).
+conformance table** — the browser passes the same `cases.json` as the Go driver) and, for the
+emscripten build, `make test-e2e-js` (boot smoke, a `/mnt/host` is-empty guard, and the same
+`cases.json` minus the mount cases).
 
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. The directory picker is
@@ -135,7 +146,9 @@ Chromium-only today; other browsers get a labelled fallback.
   is offline by design.
 - Write access to the mounted host directory. The mount is read-only, deliberately and permanently.
 - Host directory mounting in the emscripten (`--to-js`) build. That target has no such support
-  upstream, and adding it would mean wiring virtio-9p through emscripten's filesystem layer.
+  upstream, and adding it would mean wiring virtio-9p through emscripten's filesystem layer. That
+  build also has no clean shutdown — its kernel boots with `acpi=off`, so QEMU keeps running after
+  the guest halts and the session simply ends with the page.
 - Being fast at CPU-bound work. An emulated x86_64 CPU inside WebAssembly is not a performance story.
   smolbox optimises for portability and for a real Unix environment, and amortises boot cost across a
   long-lived session.

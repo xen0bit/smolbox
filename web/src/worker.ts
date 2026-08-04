@@ -24,8 +24,37 @@ postMessage({ type: "channel", sab: stdin.sab });
 const fsChannel = createBridgeSab();
 postMessage({ type: "fschannel", sab: fsChannel });
 
+// Boot watchdog. wasi.start() blocks this worker for the VM's lifetime, so a
+// timer cannot fire here — the diagnostic has to ride the poll loop, which is
+// the one thing still running. Silence in these reports is itself the signal:
+// it means poll_oneoff stopped returning, i.e. the worker is parked in a wait.
+const bootStart = performance.now();
+let ready = false;
+let polls = 0;
+let lastWaitMs = -1;
+let unclockedPolls = 0;
+let consoleBytes = 0;
+let nextReportMs = 20_000;
+
+function reportBootStall(): void {
+  const elapsed = performance.now() - bootStart;
+  if (ready || elapsed < nextReportMs) {
+    return;
+  }
+  nextReportMs = elapsed + 5_000;
+  postMessage({
+    type: "log",
+    message:
+      `boot stalled: ${Math.round(elapsed)}ms, polls=${polls}, lastWaitMs=${Math.round(lastWaitMs)}, ` +
+      `unclockedPolls=${unclockedPolls}, consoleBytes=${consoleBytes}, stdinReadable=${stdin.available()}`,
+  });
+}
+
 const router = new StdioRouter(stdin, {
-  onReady: (caps: Caps) => postMessage({ type: "ready", caps }),
+  onReady: (caps: Caps) => {
+    ready = true;
+    postMessage({ type: "ready", caps });
+  },
   onResponse: (resp: Response) => postMessage({ type: "response", resp }),
   onError: (err: Error) => postMessage({ type: "error", message: String(err) }),
 });
@@ -58,7 +87,14 @@ class StdinFd extends Fd {
 // replace it with an Atomics-based wait, mirroring upstream wasiHack().
 function patchPollOneoff(wasiInstance: WASI, ch: StdinChannel): void {
   const wasiImport = wasiInstance.wasiImport;
-  const MAX_POLL_MS = 2 ** 31 - 1;
+  // A poll carrying only fd-read subscriptions has no deadline to bound the
+  // wait. Sleeping until stdin arrives is wrong during boot: nothing is going to
+  // arrive, because the host does not write until the ready banner says the
+  // guest is up — so the VM sleeps forever and boot "just hangs". Cap every wait
+  // instead, turning that case into a slow re-poll. Costs nothing on the normal
+  // path, where a clock subscription already bounds waitMs well below this.
+  // (This is the un-clocked cousin of the 24.8-day wait in PLAN 2.11.11.)
+  const MAX_POLL_MS = 250;
 
   wasiImport.poll_oneoff = (inPtr: number, outPtr: number, nSubscriptions: number, neventsPtr: number) => {
     if (nSubscriptions === 0) {
@@ -103,6 +139,13 @@ function patchPollOneoff(wasiInstance: WASI, ch: StdinChannel): void {
       waitMs = Math.min(waitMs, Math.max(0, c.deadlinePerfMs - nowMs));
     }
 
+    polls++;
+    lastWaitMs = waitMs;
+    if (clockSubs.length === 0) {
+      unclockedPolls++;
+    }
+    reportBootStall();
+
     let out = outPtr;
     const { readable } = ch.poll(waitMs);
     if (readable) {
@@ -130,8 +173,14 @@ async function run(): Promise<void> {
   const bytes = await resp.arrayBuffer();
   const fds: Array<Fd | undefined> = [
     new StdinFd(stdin),
-    new ConsoleStdout((b) => router.push("stdout", b)),
-    new ConsoleStdout((b) => router.push("stderr", b)),
+    new ConsoleStdout((b) => {
+      consoleBytes += b.length;
+      router.push("stdout", b);
+    }),
+    new ConsoleStdout((b) => {
+      consoleBytes += b.length;
+      router.push("stderr", b);
+    }),
     createBridgeFd(new BridgeChannel(fsChannel), "/mnt/host"),
     undefined,
     undefined,

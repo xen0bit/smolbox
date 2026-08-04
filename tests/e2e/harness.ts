@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Page } from "@playwright/test";
 
+export const casesPath = fileURLToPath(new URL("../../tests/conformance/cases.json", import.meta.url));
+
 export interface Caps {
   version: string;
 }
@@ -42,6 +44,24 @@ export type SmolboxGlobal = { __smolbox?: unknown };
 export const BOOT_TIMEOUT_MS = 180_000;
 export const EXEC_TIMEOUT_MS = 120_000;
 
+// The emscripten runtime gets its own, larger budgets. It is not flakier than
+// the WASI build, just slower and far hungrier, and the shared numbers above are
+// sized for a runtime that boots in ~2 s and moves ~345 kB/s.
+//
+// Boot: ~7 s locally but ~16-22 s on a CI runner, and a live VM burns ~2.4 CPU
+// cores (QEMU's main loop busy-polls; see PLAN §2.11.15) against a 4-vCPU shared
+// runner, so contention spikes are expected. 180 s is 25x the local norm but
+// only ~8x the runner norm — this restores the proportion.
+//
+// Exec: the console moves ~35 kB/s (QEMU's 16550 UART writes one byte per
+// fd_write, each a proxyToMainThread hop), so the 1 MiB conformance case is
+// ~48 s of pure transfer locally and ~3 min in CI.
+//
+// These are harness budgets, not behaviour assertions: every case must still
+// pass unchanged, it just needs room to finish.
+export const EMSCRIPTEN_BOOT_TIMEOUT_MS = 360_000;
+export const EMSCRIPTEN_EXEC_TIMEOUT_MS = 300_000;
+
 // A mount fixture as a serializable tree; symlinks are carried separately so
 // the browser bridge can present them as virtual entries.
 export type FixtureNode =
@@ -75,6 +95,7 @@ export async function walkFixture(dir: string): Promise<FixtureNode> {
 export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
   await page.goto("/");
   await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
+
 
   if (fixture) {
     await page.evaluate(
@@ -120,17 +141,53 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
     );
   }
 
-  const caps = await page.evaluate(
-    (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
-    BOOT_TIMEOUT_MS,
-  );
+  return attach(page);
+}
+
+// Boot the emscripten (--to-js) page at /js/. That build has no host mount, so
+// there is no fixture to install: setMount is a no-op there and /mnt/host stays
+// empty. Everything past the page load is the same framed protocol.
+export async function bootJs(page: Page): Promise<Handle> {
+  await page.goto("/js/");
+  await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
+  return attach(page, EMSCRIPTEN_EXEC_TIMEOUT_MS, EMSCRIPTEN_BOOT_TIMEOUT_MS);
+}
+
+// Drive window.__smolbox.boot and wrap the remaining session calls. Shared by
+// both pages: the WASI worker and the emscripten runtime expose the same hook.
+async function attach(
+  page: Page,
+  execTimeoutMs = EXEC_TIMEOUT_MS,
+  bootTimeoutMs = BOOT_TIMEOUT_MS,
+): Promise<Handle> {
+  // Boot hangs are rare and so far only seen on CI, so a failure has to carry
+  // its own evidence: the worker's stall reports (see web/src/worker.ts) arrive
+  // as console lines, and silence in them is as informative as their contents.
+  const log: string[] = [];
+  const onConsole = (m: { text(): string }): void => {
+    log.push(`${new Date().toISOString()} ${m.text()}`.slice(0, 300));
+  };
+  page.on("console", onConsole);
+
+  let caps: Caps;
+  try {
+    caps = await page.evaluate(
+      (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
+      bootTimeoutMs,
+    );
+  } catch (err) {
+    const tail = log.slice(-40).join("\n") || "(no console output at all)";
+    throw new Error(`${String(err)}\n\n--- page console (last 40 lines) ---\n${tail}`);
+  } finally {
+    page.off("console", onConsole);
+  }
 
   return {
     boot: () => Promise.resolve(caps),
     exec: (req, timeoutMs) =>
       page.evaluate(
         ({ req, timeoutMs }) => (globalThis as SmolboxGlobal).__smolbox!.exec(req, timeoutMs),
-        { req, timeoutMs: timeoutMs ?? EXEC_TIMEOUT_MS },
+        { req, timeoutMs: timeoutMs ?? execTimeoutMs },
       ),
     close: (timeoutMs) =>
       page.evaluate(
@@ -187,3 +244,17 @@ export function checkExpect(e: Expect, r: Response): string[] {
 }
 
 export const mountFixturePath = fileURLToPath(new URL("../../testdata/mount", import.meta.url));
+
+// The shared conformance table. `requires` tags a case with the capabilities it
+// needs; the Go driver and the WASI browser driver run everything, while the
+// emscripten driver skips ["mount"] because that build has no host mount.
+export interface CaseSpec {
+  name: string;
+  requires?: string[];
+  steps: Array<{ request: Request; expect: Expect }>;
+}
+
+export async function loadCases(): Promise<CaseSpec[]> {
+  const table = JSON.parse(await readFile(casesPath, "utf8")) as { cases: CaseSpec[] };
+  return table.cases;
+}

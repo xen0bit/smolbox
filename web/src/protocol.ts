@@ -192,39 +192,70 @@ function parseSeqFrame(line: Uint8Array, prefix: string, kind: FrameKind): Frame
 // FrameDecoder consumes arbitrary byte chunks from the guest console and
 // yields complete frames, discarding non-prefixed lines (kernel noise) the way
 // the Go Scanner does.
+// Growth and scanning are both amortized O(1) per byte: the buffer doubles
+// instead of reallocating per chunk, and `scanned` remembers how far the
+// newline search already got. The emscripten console feeds this one byte at a
+// time (QEMU's 16550 UART writes per character), so a decoder that recopied and
+// rescanned the pending line on every chunk turned a 1 MiB response into
+// minutes of quadratic work.
+const initialCapacity = 4096;
+
 export class FrameDecoder {
-  private buf: Uint8Array = new Uint8Array(0);
+  private buf = new Uint8Array(initialCapacity);
+  private start = 0; // first unconsumed byte
+  private end = 0; // one past the last valid byte
+  private scanned = 0; // [start, scanned) is known to hold no newline
 
   feed(chunk: Uint8Array): Frame[] {
-    if (this.buf.length === 0) {
-      this.buf = chunk;
-    } else {
-      const next = new Uint8Array(this.buf.length + chunk.length);
-      next.set(this.buf, 0);
-      next.set(chunk, this.buf.length);
-      this.buf = next;
-    }
+    this.append(chunk);
     const frames: Frame[] = [];
-    let start = 0;
     for (;;) {
-      const nl = this.buf.indexOf(0x0a, start);
+      const nl = this.buf.subarray(this.scanned, this.end).indexOf(0x0a);
       if (nl < 0) {
+        this.scanned = this.end;
         break;
       }
-      const line = this.buf.subarray(start, nl);
-      start = nl + 1;
-      const frame = parseLine(line);
+      const at = this.scanned + nl;
+      const frame = parseLine(this.buf.subarray(this.start, at));
+      this.start = at + 1;
+      this.scanned = this.start;
       if (frame) {
         frames.push(frame);
       }
     }
-    if (start === this.buf.length) {
-      this.buf = new Uint8Array(0);
-    } else if (start > 0) {
-      this.buf = this.buf.slice(start);
-    } else if (this.buf.length > MaxFrameSize) {
+    if (this.start === this.end) {
+      this.start = 0;
+      this.end = 0;
+      this.scanned = 0;
+    } else if (this.end - this.start > MaxFrameSize) {
       throw new ProtocolError("frame exceeds MaxFrameSize");
     }
     return frames;
+  }
+
+  private append(chunk: Uint8Array): void {
+    if (chunk.length === 0) {
+      return;
+    }
+    if (this.end + chunk.length > this.buf.length) {
+      const pending = this.end - this.start;
+      const needed = pending + chunk.length;
+      if (needed <= this.buf.length) {
+        this.buf.copyWithin(0, this.start, this.end);
+      } else {
+        let capacity = this.buf.length;
+        while (capacity < needed) {
+          capacity *= 2;
+        }
+        const next = new Uint8Array(capacity);
+        next.set(this.buf.subarray(this.start, this.end), 0);
+        this.buf = next;
+      }
+      this.scanned -= this.start;
+      this.start = 0;
+      this.end = pending;
+    }
+    this.buf.set(chunk, this.end);
+    this.end += chunk.length;
   }
 }

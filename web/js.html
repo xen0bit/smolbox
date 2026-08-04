@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>smolbox</title>
+    <title>smolbox — emscripten build</title>
     <style>
       body {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -31,18 +31,22 @@
   </head>
   <body>
     <main>
-      <h1>smolbox</h1>
+      <h1>smolbox <small>(emscripten build)</small></h1>
       <p id="status">starting…</p>
       <button id="run" type="button">boot the VM and run echo hello</button>
-      <button id="pick" type="button">…</button>
       <pre id="output"></pre>
       <p>
-        This is the WASI build: it runs under wazero and in the browser, and it
-        is the one that can mount a host folder read-only at
-        <code>/mnt/host</code>. The faster emscripten build lives at
-        <a href="/js/">/js/</a> and has <strong>no host mount</strong>.
+        The emscripten <code>--to-js</code> target runs the same guest under
+        QEMU with JIT and multi-threading. It is faster than the WASI build but
+        has <strong>no host mount</strong> — <code>/mnt/host</code> is an empty
+        directory here. See the WASI page (<a href="/">/</a>) for the mount.
       </p>
     </main>
-    <script type="module" src="/main.js"></script>
+    <script>
+      window.Module = window.Module ?? {};
+    </script>
+    <script src="./load.js"></script>
+    <script src="./arg-module.js"></script>
+    <script type="module" src="./main.js"></script>
   </body>
 </html>
