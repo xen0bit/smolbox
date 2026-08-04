@@ -22,3 +22,14 @@ interface Element {
   textContent: string | null;
   addEventListener(type: "click", listener: (ev: unknown) => void): void;
 }
+
+// File System Access API: the browser globals our mount providers use, typed
+// against the structural handles in fsbridge/main-host.ts so no DOM lib is
+// pulled in. bun-types declares a minimal Navigator; merge `storage` into it.
+declare function showDirectoryPicker(
+  options?: { mode?: "read" | "readwrite" },
+): Promise<import("./fsbridge/main-host").DirectoryHandleLike>;
+
+interface Navigator {
+  storage: import("./fsbridge/main-host").StorageManagerLike;
+}

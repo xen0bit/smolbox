@@ -11,9 +11,9 @@ runs under [wazero](https://wazero.io) (local CLI, tests) and later in a browser
 directory read-only at `/mnt/host`. A future on-device LLM will drive it through a framed exec API.
 
 Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
-CLI), M3 (read-only host mount under wazero + shared conformance table), and M4 (browser worker +
-stdio router + TS session, preopen spike proven) done. M5 (sync FS bridge + browser mount) is
-next.**
+CLI), M3 (read-only host mount under wazero + shared conformance table), M4 (browser worker +
+stdio router + TS session, preopen spike proven), and M5 (sync FS bridge + browser mount + browser
+conformance driver) done. M6 (emscripten `--to-js` target) is next.**
 
 ## Toolchain
 
@@ -21,7 +21,8 @@ next.**
   **v1.11.0** because v1.12+ requires go ≥ 1.25.
 - **Docker 29.x** with the daemon socket at `/var/run/docker.sock` — required for `make wasm`.
 - **bun 1.2.x** for all web tooling (bundle, `bun test`, `bunx --bun tsc`, dev server). Node is
-  irrelevant; Playwright (M4) may need a Node pin — revisit then.
+  irrelevant; Playwright's runner works under bun (`bunx --bun playwright test`), so no Node pin
+  (risk 7, resolved at M4).
 - **golangci-lint v2** (`~/.golangci.yml` uses the v2 schema). In CI it is installed via
   `golangci/golangci-lint-action@v7`, **not** golangci's `install.sh`: that script's checksum grep
   also matches the release `*.tar.gz.sbom.json` line and always fails for v2.x releases. (v6 of the
@@ -40,12 +41,12 @@ next.**
 | `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page, copy `smolbox.wasm` + `index.html`; Bun dev server with COOP/COEP |
-| `make test-web` | `bun test web/src` (protocol framing + session unit tests) |
-| `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium, `echo hello` + preopen spike (M4) |
+| `make test-web` | `bun test web/src` (protocol + session + fsbridge unit tests) |
+| `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
-`dist/smolbox.wasm`).
+`dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`.
 
 ## How the VM is built (the two Dockerfiles)
 
@@ -97,6 +98,28 @@ the emulator's `fd_read` consumes them and `Atomics.wait` lets the worker sleep 
 Responses come back over postMessage, raised inside the worker's `fd_write`. This is the stdin half
 of the M5 fsbridge.
 
+### The sync FS bridge: all caching and the handle live on the main thread
+The mount (`web/src/fsbridge/`) is a second SAB (`{type:"fschannel"}` + `{type:"fsreq"}`), the same
+shape as stdin but two-way: the worker's `BridgeFd` encodes a request, posts a wake, and blocks on
+`Atomics.wait`; the main thread's `MountHost` performs the async `FileSystemDirectoryHandle` reads
+and replies via `Atomics.notify`. **All caching (memoized STAT/READDIR, chunk LRU, path→handle map)
+and the handle itself live in `MountHost` on the main thread** — the worker cannot receive
+postMessage mid-run, so worker-side cache invalidation on `remount()` is impossible without an epoch
+dance. `remount()` is a main-thread-only cache clear; the VM boots with an empty mount until the
+page calls `setMount(handle, links)`. (PLAN §4.4.)
+
+### The bridge's virtual symlink table
+The File System Access API has no symlink concept, so `MountHost` keeps a path→target table checked
+before the directory handle, and the worker's readdir/stat report `FILETYPE_SYMBOLIC_LINK`. The e2e
+fixture derives it from `testdata/mount`'s real symlink, keeping the single-conformance-table
+invariant. When adding a symlink to the fixture, the browser must see it via this table, not OPFS.
+
+### TextDecoder/TextEncoder throw on SharedArrayBuffer views
+Chromium rejects decoding a `Uint8Array` whose buffer is a `SharedArrayBuffer` ("...must not be
+shared"). The fsbridge `.slice()`s request/response bytes out of the SAB before decoding on **both**
+ends (PLAN §2.11.13); the READ payload window is copied with `TypedArray.prototype.slice`, which
+already allocates a non-shared buffer.
+
 ### Browser poll_oneoff: convert every clock into one timeline
 The base browser_wasi_shim `poll_oneoff` only handles a single clock subscription and busy-loops;
 `web/src/worker.ts` replaces it entirely (the guest kernel polls fd 0 for console input, driven by
@@ -111,12 +134,14 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
   shared conformance table.
 - `tests/conformance/cases.json` is the single declarative table: `{name, steps[{request,
   expect}]}` where `expect` is a partial `protocol.Response` matcher. The wazero driver (M3) runs it
-  today; the browser driver (M5) must run the **same** file so behaviour cannot diverge. Each case
+  today; the browser driver (M5) runs the **same** file so behaviour cannot diverge. Each case
   boots a fresh session; ordered steps give stateful cases (timeout→orphan-check, cd persists).
-- `tests/e2e/` (Playwright, M4) boots `dist/smolbox.wasm` in headless Chromium through the real
-  worker + `window.__smolbox` hook: `echo hello` and the preopen spike (in-memory `/mnt/host`).
-  Playwright runs under bun (`bunx --bun playwright test`); install browsers with
-  `bunx --bun playwright install chromium`. The e2e suite is not in CI yet (M5).
+- `tests/e2e/` (Playwright, M4/M5) boots `dist/smolbox.wasm` in headless Chromium through the real
+  worker + `window.__smolbox` hook: `echo hello`, an OPFS mount smoke, and the full conformance
+  table (`conformance.spec.ts`). The mount is an OPFS tree walked from `testdata/mount` on the Node
+  side (`tests/e2e/harness.ts` `walkFixture`), with the fixture's symlink registered as a virtual
+  link. Playwright runs under bun (`bunx --bun playwright test`); install browsers with
+  `bunx --bun playwright install chromium`. `test-e2e` is in CI (M5).
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
   (busybox sorts alphabetically) or the fixture/table drift silently.
 
@@ -132,5 +157,7 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
 1. `make lint test` green (M0 gate).
 2. If the VM or guest changed: `make wasm` succeeds and `make test-integration` passes.
 3. If the conformance table or a `testdata/` fixture changed: `make test-conformance` passes.
-4. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
-5. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
+4. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
+   (the browser must still pass the same conformance table as Go).
+5. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
+6. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.

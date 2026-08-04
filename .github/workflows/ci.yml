@@ -70,3 +70,40 @@ jobs:
 
       - name: Conformance table (wazero driver)
         run: make test-conformance
+
+  browser-e2e:
+    name: browser e2e (conformance parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.18"
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ hashFiles('bun.lock') }}
+
+      - name: Install web deps
+        run: bun install --frozen-lockfile
+
+      - name: Cache dist/smolbox.wasm
+        uses: actions/cache@v4
+        with:
+          path: dist/smolbox.wasm
+          key: smolbox-wasm-${{ hashFiles('vm/Dockerfile', 'guest/**', 'build/Dockerfile.c2w', 'go.mod', 'go.sum') }}
+
+      - name: Build wasm (if not cached)
+        run: |
+          if [ ! -f dist/smolbox.wasm ]; then
+            make wasm
+          fi
+
+      - name: Install Chromium
+        run: bunx --bun playwright install --with-deps chromium
+
+      - name: E2E (boot + browser conformance table)
+        run: make test-e2e

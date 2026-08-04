@@ -4,11 +4,13 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: M4 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
+> **Status: M5 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
 > guest agent's ready banner under wazero in ~3.2 s and **in a browser in ~2.6 s**, with the read-only
-> host mount working under wazero and the browser preopen mechanism proven by spike. The `smolbox`
-> CLI (`exec`/`repl`) drives it over the framed protocol, and a shared conformance table
-> (`tests/conformance/cases.json`) pins the behaviour. The browser mount bridge is the next milestone.
+> host mount working under wazero and in the browser via the sync FS bridge (a folder picked with the
+> File System Access API is mounted read-only at `/mnt/host`). The `smolbox` CLI (`exec`/`repl`) drives
+> it over the framed protocol, and a shared conformance table (`tests/conformance/cases.json`) pins
+> the behaviour — **the same table passes under both wazero and Chromium**. The emscripten `--to-js`
+> target is the next milestone.
 > See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
 
 ---
@@ -118,7 +120,8 @@ dependencies.
 The VM artifact is exercised today through `make test-integration` (boots `dist/smolbox.wasm` under
 wazero and runs the framed protocol matrix over the guest agent), and by hand through the `smolbox`
 CLI (`exec`/`repl`). In the browser it is exercised through `make test-e2e` (Playwright boots the
-same artifact in headless Chromium and runs `echo hello`, plus the preopen spike).
+same artifact in headless Chromium: `echo hello`, an OPFS-backed mount smoke, and the **full
+conformance table** — the browser passes the same `cases.json` as the Go driver).
 
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. The directory picker is

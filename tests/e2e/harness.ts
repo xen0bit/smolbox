@@ -1,0 +1,189 @@
+// Shared helpers for the Playwright e2e suites: boot the VM through the page's
+// window.__smolbox hook, install a mount into OPFS (the File System Access API
+// without a native dialog), and apply the conformance expect matchers — the TS
+// twin of tests/conformance/driver.go's expect.check.
+
+import { lstat, readFile, readdir, readlink } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Page } from "@playwright/test";
+
+export interface Caps {
+  version: string;
+}
+
+export interface Request {
+  op: string;
+  cmd?: string;
+  cwd?: string;
+  stdin?: string;
+  timeout_ms?: number;
+  max_output?: number;
+}
+
+export interface Response {
+  seq: number;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  timed_out: boolean;
+  truncated: boolean;
+  duration_ms: number;
+}
+
+export interface Handle {
+  boot(timeoutMs?: number): Promise<Caps>;
+  exec(req: Request, timeoutMs?: number): Promise<Response>;
+  close(timeoutMs?: number): Promise<void>;
+}
+
+export type SmolboxGlobal = { __smolbox?: unknown };
+
+export const BOOT_TIMEOUT_MS = 180_000;
+export const EXEC_TIMEOUT_MS = 120_000;
+
+// A mount fixture as a serializable tree; symlinks are carried separately so
+// the browser bridge can present them as virtual entries.
+export type FixtureNode =
+  | { kind: "file"; content: string }
+  | { kind: "dir"; children: Record<string, FixtureNode> }
+  | { kind: "symlink"; target: string };
+
+// Walk a host directory (e.g. testdata/mount) into a FixtureNode. This is the
+// single source of truth for the browser mount: it mirrors exactly what the
+// wazero driver mounts on the Go side.
+export async function walkFixture(dir: string): Promise<FixtureNode> {
+  const children: Record<string, FixtureNode> = {};
+  for (const name of await readdir(dir)) {
+    const p = path.join(dir, name);
+    const st = await lstat(p);
+    if (st.isSymbolicLink()) {
+      children[name] = { kind: "symlink", target: await readlink(p) };
+    } else if (st.isDirectory()) {
+      children[name] = await walkFixture(p);
+    } else {
+      children[name] = { kind: "file", content: await readFile(p, "utf8") };
+    }
+  }
+  return { kind: "dir", children };
+}
+
+// Populate OPFS with the fixture and mount it via the page's setMount, then
+// boot the VM. OPFS persists per origin, so the root is cleared first; real
+// symlinks become the bridge's virtual symlink table. If fixture is omitted,
+// the mount is left empty (the preopen still resolves as an empty directory).
+export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
+  await page.goto("/");
+  await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
+
+  if (fixture) {
+    await page.evaluate(
+      async (tree) => {
+        const links: Record<string, string> = {};
+        const root = await navigator.storage.getDirectory();
+        for await (const [name] of root.entries()) {
+          await root.removeEntry(name, { recursive: true });
+        }
+
+        const writeNode = async (
+          dir: FileSystemDirectoryHandle,
+          node: FixtureNode,
+          abs: string,
+        ): Promise<void> => {
+          if (node.kind === "symlink") {
+            links[abs] = node.target;
+            return;
+          }
+          if (node.kind === "dir") {
+            for (const [name, child] of Object.entries(node.children)) {
+              const childAbs = abs === "/" ? `/${name}` : `${abs}/${name}`;
+              if (child.kind === "file") {
+                const fh = await dir.getFileHandle(name, { create: true });
+                const writable = await fh.createWritable();
+                await writable.write(child.content);
+                await writable.close();
+              } else if (child.kind === "dir") {
+                const sub = await dir.getDirectoryHandle(name, { create: true });
+                await writeNode(sub, child, childAbs);
+              } else if (typeof child.target === "string") {
+                links[childAbs] = child.target;
+              }
+            }
+          }
+        };
+
+        await writeNode(root, tree as FixtureNode, "/");
+        const api = (globalThis as unknown as { __smolbox?: { setMount(h: unknown, l?: Record<string, string>): void } }).__smolbox;
+        api?.setMount(root, links);
+      },
+      fixture,
+    );
+  }
+
+  const caps = await page.evaluate(
+    (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
+    BOOT_TIMEOUT_MS,
+  );
+
+  return {
+    boot: () => Promise.resolve(caps),
+    exec: (req, timeoutMs) =>
+      page.evaluate(
+        ({ req, timeoutMs }) => (globalThis as SmolboxGlobal).__smolbox!.exec(req, timeoutMs),
+        { req, timeoutMs: timeoutMs ?? EXEC_TIMEOUT_MS },
+      ),
+    close: (timeoutMs) =>
+      page.evaluate(
+        (timeoutMs) => (globalThis as SmolboxGlobal).__smolbox!.close(timeoutMs),
+        timeoutMs ?? 15_000,
+      ),
+  };
+}
+
+// Partial matcher, mirroring tests/conformance/driver.go's expect.check. Only
+// the fields that are set are asserted; returns a list of human-readable diffs.
+export interface Expect {
+  exit_code?: number;
+  stdout?: string;
+  stdout_contains?: string;
+  stdout_not_contains?: string;
+  stdout_len?: number;
+  stderr?: string;
+  stderr_contains?: string;
+  timed_out?: boolean;
+  truncated?: boolean;
+}
+
+export function checkExpect(e: Expect, r: Response): string[] {
+  const diffs: string[] = [];
+  if (e.exit_code !== undefined && r.exit_code !== e.exit_code) {
+    diffs.push(`exit_code = ${r.exit_code}, want ${e.exit_code}`);
+  }
+  if (e.stdout !== undefined && r.stdout !== e.stdout) {
+    diffs.push(`stdout = ${JSON.stringify(r.stdout)}, want ${JSON.stringify(e.stdout)}`);
+  }
+  if (e.stdout_contains !== undefined && !r.stdout.includes(e.stdout_contains)) {
+    diffs.push(`stdout ${JSON.stringify(r.stdout)} missing ${JSON.stringify(e.stdout_contains)}`);
+  }
+  if (e.stdout_not_contains !== undefined && r.stdout.includes(e.stdout_not_contains)) {
+    diffs.push(`stdout must not contain ${JSON.stringify(e.stdout_not_contains)}`);
+  }
+  if (e.stdout_len !== undefined && r.stdout.length !== e.stdout_len) {
+    diffs.push(`stdout len = ${r.stdout.length}, want ${e.stdout_len}`);
+  }
+  if (e.stderr !== undefined && r.stderr !== e.stderr) {
+    diffs.push(`stderr = ${JSON.stringify(r.stderr)}, want ${JSON.stringify(e.stderr)}`);
+  }
+  if (e.stderr_contains !== undefined && !r.stderr.includes(e.stderr_contains)) {
+    diffs.push(`stderr ${JSON.stringify(r.stderr)} missing ${JSON.stringify(e.stderr_contains)}`);
+  }
+  if (e.timed_out !== undefined && r.timed_out !== e.timed_out) {
+    diffs.push(`timed_out = ${r.timed_out}, want ${e.timed_out}`);
+  }
+  if (e.truncated !== undefined && r.truncated !== e.truncated) {
+    diffs.push(`truncated = ${r.truncated}, want ${e.truncated}`);
+  }
+  return diffs;
+}
+
+export const mountFixturePath = fileURLToPath(new URL("../../testdata/mount", import.meta.url));

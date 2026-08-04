@@ -1,12 +1,14 @@
 // M4 worker: forks upstream examples/wasi-browser/htdocs/worker.js, swapping
-// xterm-pty for the framed stdio router and the certificates dir for an
-// in-memory /mnt/host preopen (the spike). All session I/O flows through a
-// shared-memory stdin channel: this thread runs the module synchronously (so it
-// cannot receive postMessage during the session), while the main thread writes
-// REQ frames straight into the SAB.
+// xterm-pty for the framed stdio router and the certificates dir for the sync
+// FS bridge preopen at /mnt/host (M5). All session I/O flows through a
+// shared-memory stdin channel, and all mount I/O through a second
+// shared-memory bridge channel: this thread runs the module synchronously (so
+// it cannot receive postMessage during the session), while the main thread
+// writes REQ frames straight into the SABs and services fsbridge requests.
 
 import { ConsoleStdout, Fd, WASI, wasi } from "@bjorn3/browser_wasi_shim";
-import { inMemoryMount, spikeMountTree } from "./mount.ts";
+import { BridgeChannel, createBridgeSab } from "./fsbridge/protocol.ts";
+import { createBridgeFd } from "./fsbridge/worker-fd.ts";
 import type { Caps, Response } from "./protocol.ts";
 import { StdinChannel, StdioRouter } from "./stdio.ts";
 
@@ -18,6 +20,9 @@ function postLog(msg: string): void {
 
 const stdin = StdinChannel.create();
 postMessage({ type: "channel", sab: stdin.sab });
+
+const fsChannel = createBridgeSab();
+postMessage({ type: "fschannel", sab: fsChannel });
 
 const router = new StdioRouter(stdin, {
   onReady: (caps: Caps) => postMessage({ type: "ready", caps }),
@@ -127,7 +132,7 @@ async function run(): Promise<void> {
     new StdinFd(stdin),
     new ConsoleStdout((b) => router.push("stdout", b)),
     new ConsoleStdout((b) => router.push("stderr", b)),
-    inMemoryMount("/mnt/host", spikeMountTree),
+    createBridgeFd(new BridgeChannel(fsChannel), "/mnt/host"),
     undefined,
     undefined,
   ];
