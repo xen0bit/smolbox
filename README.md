@@ -4,14 +4,16 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: M6 complete.** The VM builds (`make wasm` → `dist/smolbox.wasm`, 108 MB) and boots to the
-> guest agent's ready banner under wazero in ~3.2 s and **in a browser in ~2.6 s**, with the read-only
-> host mount working under wazero and in the browser via the sync FS bridge (a folder picked with the
-> File System Access API is mounted read-only at `/mnt/host`). The `smolbox` CLI (`exec`/`repl`) drives
-> it over the framed protocol, and a shared conformance table (`tests/conformance/cases.json`) pins
-> the behaviour — **the same table passes under wazero, under Chromium, and (minus the mount cases)
-> under the emscripten `--to-js` build**, which now ships too. Next is M7: the tool-call API docs,
-> JSON Schema, and a mock caller for the future WebGPU model.
+> **Status: component 1 is complete (M0–M7).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
+> 108 MB) and boots to the guest agent's ready banner under wazero in ~3.2 s and **in a browser in
+> ~2.6 s**, with the read-only host mount working under wazero and in the browser via the sync FS
+> bridge (a folder picked with the File System Access API is mounted read-only at `/mnt/host`). The
+> `smolbox` CLI (`exec`/`repl`) drives it over the framed protocol, and a shared conformance table
+> (`tests/conformance/cases.json`) pins the behaviour — **the same table passes under wazero, under
+> Chromium, and (minus the mount cases) under the emscripten `--to-js` build**, which ships too. The
+> tool-call surface is specified and tested: [`docs/tool-api.md`](docs/tool-api.md), JSON Schemas
+> generated from the Go types, and **a mock caller that runs a scripted tool-call transcript against
+> a real VM** — so the WebGPU model, when it lands, is a consumer of a proven API.
 > See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
 
 ---
@@ -86,10 +88,15 @@ resp, err := session.Exec(ctx, protocol.Request{
 
 ### The agent
 
-- The exec API is exposed as a `run_terminal_command` tool definition, ready for function calling.
+- The exec API is exposed as a single `run_terminal_command` tool definition, ready for function
+  calling in either the Anthropic or the OpenAI dialect, from Go and from TypeScript. Listing a
+  directory, reading a file, searching a tree — those are commands, not more tools.
+- The model never chooses the *operation*: `op` is not in the tool's schema, and a call that sets it
+  is rejected before the session sees it. A model cannot talk its own sandbox into `shutdown`.
 - A WebGPU model in the page calls it, reads the folder the user picked, and reports back.
 - The tool surface is fully specified and tested against a mock caller **before** any model is
-  wired in — the model is a consumer of a proven API, not a prerequisite for it.
+  wired in — the model is a consumer of a proven API, not a prerequisite for it. See
+  [docs/tool-api.md](docs/tool-api.md).
 
 ### Build and test
 
@@ -188,7 +195,8 @@ xterm-pty already uses for terminal I/O, which is why cross-origin isolation is 
 ## Documentation
 
 - [PLAN.md](PLAN.md) — implementation plan, research notes, upstream references, risks
-- `docs/tool-api.md` — the exec API and tool definitions *(M7)*
+- [docs/tool-api.md](docs/tool-api.md) — the exec API and the `run_terminal_command` tool definition
+- [docs/schema/](docs/schema) — JSON Schemas, generated from the Go wire types (`make generate`)
 
 ## Built on
 

@@ -13,8 +13,9 @@ directory read-only at `/mnt/host`. A future on-device LLM will drive it through
 Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
 CLI), M3 (read-only host mount under wazero + shared conformance table), M4 (browser worker +
 stdio router + TS session, preopen spike proven), M5 (sync FS bridge + browser mount + browser
-conformance driver), and M6 (emscripten `--to-js` target + its conformance driver) done. M7
-(tool-API docs, JSON Schema, mock caller) is next.**
+conformance driver), M6 (emscripten `--to-js` target + its conformance driver), and M7 (tool-API
+docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.** What
+remains is component 2, the WebGPU model, which is out of scope for PLAN.md.
 
 ## Toolchain
 
@@ -40,10 +41,11 @@ conformance driver), and M6 (emscripten `--to-js` target + its conformance drive
 | `make wasm` | convert the guest to `dist/smolbox.wasm` (needs Docker) |
 | `make wasm-js` | convert the guest to `dist/js/` via `c2w --to-js` (emscripten/QEMU, **no host mount**) |
 | `make test-integration` | boot `dist/smolbox.wasm` under wazero, session-lifecycle tests only |
-| `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver |
+| `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver, **plus the mock caller** (M7) |
+| `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page, copy `smolbox.wasm` + `index.html`; Bun dev server with COOP/COEP |
-| `make test-web` | `bun test web/src` (protocol + session + fsbridge unit tests) |
+| `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
 | `make clean` | remove `dist/ bin/ web/dist/` |
@@ -186,6 +188,36 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
 ~24.8-day `Atomics.wait` and a VM that boots forever. Normalise all deadlines to
 `performance.now()` ms before waiting. (PLAN §2.11.11-12.)
 
+### The tool surface: schemas are derived, never written
+`internal/tool` is the model-facing view of `internal/protocol`. `docs/schema/*.json` is **generated**
+— reflection over the wire structs, run by `make generate`. Never hand-edit those files;
+`TestArtifactsAreCurrent` fails under `make test` the moment they drift.
+
+The one thing that *is* hand-written is the field descriptions, and they live in `internal/tool`
+rather than as doc comments on `protocol.Request`/`Response`: they are prompt text a model reads, not
+Go documentation. **A wire field with no description is a hard failure** (`objectSchema` errors, and
+because the schemas are package-level vars it panics at init) — that is deliberate, and it is what
+stops the model-facing surface from quietly growing when someone adds a field. Add the field, add the
+description, run `make generate`.
+
+`web/src/tool.ts` is a hand-written twin like `protocol.ts`, held to the Go original by
+`tool.test.ts` deep-equalling the generated JSON. Change one side, run both suites.
+
+### The model never chooses the op
+The tool's input schema is `protocol.Request` **minus `op`**, and `DecodeArgs` rejects any argument
+object that sets one (`ErrOpNotAllowed`), before the session is touched. `run_terminal_command` is
+the exec surface and nothing else — a model must not be able to talk its own sandbox into `shutdown`
+by naming it in an argument object. Unknown fields are rejected too, so a hallucinated argument comes
+back as a correctable error rather than a silently dropped flag. If you widen the tool surface, keep
+both guards and extend the negative tests in `tool_test.go`, `tool.test.ts`, and the mock caller.
+
+### Render() omits duration_ms on purpose
+The mock caller asserts rendered results **verbatim**, so anything wall-clock in the rendering would
+make every transcript unstable. `Call` hands back the raw `*protocol.Response` alongside the text for
+hosts that want the timing. The exact format is pinned by `tests/tool/render-cases.json`, which the
+Go and bun suites both run — the same shared-table trick as the conformance table, one level up. Add
+a rendering rule there first, then implement it twice.
+
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
@@ -218,7 +250,12 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
   the shared table. Context teardown is clean (CPU back to ~3 % within 3 s), so don't go hunting for
   leaked workers; that was checked.
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
-  (busybox sorts alphabetically) or the fixture/table drift silently.
+  (busybox sorts alphabetically) or the fixture/table drift silently. **The mock caller's first step
+  asserts that same listing verbatim**, so a new fixture means editing `toolcall_test.go` too.
+- `tests/conformance/toolcall_test.go` (M7) is the mock caller: one continuous session of 12 scripted
+  tool calls with every rendering asserted verbatim. It stands in for the model that does not exist
+  yet. Keep it a *transcript* — ordered, stateful, and exact — rather than a set of independent
+  assertions; the ordering is half of what it proves.
 
 ### Conventions
 - **Do not add comments to code unless asked.** One-line doc comments on exported Go identifiers are
@@ -231,10 +268,13 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
 ## Verify before committing
 1. `make lint test` green (M0 gate).
 2. If the VM or guest changed: `make wasm` succeeds and `make test-integration` passes.
-3. If the conformance table or a `testdata/` fixture changed: `make test-conformance` passes.
-4. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
+3. If the conformance table or a `testdata/` fixture changed: `make test-conformance` passes (it also
+   runs the mock caller).
+4. If `internal/protocol` or `internal/tool` changed: `make generate`, then `make test test-web` —
+   the generated schemas, the TS twin, and the docs tables all have drift gates.
+5. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
    (the browser must still pass the same conformance table as Go). If shared code under `web/src/`
    changed, also run `make test-e2e-js` with `dist/js` present — the emscripten page reuses
    `protocol.ts`, `stdio.ts` and `session.ts` verbatim.
-5. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
-6. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
+6. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
+7. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.

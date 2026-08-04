@@ -3,7 +3,9 @@
 > Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), M3 (read-only host
 > mount under wazero + shared conformance table), M4 (browser worker + stdio router + TS session,
 > with the preopen spike), M5 (sync FS bridge + browser mount + browser conformance driver), and
-> M6 (emscripten `--to-js` target) complete. M7 (tool-API docs, JSON Schema, mock caller) is next.
+> M6 (emscripten `--to-js` target), and M7 (tool-API docs, JSON Schema, mock caller) complete.
+> **Every milestone in §6 is done**; what remains is component 2, the WebGPU model, which is out of
+> scope for this plan and now has a specified, tested surface to drop into.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -190,6 +192,30 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
      buffer's compact/grow path in order.
 - **QEMU never exits, so there is no clean teardown** (§2.11.17). `SmolboxHandle.close()` on the
   emscripten page shuts the *agent* down and calls the session over; the runtime dies with the page.
+
+### Measured at M7 (2026-08-04, this machine)
+
+- **The mock caller passes on the first run: 12 scripted tool calls, every rendering asserted
+  verbatim** (`tests/conformance/toolcall_test.go`, ~10 s for the transcript, ~23 s for all three
+  tests including three VM boots). It is one continuous session — orient, read, search, a search
+  that finds nothing, a refused write, `cd`, a relative-path report, stdin, per-call env, a timeout,
+  a truncation — so ordering and persistence are part of what is asserted.
+- **The tool surface costs three Go files, one generator, one TS twin, and no new dependencies.**
+  `internal/tool` derives the JSON Schemas from the `internal/protocol` structs by reflection;
+  nothing is hand-maintained except the descriptions, and a field with no description is a build
+  failure rather than an undocumented property. `make test` runs the whole gate in under a second
+  with no Docker.
+- **Anti-drift is enforced in three places, all cheap:** `TestArtifactsAreCurrent` fails when a
+  checked-in `docs/schema/*.json` no longer matches the Go types (verified by perturbing a file:
+  it fails, `make generate` clears it); `web/src/tool.test.ts` deep-equals the TS twin against those
+  same generated files; and `TestDocsTableMatchesInputSchema` holds the field tables in
+  `docs/tool-api.md` to the schema's property list. `make test-web` is now **108 tests** (was 74);
+  `internal/tool` adds **38**.
+- **Two real bugs the schema work surfaced**, both pre-existing and neither caught by the
+  conformance table: `protocol.Response.Stdout` is a plain `[]byte`, so a silent command sends
+  `"stdout": null` and not `""` (§2.11.22), and the TS `Request.stdin` contract inverts the wire's
+  (§2.11.23). The first is now in the generated schema as `["string", "null"]`; the second would
+  have double-encoded every tool call carrying stdin.
 
 ---
 
@@ -522,6 +548,20 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     wazero. The e2e fixture walker initially double-wrapped directories, surfacing spurious
     `kind`/`children` symlink entries in `ls` — the `ls -1` conformance case catches any future
     regression.
+22. **A silent command sends `"stdout": null`, not `""`** (found at M7 while generating the schema).
+    `protocol.Response.Stdout` is a plain `[]byte` with no `omitempty`, and `encoding/json` renders a
+    nil slice as `null`. The TS side already survived it — `decodeBytes` returns `""` for anything
+    that is not a string — but nothing said so on purpose. The generated schema now types `stdout`
+    and `stderr` as `["string", "null"]`, derived automatically: any required field of a nilable Go
+    kind gets `null` added. A consumer that validates against the schema and assumes a string would
+    have failed on the first command that printed nothing.
+23. **`Request.stdin` means the opposite thing in Go and in TS, and the tool layer has to convert.**
+    On the wire and in Go it is base64 (`[]byte`, decoded by `json.Unmarshal`). In `web/src/protocol.ts`
+    it is `string | Uint8Array` where a **string is plain text** that `encodeRequest` base64s on the
+    way out. A tool call's `stdin` argument is base64, so `decodeArgs` in `web/src/tool.ts` must
+    `atob` it into a `Uint8Array`; passing the string straight through would double-encode every
+    call carrying stdin. The mock caller's stdin step is what pins the Go side of this, and
+    `tool.test.ts` asserts the decoded bytes on the TS side.
 
 ---
 
@@ -535,10 +575,15 @@ package.json + bun.lock       # web deps (typescript, @types/bun) — bun manage
 vm/Dockerfile                 # (1) THE VM: minimal Alpine guest image
 build/Dockerfile.c2w          # (2) BUILDS THE VM: c2w toolchain -> dist/smolbox.wasm
 cmd/smolbox/                  # CLI: one-shot exec + interactive REPL
+cmd/gen-tool-api/             # M7: writes docs/schema/*.json from the Go types (`make generate`)
 guest/smolagentd/             # guest agent, static linux/amd64, baked into vm/Dockerfile
 internal/protocol/            # wire types + framing, shared by host and guest
 internal/vm/                  # wazero wiring, boot, session lifecycle
 internal/hostfs/              # read-only mount provider interface + os-backed impl
+internal/tool/                # M7: the model-facing tool surface over the exec API
+  schema.go                   #   reflection -> JSON Schema, ordered properties
+  tool.go                     #   definition, dialect adapters, DecodeArgs, Call, Render
+  artifacts.go                #   the generated file set, shared by the generator and its test
 web/
   serve.ts                    # dev server: Bun.serve with COOP/COEP headers
   index.html                  # minimal page: boot/run UI + crossOriginIsolated check
@@ -552,6 +597,7 @@ web/
     protocol.ts               # TS twin of internal/protocol framing + types
     stdio.ts                  # stdio router: FrameDecoder + SAB stdin channel
     session.ts                # TS twin of internal/vm session client
+    tool.ts                   # M7: TS twin of internal/tool (definition, adapters, renderResult)
     mount.ts                  # M5: mount providers (picker / OPFS) behind one interface
     fsbridge/                 # M5: SAB layout, worker Fd, main-thread async service
       protocol.ts             #   SAB layout + op codecs, shared by both ends
@@ -560,12 +606,15 @@ web/
   tsconfig.json
 tests/
   conformance/cases.json      # shared behaviour table, run by ALL THREE drivers (`requires` tags)
+  conformance/toolcall_test.go # M7: the mock caller — a scripted tool-call transcript
+  tool/render-cases.json      # M7: golden tool-result renderings, run by Go AND bun
   integration/                # Go, build tag `integration`
   e2e/                        # Playwright: boot + echo hello + OPFS mount + conformance drivers
     conformance.spec.ts       #   M5: the WASI page, all 14 cases
     emscripten.spec.ts        #   M6: the /js/ page, the 8 non-mount cases
 testdata/mount/               # fixture directory used as the mounted folder
-docs/tool-api.md              # tool-call surface for the future WebGPU LLM
+docs/tool-api.md              # M7: the tool-call surface, hand-written spec
+docs/schema/                  # M7: GENERATED from the Go types — never hand-edit
 dist/                         # build output (gitignored)
 ```
 
@@ -804,15 +853,49 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 `crossOriginIsolated === true` at startup and fail with a readable message rather than a cryptic
 `Atomics` error.
 
-### 4.5 Tool-call surface for the future LLM (design only)
+### 4.5 Tool-call surface for the future LLM (M7 — done)
 
-`internal/protocol` *is* the tool surface. Deliverables now, so WebGPU integration is a drop-in later:
+`internal/protocol` *is* the tool surface; `internal/tool` is the model-facing view of it. The model
+gets exactly **one** tool, `run_terminal_command`. Listing a directory, reading a file, searching a
+tree — those are commands, not more tools.
 
-- `docs/tool-api.md` plus a JSON Schema for `Request`/`Response`, **generated from the Go types** so
-  they cannot drift.
-- A `run_terminal_command` tool definition exported from both Go and TS, shaped for function calling.
-- A mock caller in `tests/` that issues a scripted sequence of tool calls (list the mount, read a
-  file, grep it, report) and asserts the transcript — proving the surface works without a model.
+**The schemas are derived, not written.** `objectSchema` reflects over the `internal/protocol`
+structs, so a schema cannot describe a shape the wire does not have. Only the *descriptions* are
+hand-written, and they live in `internal/tool` rather than as doc comments on the wire types: they
+are prompt text, not Go documentation. A field with no description is a hard error, which is what
+stops the model-facing surface from quietly growing when somebody adds a field to `protocol.Request`.
+
+**The tool input is `Request` minus `op`, with `cmd` required.** Two deliberate deviations:
+
+- `op` is not in the input schema and a tool call that sets it is rejected before the session sees
+  it (`ErrOpNotAllowed`). The tool is the exec surface and nothing else — a model must not be able
+  to talk its own sandbox into `shutdown` by naming it in an argument object.
+- `cmd` is `omitempty` on the wire (correct: `ping` carries none) and required for the tool (a tool
+  call without a command is meaningless).
+
+Unknown fields are rejected rather than ignored, so a hallucinated `"recursive": true` comes back as
+an error the caller can feed to the model instead of a flag silently dropped.
+
+**Two dialects, one definition.** `Definition` is runtime-neutral; `Anthropic()` and `OpenAI()` are
+thin adapters over the same input schema, mirrored in `web/src/tool.ts`. The future WebGPU model's
+inference stack picks the dialect; nothing about smolbox changes.
+
+**`Call` returns both renderings** — text for the model, `*protocol.Response` for the host. `Render`
+deliberately omits `duration_ms`: the rendering is asserted verbatim by the mock caller, and a
+wall-clock number would make every transcript unstable. It takes a `tool.Execer` interface, not a
+`*vm.Session`, so the package has no dependency on wazero and the same call path serves the browser.
+
+**Anti-drift is mechanical, in three places:** `TestArtifactsAreCurrent` (checked-in JSON vs. the Go
+types), `web/src/tool.test.ts` (the TS twin deep-equals that same JSON), and
+`TestDocsTableMatchesInputSchema` (the prose tables in `docs/tool-api.md` vs. the schema's property
+list). The Go/TS `Render` twins are held together by `tests/tool/render-cases.json`, run by both
+suites — the same shared-table trick as the conformance table, one level up.
+
+**The mock caller** (`tests/conformance/toolcall_test.go`) is the proof the surface works without a
+model: 12 scripted tool calls against a real booted VM, each an argument object exactly as a model
+would emit it, with the rendered result asserted verbatim. It proves the two things a JSON Schema
+cannot — that a model-shaped argument object reaches the guest and comes back correctly, and that
+the text a model would read is stable enough to assert.
 
 ---
 
@@ -828,11 +911,12 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
 | `web` | bundle `web/src/{worker,main}.ts` + copy `index.html` and `dist/smolbox.wasm` → `web/dist` |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
+| `generate` | `go run ./cmd/gen-tool-api` → rewrites `docs/schema/*.json` from the Go wire types |
 | `test` | Go unit tests; no Docker required |
 | `test-integration` | `go test -tags integration ./tests/integration/...`; requires `dist/smolbox.wasm` |
 | `test-web` | `bun test web/src` — protocol framing + session unit tests |
 | `test-e2e` | Playwright (`make web` first) against `make serve` |
-| `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver (browser driver **M5 done**) |
+| `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver **and the mock caller** (browser driver **M5 done**) |
 | `lint` | `golangci-lint run` + `tsc --noEmit` |
 | `clean` | remove `dist bin web/dist` |
 | `all` | `build wasm web` |
@@ -852,7 +936,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` | **done** (§1) |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go — **done** (§1) |
 | M6 | `make wasm-js` emscripten target | boots in browser; passes the non-mount conformance cases; documented as no-mount — **done** (§1) |
-| M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface |
+| M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface — **done** (§1, §4.5) |
 
 ---
 
@@ -891,14 +975,24 @@ Cases:
 interleaved kernel noise, reads split across buffer boundaries, oversized frames. The read-only
 provider boundary (`internal/hostfs` is a plain `Mount` struct; wazero's `ReadOnlyDirMount` is the
 implementation) is covered end-to-end by the mount cases in the conformance table rather than a
-standalone unit test.
+standalone unit test. `internal/tool` (**M7 done**, 38 tests) covers the schema derivation, argument
+decoding and its rejections, the dialect adapters, the render goldens, and the three anti-drift
+gates (§4.5).
+
+**The tool surface** (**M7 done**): the mock caller in `tests/conformance/toolcall_test.go` runs
+under `make test-conformance` — a 12-step scripted transcript against a real booted VM with every
+rendering asserted verbatim, plus the negative half (argument injection refused against a live
+session, which must stay usable afterwards) and the failed-command / broken-session distinction.
+The shared render table `tests/tool/render-cases.json` is run by both the Go and the bun suites.
 
 **TS unit tests** (`bun test`, **M4 + M5 done**): the TS framing twin (`protocol.ts`) round-trips
 requests/ready/responses against the Go wire shape and skips noise; the SAB stdin channel and
 `session.ts` against a mock worker (boot, seq'd exec dispatch, close, error paths); and the fsbridge
 suite — SAB codec round-trips, `MountHost` dispatch against fake directory handles, every `BridgeFd`
 write op returns `ERRNO_ROFS`, chunked reads larger than the payload window, `..` escapes →
-`ERRNO_NOTCAPABLE`, and cache invalidation on `remount()`.
+`ERRNO_NOTCAPABLE`, and cache invalidation on `remount()`. **M7** adds `tool.test.ts`: the TS
+definition deep-equals the generated `docs/schema/*.json`, `decodeArgs` refuses the same classes of
+malformed call the Go side does, and `renderResult` runs the shared golden table.
 
 **Browser e2e** (`make test-e2e`, Playwright, **M4 + M5 done**): boots `dist/smolbox.wasm` in headless
 Chromium through the real worker/session code path and asserts the `echo hello` round-trip, the OPFS
@@ -920,7 +1014,9 @@ without it.
 `dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version; a
 browser e2e job (restores the wasm cache, installs Chromium, runs `make test-e2e`) — **M5 done**;
 and an emscripten e2e job on the same shape, caching `dist/js` (~116 MiB) under its own key and
-running `make test-e2e-js` — **M6 done**.
+running `make test-e2e-js` — **M6 done**. **M7 needed no new job**: the generated-schema staleness
+gate rides `make test` in the unit job, the TS twin check rides `make test-web`, and the mock caller
+rides `make test-conformance` in the wasm job.
 
 ---
 

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "smolbox exec response",
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "description": "Sequence number of the request this response answers."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Exit status of the command. A command killed by a signal reports 128 plus the signal number, so a timeout kill reports 137."
+    },
+    "stdout": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Everything the command wrote to standard output, base64-encoded.",
+      "contentEncoding": "base64"
+    },
+    "stderr": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Everything the command wrote to standard error, base64-encoded.",
+      "contentEncoding": "base64"
+    },
+    "timed_out": {
+      "type": "boolean",
+      "description": "True when the command hit `timeout_ms` and was killed."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "True when stdout or stderr hit `max_output` and was cut short."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "description": "Wall-clock time the command took, in milliseconds. Measured in the guest, so it excludes protocol framing and transport."
+    },
+    "error": {
+      "type": "string",
+      "description": "Set when the agent could not run the command at all: an unusable `cwd`, an unknown op, or a response too large to frame. Empty on a normal run, including a normal non-zero exit."
+    }
+  },
+  "required": [
+    "seq",
+    "exit_code",
+    "stdout",
+    "stderr",
+    "timed_out",
+    "truncated",
+    "duration_ms"
+  ]
+}

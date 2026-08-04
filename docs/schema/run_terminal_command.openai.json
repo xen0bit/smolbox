@@ -1,0 +1,45 @@
+{
+  "type": "function",
+  "function": {
+    "name": "run_terminal_command",
+    "description": "Run a shell command inside the smolbox Linux VM and return its exit code, stdout, and stderr.\n\nThe VM is a persistent sandbox. The working directory and anything written to /tmp survive between calls, so you can cd into a directory once and keep working there, or build up intermediate files across several calls.\n\nThe user's folder is mounted read-only at /mnt/host. You can list, read, and search it; writes to it fail with EROFS. Nothing else in the VM touches the user's machine, so use /tmp freely for scratch work.\n\nThe command is interpreted by sh -c, so pipes, redirection, globs, quoting, and && all work. There is no network access. Prefer one focused command per call and read its output before choosing the next one.",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "run_terminal_command arguments",
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "description": "The shell command to run, as a single string. It is passed to `sh -c`, so pipes, redirection, globs, quoting, and `&&` all work."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Directory to run this command in. Defaults to the session's current directory, which carries over from earlier calls."
+        },
+        "env": {
+          "type": "object",
+          "description": "Environment variables for this command only. A guest-side `export` does not carry over to the next call; this does not either.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "stdin": {
+          "type": "string",
+          "description": "Bytes to feed to the command's standard input, base64-encoded.",
+          "contentEncoding": "base64"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "description": "Kill the command after this many milliseconds. The whole process group is killed and `timed_out` is set on the response. 0 means no timeout."
+        },
+        "max_output": {
+          "type": "integer",
+          "description": "Cap stdout and stderr at this many bytes each. Output past the cap is dropped and `truncated` is set on the response. 0 uses the session default."
+        }
+      },
+      "required": [
+        "cmd"
+      ]
+    }
+  }
+}

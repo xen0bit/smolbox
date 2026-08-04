@@ -9,7 +9,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve \
+.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate \
         test test-integration test-web test-e2e test-e2e-js test-conformance lint clean
 
 all: build wasm web
@@ -60,6 +60,12 @@ web:
 
 serve:
 	bun web/serve.ts
+
+# Rewrites docs/schema/*.json from the Go wire types. TestArtifactsAreCurrent
+# (under `make test`) fails when the checked-in files no longer match, so this
+# is the only way to change them.
+generate:
+	go run ./cmd/gen-tool-api
 
 test:
 	go test ./...

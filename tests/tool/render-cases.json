@@ -1,0 +1,65 @@
+{
+  "_comment": "Golden renderings of a tool result, shared by the Go implementation (internal/tool.Render) and its TypeScript twin (web/src/tool.ts renderResult). Both must produce `want` byte for byte. stdout/stderr are plain text here, not base64: the Go test wraps them into a protocol.Response and the TS test into a Response, which is where the two languages' decoded shapes already agree.",
+  "cases": [
+    {
+      "name": "plain stdout",
+      "response": { "exit_code": 0, "stdout": "hello\n" },
+      "want": "exit_code: 0\n\n<stdout>\nhello\n</stdout>\n"
+    },
+    {
+      "name": "stdout and stderr are separate blocks, stdout first",
+      "response": { "exit_code": 0, "stdout": "out\n", "stderr": "err\n" },
+      "want": "exit_code: 0\n\n<stdout>\nout\n</stdout>\n\n<stderr>\nerr\n</stderr>\n"
+    },
+    {
+      "name": "stderr only",
+      "response": { "exit_code": 2, "stderr": "boom\n" },
+      "want": "exit_code: 2\n\n<stderr>\nboom\n</stderr>\n"
+    },
+    {
+      "name": "a silent command says so rather than rendering an empty block",
+      "response": { "exit_code": 0 },
+      "want": "exit_code: 0\n\n(no output)\n"
+    },
+    {
+      "name": "non-zero exit is a result, not an error",
+      "response": { "exit_code": 3 },
+      "want": "exit_code: 3\n\n(no output)\n"
+    },
+    {
+      "name": "timed out is flagged on the exit_code line",
+      "response": { "exit_code": 137, "timed_out": true },
+      "want": "exit_code: 137 [timed out]\n\n(no output)\n"
+    },
+    {
+      "name": "truncated is flagged on the exit_code line",
+      "response": { "exit_code": 0, "stdout": "aaa", "truncated": true },
+      "want": "exit_code: 0 [output truncated]\n\n<stdout>\naaa\n</stdout>\n"
+    },
+    {
+      "name": "both flags share one bracket",
+      "response": { "exit_code": 137, "stdout": "partial\n", "timed_out": true, "truncated": true },
+      "want": "exit_code: 137 [timed out, output truncated]\n\n<stdout>\npartial\n</stdout>\n"
+    },
+    {
+      "name": "an agent error replaces the no-output line",
+      "response": { "exit_code": 1, "error": "chdir /nope: no such file or directory" },
+      "want": "exit_code: 1\nerror: chdir /nope: no such file or directory\n"
+    },
+    {
+      "name": "an agent error still shows whatever output there was",
+      "response": { "exit_code": 1, "stdout": "partial\n", "error": "response exceeds frame limit" },
+      "want": "exit_code: 1\nerror: response exceeds frame limit\n\n<stdout>\npartial\n</stdout>\n"
+    },
+    {
+      "name": "output with no trailing newline still closes on its own line",
+      "response": { "exit_code": 0, "stdout": "no-newline" },
+      "want": "exit_code: 0\n\n<stdout>\nno-newline\n</stdout>\n"
+    },
+    {
+      "name": "exactly one trailing newline is trimmed, so a blank last line survives",
+      "response": { "exit_code": 0, "stdout": "a\n\n" },
+      "want": "exit_code: 0\n\n<stdout>\na\n\n</stdout>\n"
+    }
+  ]
+}
