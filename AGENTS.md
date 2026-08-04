@@ -160,6 +160,24 @@ Relatedly, the generated `arg-module.js` always emits `-netdev socket,connect=12
 the page logs a failed WebSocket at boot — that is upstream's no-network mode (the socket is only
 used when `Module['websocket'].url` is set, which smolbox never does). Cosmetic; leave it.
 
+### Browser poll_oneoff: never let a wait go unbounded
+`waitMs` is only ever shrunk by a *clock* subscription, so a guest poll carrying only fd-read
+subscriptions has nothing to bound it. Sleeping until stdin arrives is fatal during boot — the host
+does not write until the ready banner says the guest is up, so nothing can wake it and the VM hangs
+forever. `MAX_POLL_MS` is therefore **250 ms**, not `2**31 - 1`: an un-clocked poll becomes a slow
+re-poll, and the normal path is unaffected because a clock subscription already bounds it far below.
+Do not raise it back for "efficiency". (PLAN §2.11.19.)
+
+### Boot hangs are self-diagnosing; keep them that way
+`wasi.start()` blocks the worker, so no timer can fire there — the WASI boot watchdog rides the
+`poll_oneoff` loop and posts a stall report every 5 s after 20 s without a banner. **Silence in
+those reports is the signal**: it means `poll_oneoff` stopped returning and the worker is parked.
+The emscripten page uses a plain `setInterval` (its main thread is free); `writes=0` there means the
+guest never reached its first serial write, i.e. a regressed TTY poll override. `tests/e2e/harness.ts`
+appends the last 40 console lines to any boot failure so CI logs carry the evidence. If you touch
+the poll or console paths, keep these reports working — a boot hang that reproduces only on CI is
+otherwise close to undebuggable. (PLAN §2.11.20.)
+
 ### Browser poll_oneoff: convert every clock into one timeline
 The base browser_wasi_shim `poll_oneoff` only handles a single clock subscription and busy-loops;
 `web/src/worker.ts` replaces it entirely (the guest kernel polls fd 0 for console input, driven by

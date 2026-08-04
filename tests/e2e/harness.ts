@@ -160,10 +160,27 @@ async function attach(
   execTimeoutMs = EXEC_TIMEOUT_MS,
   bootTimeoutMs = BOOT_TIMEOUT_MS,
 ): Promise<Handle> {
-  const caps = await page.evaluate(
-    (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
-    bootTimeoutMs,
-  );
+  // Boot hangs are rare and so far only seen on CI, so a failure has to carry
+  // its own evidence: the worker's stall reports (see web/src/worker.ts) arrive
+  // as console lines, and silence in them is as informative as their contents.
+  const log: string[] = [];
+  const onConsole = (m: { text(): string }): void => {
+    log.push(`${new Date().toISOString()} ${m.text()}`.slice(0, 300));
+  };
+  page.on("console", onConsole);
+
+  let caps: Caps;
+  try {
+    caps = await page.evaluate(
+      (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
+      bootTimeoutMs,
+    );
+  } catch (err) {
+    const tail = log.slice(-40).join("\n") || "(no console output at all)";
+    throw new Error(`${String(err)}\n\n--- page console (last 40 lines) ---\n${tail}`);
+  } finally {
+    page.off("console", onConsole);
+  }
 
   return {
     boot: () => Promise.resolve(caps),

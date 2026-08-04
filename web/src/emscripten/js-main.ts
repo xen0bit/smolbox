@@ -74,8 +74,30 @@ const pty = new ProtocolPty(realChannel, {
 });
 realChannel.onWrite = () => pty.notifyInput();
 
+// Boot watchdog. Unlike the WASI worker this thread is free (QEMU runs on a
+// pthread), so a plain timer works. Silence would mean the page itself is
+// wedged; a report with writes=0 means the guest never reached its first serial
+// write, which is what a regressed TTY poll override looks like (PLAN 2.11.15).
+let ready = false;
+const bootStart = performance.now();
+const watchdog = setInterval(() => {
+  const elapsed = performance.now() - bootStart;
+  if (ready || elapsed < 20_000) {
+    return;
+  }
+  const s = pty.stats;
+  console.log(
+    `smolbox boot stalled: ${Math.round(elapsed)}ms, ptyWrites=${s.writes}, bytesOut=${s.bytesOut}, ` +
+      `ptyReads=${s.reads}, waits=${s.waits}, stdinReadable=${realChannel.available()}`,
+  );
+}, 5_000);
+
 const router = new StdioRouter(realChannel, {
-  onReady: (caps) => emit({ type: "ready", caps }),
+  onReady: (caps) => {
+    ready = true;
+    clearInterval(watchdog);
+    emit({ type: "ready", caps });
+  },
   onResponse: (resp) => emit({ type: "response", resp }),
   onError: (err) => emit({ type: "error", message: String(err) }),
 });

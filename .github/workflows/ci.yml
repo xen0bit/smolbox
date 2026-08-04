@@ -108,6 +108,15 @@ jobs:
       - name: E2E (boot + browser conformance table)
         run: make test-e2e
 
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-wasi
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
   emscripten-e2e:
     name: emscripten e2e (--to-js, no mount)
     runs-on: ubuntu-latest
@@ -146,3 +155,13 @@ jobs:
 
       - name: E2E (emscripten boot + non-mount conformance cases)
         run: make test-e2e-js
+
+      - name: Upload Playwright results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-emscripten
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+

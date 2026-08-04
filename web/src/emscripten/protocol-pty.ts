@@ -63,6 +63,9 @@ export class ProtocolPty {
   private readCbs: Array<() => void> = [];
   private signalCbs: Array<(signal: string) => void> = [];
   private termios: PtyTermios = structuredClone(defaultTermios);
+  // Counters for the page's boot watchdog; a stalled boot looks very different
+  // depending on whether the guest is silent (writes 0) or talking.
+  readonly stats = { reads: 0, writes: 0, bytesOut: 0, waits: 0 };
 
   constructor(
     private stdin: StdinChannel,
@@ -78,14 +81,18 @@ export class ProtocolPty {
   }
 
   read(length: number): Uint8Array {
+    this.stats.reads++;
     return this.stdin.read(length) ?? new Uint8Array(0);
   }
 
   write(data: number[]): void {
+    this.stats.writes++;
+    this.stats.bytesOut += data.length;
     this.hooks.onOutput(Uint8Array.from(data));
   }
 
   onReadable(cb: () => void): PtyDisposable {
+    this.stats.waits++;
     if (this.stdin.available()) {
       // The runtime registered its wait after the data arrived; do not leave it
       // parked on Atomics.wait forever.

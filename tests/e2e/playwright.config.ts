@@ -8,7 +8,11 @@ export default defineConfig({
   timeout: 5 * 60 * 1000,
   fullyParallel: false,
   workers: 1,
-  retries: 0,
+  // One retry for a rare boot hang seen only on CI (~2 in 48 boots, both
+  // runtimes) that has never reproduced locally, including at 2.5x CPU
+  // oversubscription. A retried boot carries the worker's stall reports in the
+  // failure message, so a real regression still fails twice and says why.
+  retries: 1,
   reporter: [["list"]],
   use: {
     ...devices["Desktop Chrome"],

@@ -487,7 +487,28 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     `vm.state` snapshot, so it cannot be changed after the fact. `web/src/emscripten/js-main.ts`
     therefore does not use `Session.close()`: it sends the `shutdown` op as a plain request, treats
     the agent's reply as the end of the session, and lets the runtime die with the page.
-18. **`arg-module.js` always emits the netdev args, and that *is* upstream's no-network mode.** The
+19. **An un-clocked `poll_oneoff` could sleep the WASI worker forever — the un-clocked cousin of
+    §2.11.11.** The M4 fix normalised clock *timelines*, but `waitMs` still started at
+    `2**31 - 1` ms (~24.8 days) and was only ever bounded by a clock subscription. A guest poll
+    carrying **only** fd-read subscriptions therefore parked the worker in `Atomics.wait`
+    indefinitely — and during boot that is fatal, because the host does not write to stdin until
+    the ready banner says the guest is up, so nothing can ever wake it. Symptom: a rare boot that
+    produces no ready banner while neighbouring boots take 3–4 s. `MAX_POLL_MS` is now **250 ms**,
+    which turns that case into a slow re-poll and costs nothing on the normal path (a clock
+    subscription already bounds `waitMs` far below it). Found while chasing a CI-only boot hang;
+    it was never reproduced locally, including at 2.5× CPU oversubscription (20/20 clean), so
+    treat this as the leading explanation rather than a confirmed root cause — the boot watchdogs
+    below exist to settle it if it recurs.
+20. **Boot hangs must be self-diagnosing, because `wasi.start()` blocks the worker.** No timer can
+    fire in the WASI worker once the VM is running, so its watchdog rides the `poll_oneoff` loop
+    and posts a stall report (elapsed, poll count, last `waitMs`, un-clocked poll count, console
+    bytes) every 5 s after 20 s without a banner. **Silence in those reports is itself the signal**
+    — it means `poll_oneoff` stopped returning, i.e. the worker is parked in a wait. The emscripten
+    page can use a plain `setInterval` instead (QEMU runs on a pthread, so its main thread is
+    free); there `writes=0` would mean the guest never reached its first serial write, which is
+    what a regressed TTY poll override looks like (§2.11.15). The e2e harness appends the last 40
+    console lines to any boot failure, so CI logs carry the evidence without an artifact download.
+21. **`arg-module.js` always emits the netdev args, and that *is* upstream's no-network mode.** The
     generated arguments carry `-netdev socket,connect=127.0.0.1:8888`, so the page logs a failed
     `ws://127.0.0.1:8888/` connection at boot. Upstream's example ships the same arguments and
     documents plain `localhost:8080` (no `?net=` parameter) as "container runs without networking":
