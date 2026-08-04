@@ -192,6 +192,10 @@ clock is `Date.now()*1e6` — subtract a REALTIME deadline from `performance.now
   not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
   WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.
   Adding a spec that needs one artifact but not the other means touching both configs.
+- That suite also runs on a **larger exec budget** (`EMSCRIPTEN_EXEC_TIMEOUT_MS`, 300 s) because its
+  console is ~10× slower and a CI runner is ~2.6× slower again — the 1 MiB case is ~48 s of transfer
+  locally and ~125 s in CI, past the shared 120 s default. Raise the budget if a case legitimately
+  needs longer on this runtime; do **not** tag the case out of the table.
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
   (busybox sorts alphabetically) or the fixture/table drift silently.
 

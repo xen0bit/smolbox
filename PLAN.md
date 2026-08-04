@@ -137,6 +137,13 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
   8 cases of `tests/conformance/cases.json` not tagged `requires: ["mount"]`, one fresh VM each.
   Suite ~2.0 min, of which the 1 MiB case alone is ~51 s (see console throughput below). The 6 mount
   cases stay excluded by tag; the Go and WASI-browser drivers still run all 14.
+- **A GitHub Actions runner is ~2.6× slower than this machine on this target**: boot 23.7 s against
+  7.4 s, the small cases ~19–20 s against ~7–8 s, whole suite 5.5 min against 2.0 min. That is
+  enough to push the 1 MiB case past the harness's default 120 s exec budget (~48 s of console
+  transfer here becomes ~125 s there), so the emscripten driver runs with
+  `EMSCRIPTEN_EXEC_TIMEOUT_MS = 300 s` and a 10-minute per-test budget. The case itself is
+  unchanged — it is a slow runtime, not a different one. **The WASI suite needs none of this**; its
+  console is 10× faster, so the same case takes 7.1 s.
 - **Artifact:** `dist/js` = **121 738 772 bytes (116.1 MiB)** — `qemu-system-x86_64.data` 80.2 MB
   (bzImage + rootfs.bin + `vm.state` snapshot + BIOS blobs), `qemu-system-x86_64.wasm` 41.2 MB,
   `out.js` 278 KB, `load.js` 7.6 KB, `arg-module.js` 739 B. Slightly larger than the 107.6 MiB WASI

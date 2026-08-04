@@ -44,6 +44,13 @@ export type SmolboxGlobal = { __smolbox?: unknown };
 export const BOOT_TIMEOUT_MS = 180_000;
 export const EXEC_TIMEOUT_MS = 120_000;
 
+// The emscripten console moves ~35 kB/s — QEMU's 16550 UART writes one byte per
+// fd_write, each a proxyToMainThread hop — so the 1 MiB conformance case is ~48 s
+// of pure transfer on a dev machine and ~2 min on a CI runner (~2.6x slower).
+// This is a harness budget, not a behaviour assertion: the case must still pass
+// unchanged, it just needs room to finish.
+export const EMSCRIPTEN_EXEC_TIMEOUT_MS = 300_000;
+
 // A mount fixture as a serializable tree; symlinks are carried separately so
 // the browser bridge can present them as virtual entries.
 export type FixtureNode =
@@ -132,12 +139,12 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
 export async function bootJs(page: Page): Promise<Handle> {
   await page.goto("/js/");
   await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
-  return attach(page);
+  return attach(page, EMSCRIPTEN_EXEC_TIMEOUT_MS);
 }
 
 // Drive window.__smolbox.boot and wrap the remaining session calls. Shared by
 // both pages: the WASI worker and the emscripten runtime expose the same hook.
-async function attach(page: Page): Promise<Handle> {
+async function attach(page: Page, execTimeoutMs = EXEC_TIMEOUT_MS): Promise<Handle> {
   const caps = await page.evaluate(
     (timeout) => (globalThis as SmolboxGlobal).__smolbox!.boot(timeout),
     BOOT_TIMEOUT_MS,
@@ -148,7 +155,7 @@ async function attach(page: Page): Promise<Handle> {
     exec: (req, timeoutMs) =>
       page.evaluate(
         ({ req, timeoutMs }) => (globalThis as SmolboxGlobal).__smolbox!.exec(req, timeoutMs),
-        { req, timeoutMs: timeoutMs ?? EXEC_TIMEOUT_MS },
+        { req, timeoutMs: timeoutMs ?? execTimeoutMs },
       ),
     close: (timeoutMs) =>
       page.evaluate(
