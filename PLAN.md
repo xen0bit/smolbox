@@ -1,8 +1,9 @@
 # smolbox — Implementation Plan
 
 > Status: M0 (scaffolding), M1 (wasm build), M2 (guest agent + session + CLI), M3 (read-only host
-> mount under wazero + shared conformance table), and M4 (browser worker + stdio router + TS
-> session, with the preopen spike) complete. M5 (sync FS bridge + browser mount) is next.
+> mount under wazero + shared conformance table), M4 (browser worker + stdio router + TS session,
+> with the preopen spike), and M5 (sync FS bridge + browser mount + browser conformance driver)
+> complete. M6 (emscripten `--to-js` target) is next.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -97,6 +98,37 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
 - The browser worker's stdin is a **SharedArrayBuffer batch channel** (main thread writes whole REQ
   frames, the emulator's fd_read consumes them; `Atomics.wait` sleeps the worker instead of
   busy-looping). This is a one-way preview of the M5 fsbridge pattern (§4.4).
+
+### Measured at M5 (2026-08-03, this machine)
+
+- **Browser passes the full conformance table: 14/14 green** (`make test-e2e`,
+  `tests/e2e/conformance.spec.ts`). The exact same `tests/conformance/cases.json` runs in headless
+  Chromium through the sync FS bridge mounted on an OPFS directory that mirrors `testdata/mount` —
+  including the write-rejection (`EROFS` at the bridge), `../` escape (guest-VFS neutralised, never
+  reaching the bridge), nested reads, and the virtual symlink (`link.txt → hello.txt`, which OPFS
+  cannot express). Suite: ~52 s for 14 cases, one fresh VM boot each.
+- **Boot + mount smoke: 2/2 green** (boot.spec). `echo hello` ~2.6 s; the OPFS mount smoke ~3.9 s.
+- **fsbridge unit tests: 55 new** (`make test-web`, 72 total): SAB codec round-trips, MountHost
+  dispatch against fake handles, every BridgeFd write op → `ERRNO_ROFS`, chunked reads, `..`
+  escapes → `ERRNO_NOTCAPABLE`, and cache invalidation on remount.
+- **Two real bugs found while wiring the bridge:**
+  1. `TextDecoder.decode`/`TextEncoder.encode` **throw on views over a `SharedArrayBuffer`**
+     ("The provided ArrayBufferView value must not be shared"). The bridge must `.slice()` bytes out
+     of the SAB before decoding — the request/response JSON is copied into a fresh buffer (§2.11.11).
+  2. The e2e fixture walker double-wrapped directories, so OPFS got a `sub/` whose `children` was
+     itself `{kind, children}` — surfaced as spurious `kind`/`children` symlink entries in
+     `ls /mnt/host/sub`. Fixed in `tests/e2e/harness.ts`; the `ls -1` conformance case is the guard.
+- **Caching lives entirely on the main thread** (a deliberate deviation from §4.4's "worker
+  memoizes"): the worker cannot receive `postMessage` while the module runs, so worker-side cache
+  invalidation on `remount()` would need an epoch dance through the SAB. Keeping memoized
+  STAT/READDIR, the chunk LRU, and the path→handle map in `MountHost` makes `remount()` a plain
+  cache clear (§4.4).
+- **Virtual symlink table**: the File System Access API cannot represent symlinks, so the bridge
+  presents a path→target table registered alongside the handle. The conformance fixture derives it
+  from `testdata/mount`'s real symlink, so the guest-observable behaviour is identical to wazero's.
+- **The VM boots with no mount attached**: the preopen resolves as an empty directory until the user
+  (or test) calls `setMount(handle, links)` — mount and remount are main-thread-only and never
+  round-trip the worker.
 
 ---
 
@@ -354,6 +386,20 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     and the main thread writes REQ frames straight into it; responses still come back over
     postMessage (raised inside the worker's `fd_write`). This is why `web/src/stdio.ts` owns a
     `StdinChannel` and why the fsbridge (M5) is the same shape, only two-way.
+13. **TextDecoder/TextEncoder throw on views over a `SharedArrayBuffer`.** Chromium rejects decoding
+    a `Uint8Array` whose buffer is shared ("The provided ArrayBufferView value must not be shared").
+    The fsbridge JSON envelopes must be `.slice()`d into a fresh buffer before decode on *both*
+    ends; the binary payload window is read with `TypedArray.prototype.slice`, which already copies
+    into a non-shared buffer. M5's first browser boot hung for a full `BRIDGE_TIMEOUT_MS` on this —
+    the worker's stat request was fine, but the main thread's decoder threw and never answered.
+14. **Virtual symlinks are a bridge concern, not an OPFS concern.** The File System Access API has
+    no symlink concept, so `MountHost` keeps a path→target table checked before the directory
+    handle, and the worker's readdir/stat report `FILETYPE_SYMBOLIC_LINK` for those entries. The
+    conformance fixture derives the table from `testdata/mount`'s real symlink, keeping the
+    single-table invariant: `cat /mnt/host/link.txt` behaves identically in the browser and under
+    wazero. The e2e fixture walker initially double-wrapped directories, surfacing spurious
+    `kind`/`children` symlink entries in `ls` — the `ls -1` conformance case catches any future
+    regression.
 
 ---
 
@@ -380,13 +426,16 @@ web/
     protocol.ts               # TS twin of internal/protocol framing + types
     stdio.ts                  # stdio router: FrameDecoder + SAB stdin channel
     session.ts                # TS twin of internal/vm session client
-    mount.ts                  # M4 spike: in-memory PreopenDirectory builder (real providers in M5)
+    mount.ts                  # M5: mount providers (picker / OPFS) behind one interface
     fsbridge/                 # M5: SAB layout, worker Fd, main-thread async service
+      protocol.ts             #   SAB layout + op codecs, shared by both ends
+      worker-fd.ts            #   blocking Fd subclass (worker thread)
+      main-host.ts            #   async service + all caching + virtual symlinks (main thread)
   tsconfig.json
 tests/
   conformance/cases.json      # shared behaviour table, run by BOTH Go and browser drivers
   integration/                # Go, build tag `integration`
-  e2e/                        # Playwright (M4): boot + echo hello + preopen spike
+  e2e/                        # Playwright (M4/M5): boot + echo hello + OPFS mount + conformance driver
 testdata/mount/               # fixture directory used as the mounted folder
 docs/tool-api.md              # tool-call surface for the future WebGPU LLM
 dist/                         # build output (gitignored)
@@ -546,7 +595,11 @@ worker's `fd_read`/`poll_oneoff` consume (§1, measured at M4). This is the stdi
 fsbridge, minus the request/response protocol.
 
 **2. The mounted directory is injected as `fds[3]`**, replacing upstream's `certDir` slot. M4's spike
-uses an in-memory `PreopenDirectory` (§1); the real `Fd` backed by the sync bridge lands in M5.
+was an in-memory `PreopenDirectory` (§1); M5 replaces it with the sync-bridge `BridgeFd`. The worker
+posts a second SAB (`{type:"fschannel"}`) at startup; the main thread services it. **The VM boots
+with no mount attached** — the preopen resolves as an empty directory until the user (or test) calls
+`setMount(handle, links)`, and mount/remount are main-thread-only (they never round-trip the worker,
+so there is no mid-run injection problem).
 
 ### 4.4 The sync FS bridge
 
@@ -554,34 +607,46 @@ uses an in-memory `PreopenDirectory` (§1); the real `Fd` backed by the sync bri
 worker thread (wasm, may block)        main thread (holds the DirectoryHandle)
   Fd.path_open(...)                      -- never blocks --
     encode req into SAB
-    postMessage(wake)              ──►   onmessage: decode req
+    postMessage(wake)              ──►   onmessage: readRequest() (sync)
     Atomics.wait(state, REQ)             await handle.getFileHandle(...)
                               ◄──        write payload into SAB
     state == RESP → decode               Atomics.store(state, RESP); Atomics.notify
     return {ret, fd_obj}
 ```
 
-- **SAB layout:** `[state:i32][errno:i32][reqLen:i32][respLen:i32][request bytes][payload window]`,
-  payload window 1 MiB by default. Reads larger than the window are chunked by the worker into
-  repeated `READ{path, offset, len}` ops.
+- **SAB layout:** `[state:i32][errno:i32][reqLen:i32][respLen:i32][reserved×4]`, then a 64 KiB
+  request region and a 1 MiB payload window. The response JSON reuses the request region (requests
+  are strictly serialized); READ binary data goes into the payload window. Reads larger than the
+  window are chunked by the worker into repeated `READ{path, offset, len}` ops.
 - **Ops:** `STAT`, `READDIR`, `READ`, `READLINK`. Every write op (`path_create_directory`,
   `fd_pwrite`, `path_unlink_file`, `path_rename`, …) returns `wasi.ERRNO_ROFS` **without touching the
-  bridge at all**.
+  bridge at all**. `path_open` also rejects write intent (`O_CREAT`/`O_TRUNC` or `RIGHTS_FD_WRITE`)
+  up front, and normalises paths itself: absolute paths and `..` above the mount root →
+  `ERRNO_NOTCAPABLE` (a defensive boundary — the guest VFS already resolves `..` above the bind
+  mount, §2.11.10).
 - **The main thread never blocks** — `Atomics.wait` is forbidden there (§2.6). The worker signals via
   `postMessage` and *then* blocks; the main thread replies through the SAB and `Atomics.notify`.
   This is exactly the xterm-pty pattern, and the two blocking channels (tty, fs) are independent SABs
   serviced by the same non-blocking event loop.
-- **Caching.** The mount is read-only, so the worker memoizes `STAT`/`READDIR` and keeps an LRU of
-  content chunks; path→handle resolution is cached on the main thread. `remount()` clears both — that
-  is the answer to "the user edited the folder".
+- **Caching lives entirely in `MountHost` on the main thread** (deviation from an earlier draft
+  where the worker memoized — §1, measured at M5). The worker cannot receive `postMessage` while the
+  module runs, so worker-side cache invalidation on `remount()` would need an epoch dance through the
+  SAB. Memoized `STAT`/`READDIR`, a chunk LRU (512 entries), and the path→handle map all sit next to
+  the handle; `remount()` clears them in one call — the answer to "the user edited the folder".
+- **Virtual symlinks.** The File System Access API cannot represent symlinks, so `MountHost` keeps a
+  path→target table checked before the directory handle, and the worker's readdir/stat report
+  `FILETYPE_SYMBOLIC_LINK` for those entries. The conformance fixture derives the table from
+  `testdata/mount`'s real symlink (§2.11.14), so `cat /mnt/host/link.txt` behaves identically in the
+  browser and under wazero.
 - **Gotcha from §2.4:** c2w's guest traversal needs the directory to resolve `"."` to itself. Our `Fd`
-  must handle `"."` and `".."` explicitly and reject `..` escapes above the mount root (see also the
-  `WithReadOnlyDirMount` traversal caveat in §2.2).
+  handles `"."` and `".."` explicitly (readdir cookie 0/1, §2.4 pattern) and rejects `..` escapes
+  above the mount root (see also the `WithReadOnlyDirMount` traversal caveat in §2.2).
 
 **Testability.** `mount.ts` accepts anything structurally matching `FileSystemDirectoryHandle`.
 Playwright cannot drive `showDirectoryPicker()`, but `navigator.storage.getDirectory()` (OPFS)
-returns the same interface — so E2E tests populate an OPFS tree and mount that, exercising the
-identical code path with no native dialog.
+returns the same interface — so E2E tests populate an OPFS tree (walked from `testdata/mount` on the
+Node side, so the bytes match the wazero mount) and mount that, exercising the identical code path
+with no native dialog.
 
 **Browser support.** Chromium-only for the picker. Firefox and Safari get a clearly-labelled degraded
 path (drag-and-drop a folder, or OPFS) behind the same provider interface. The page must check
@@ -615,7 +680,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | `test-integration` | `go test -tags integration ./tests/integration/...`; requires `dist/smolbox.wasm` |
 | `test-web` | `bun test web/src` — protocol framing + session unit tests |
 | `test-e2e` | Playwright (`make web` first) against `make serve` |
-| `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver (browser driver at M5) |
+| `test-conformance` | runs `tests/conformance/cases.json` through the Go/wazero driver (browser driver **M5 done**) |
 | `lint` | `golangci-lint run` + `tsc --noEmit` |
 | `clean` | remove `dist bin web/dist` |
 | `all` | `build wasm web` |
@@ -633,7 +698,7 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 | M2 | Guest agent + protocol + `internal/vm` session + CLI | `smolbox repl` works; Go integration matrix green | **done** (§1) |
 | M3 | Read-only host mount under wazero + shared conformance table + Go driver | mount cases in the conformance table green — **done** (§1) |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` | **done** (§1) |
-| M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go |
+| M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go — **done** (§1) |
 | M6 | `make wasm-js` emscripten target | boots in browser; documented as no-mount |
 | M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface |
 
@@ -643,11 +708,13 @@ path (drag-and-drop a folder, or OPFS) behind the same provider interface. The p
 
 **Shared conformance table (`tests/conformance/cases.json`)** is the core of the strategy: one
 declarative list of `{name, steps[{request, expect}]}` cases, executed by a Go driver against wazero
-(`tests/conformance`, **M3 done**) and later by a Playwright driver against the browser (M5).
+(`tests/conformance`, **M3 done**) and by a Playwright driver against the browser
+(`tests/e2e/conformance.spec.ts`, **M5 done**).
 `expect` is a partial `protocol.Response` matcher (`exit_code`, exact `stdout`/`stderr`,
 `stdout_contains`/`stdout_not_contains`/`stderr_contains`, `stdout_len`, `timed_out`, `truncated`);
 each case boots a fresh session and its steps run in order. Behaviour cannot silently diverge
-between runtimes — the browser driver must run this **same** file.
+between runtimes — the browser driver runs this **same** file, mounting an OPFS tree walked from
+`testdata/mount` (with its symlink presented through the bridge's virtual table).
 
 Cases:
 
@@ -670,24 +737,25 @@ provider boundary (`internal/hostfs` is a plain `Mount` struct; wazero's `ReadOn
 implementation) is covered end-to-end by the mount cases in the conformance table rather than a
 standalone unit test.
 
-**TS unit tests** (`bun test`, **M4 done**): the TS framing twin (`protocol.ts`) round-trips
+**TS unit tests** (`bun test`, **M4 + M5 done**): the TS framing twin (`protocol.ts`) round-trips
 requests/ready/responses against the Go wire shape and skips noise; the SAB stdin channel and
-`session.ts` against a mock worker (boot, seq'd exec dispatch, close, error paths). M5 adds the
-bridge tests: `HostDirFd` against a fake synchronous backend, every write op returns `ERRNO_ROFS`,
-chunked reads larger than the payload window, and cache invalidation on `remount()`.
+`session.ts` against a mock worker (boot, seq'd exec dispatch, close, error paths); and the fsbridge
+suite — SAB codec round-trips, `MountHost` dispatch against fake directory handles, every `BridgeFd`
+write op returns `ERRNO_ROFS`, chunked reads larger than the payload window, `..` escapes →
+`ERRNO_NOTCAPABLE`, and cache invalidation on `remount()`.
 
-**Browser e2e** (`make test-e2e`, Playwright, **M4 done**): boots `dist/smolbox.wasm` in headless
-Chromium through the real worker/session code path and asserts the `echo hello` round-trip, plus the
-preopen spike (in-memory `/mnt/host` file/nested/list reads). The browser driver that runs the
-**same** conformance table lands in M5.
+**Browser e2e** (`make test-e2e`, Playwright, **M4 + M5 done**): boots `dist/smolbox.wasm` in headless
+Chromium through the real worker/session code path and asserts the `echo hello` round-trip, the OPFS
+mount smoke (file/nested/list/symlink reads through the sync bridge), and the **full conformance
+table** (`tests/e2e/conformance.spec.ts`, 14/14) — the browser half of the single-table guarantee.
 
-**Manual smoke:** `make wasm web serve`, open the page, boot the VM, `echo hello` (M4); the
-directory picker + `ls -la /mnt/host` smoke is M5.
+**Manual smoke:** `make wasm web serve`, open the page, boot the VM, `echo hello`; pick a folder and
+`ls -la /mnt/host` through the picker, or `setMount` the OPFS root.
 
 **CI** (GitHub Actions): unit tests on every push (Go + bun via `oven-sh/setup-bun`, including
 `make test-web`); `make wasm` + integration + conformance on a Docker-enabled runner, caching
-`dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version. Playwright
-e2e is deferred until M5 stabilises the browser suite.
+`dist/smolbox.wasm` keyed on the hashes of `vm/Dockerfile`, `guest/`, and the c2w version; and a
+browser e2e job (restores the wasm cache, installs Chromium, runs `make test-e2e`) — **M5 done**.
 
 ---
 
@@ -701,10 +769,10 @@ e2e is deferred until M5 stabilises the browser suite.
    the browser (§2.3); the `/.wasmenv` `certDir` precedent shows the mechanism works (§2.4).
    **Mitigation: M4 opens by spiking a hardcoded in-memory `PreopenDirectory` at `/mnt/host` and
    confirming the guest sees it, before any bridge code is written.** Everything downstream depends
-   on this, so it must be the first browser task. **Status: spike passed at M4** — the guest reads
-   files and lists the in-memory `/mnt/host` from the browser (§1). What remains unproven is the
-   *async* bridge: a `FileSystemDirectoryHandle` served through a SAB (M5), and the black-box
-   `../`/write-rejection cases the conformance table asserts.
+   on this, so it must be the first browser task. **Status: resolved at M5** — the in-memory spike
+   passed at M4 (§1), and M5's real bridge passes the full conformance table in Chromium, including
+   the write-rejection and `../`-escape cases, over a `FileSystemDirectoryHandle` served through the
+   SAB (§1, measured at M5).
 3. **Wasm artifact size.** **Measured 107.6 MiB for minimal Alpine + BusyBox tooling** (§1). Under the
    pain threshold; if delivery ever hurts, `c2w --external-bundle` mounts the image at runtime
    instead of embedding it.
