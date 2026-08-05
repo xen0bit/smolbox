@@ -18,7 +18,11 @@ conformance driver), M6 (emscripten `--to-js` target + its conformance driver), 
 docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.**
 Component 2 has started: **M8 (the WebGPU tool-call spike) is done** — a local LFM2 model on WebGPU
 drives a real VM through the M7 tool surface, which needed **no changes** to serve it (PLAN §9).
-M9+ (multi-turn, chat UI) is not designed yet.
+**M9–M11 are designed but not built** (PLAN §10): the chat UI and multi-turn loop, a curated model
+registry with per-family call-syntax dialects, and customizable tools. Two rules from that design
+bind any work in this area: new capability goes *around* the exec API rather than inside it, and
+anything that needs a GPU cannot be tested in CI — so keep the logic pure and put it behind
+`FakeModel`.
 
 ## Toolchain
 

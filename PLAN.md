@@ -6,7 +6,9 @@
 > M6 (emscripten `--to-js` target), and M7 (tool-API docs, JSON Schema, mock caller) complete.
 > **Every milestone in §6 is done.** Component 2 opened at §9: **M8, the WebGPU tool-call spike, is
 > also done** — a local model on WebGPU drives a real VM through the M7 tool surface end to end,
-> without a single change to that surface. What remains is M9+ (multi-turn, chat UI), still undesigned.
+> without a single change to that surface. **§10 designs what comes next** (M9 chat UI and the
+> multi-turn loop, M10 the model registry and dialects, M11 customizable tools) — design only, not
+> yet built.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -1243,7 +1245,7 @@ this repo changes as part of this section.
 |---|---|---|
 | M8 | WebGPU tool-call spike: load `LFM2-1.2B-Tool-ONNX` via transformers.js in a dedicated worker, send one hardcoded prompt, get back one real `run_terminal_command` call, execute it against a live `Session`, log the full transcript | A single scripted run in Chromium shows: model loads on WebGPU, emits a tool call parsed without error, the call reaches a real VM session and returns real output, and the model's follow-up text (after the tool result is fed back) is logged — no chat UI required — **done** (§1, measured at M8) |
 
-### 9.4 Open questions for M9+ (not designed yet)
+### 9.4 Open questions for M9+ (**now designed in §10**; the ones still open are carried there)
 
 - Multi-turn loop and conversation-history management.
 - Chat UI shape — what a person actually sees and how they intervene.
@@ -1288,3 +1290,195 @@ this repo changes as part of this section.
     measurement rather than documentation — Liquid's docs describe a prompt switch that did not take.
     A model bump must re-run `make test-e2e-agent`; the parser accepts both syntaxes so a change in
     either direction is survivable, but a third syntax would not be.
+
+---
+
+## 10. Component 2, continued: chat, models, and tools (M9–M11)
+
+§9 proved the mechanism: a local model can drive the VM through the M7 tool surface. This section
+plans the product around it — a real chat interface, more than one model, and tools the user can
+shape. **Status: design only. No code in this repo changes as part of this section.**
+
+### 10.1 What M8 established that this section is built on
+
+Facts, not assumptions — each was measured, and each constrains a decision below.
+
+- **The tool surface does not need to change to serve a model.** M8 shipped without touching
+  `internal/tool` or `web/src/tool.ts`. Everything here must hold that line: new capability belongs
+  *around* the exec API, not inside it.
+- **Call syntax is a property of the checkpoint, not of the docs** (§9.1.3). LFM2 emits Pythonic
+  against five different prompts, including the wording its own vendor documents for JSON. Any
+  second model must be assumed to have its own syntax until a real transcript proves otherwise.
+- **A tool definition is expensive prompt real estate.** The rendered system prompt for the *single*
+  `run_terminal_command` tool is **2301 characters** (measured against the real template, OpenAI
+  dialect). Six tools is roughly 9–14 KB of system prompt on **every** turn, which a 1.2B model pays
+  for in both latency and attention. This is the strongest argument against a large tool list and
+  the reason §10.5 makes exposure per-session and opt-in.
+- **The context window is not the near-term limit; the output cap is.** LFM2's
+  `max_position_embeddings` is **128 000**, but `Request.MaxOutput` defaults to **1 MiB** — on the
+  order of 250k tokens from a single `cat`. The loop must budget output long before context runs out.
+- **There is no CI for anything that needs a GPU** (§2.11.24). This is the single biggest force on
+  the designs below: every milestone here is shaped so that its logic is pure and testable without
+  one.
+
+### 10.2 Decisions taken
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Chat loop | Multi-turn, **bounded** iterations per user message | An agent that can call tools forever is a hang with extra steps; a hard cap makes the failure legible |
+| Output budget | The agent sets **`Request.max_output` per call** and lets `Render` report `truncated` | The knob already exists in the M7 surface and the rendering already says "output truncated" — inventing a second truncation layer would put two different numbers in front of the model |
+| History policy | Keep the system prompt and recent turns verbatim; **elide oldest tool outputs first**, leaving the command and exit code | Tool output is the largest and least reusable thing in the history; the *fact* that a command ran and what it returned matters longer than its bytes |
+| Model selection | **Curated registry, each entry pinned to a revision and tagged with its dialect** | §10.1: syntax cannot be assumed. A dropdown over known-good entries fails honestly; a free-text model id fails as a mystery |
+| Quantization | Chosen at runtime from the **adapter's feature list**, not hardcoded | `shader-f16` is absent in headless Chromium but likely present on a real desktop (§2.11.24), so `q4f16` is a legitimate choice *sometimes*. Ask the adapter |
+| Tool sources | **Three**: Go-generated built-ins, user-defined command templates, per-session overrides | All three were asked for, and they are genuinely different things — a schema, a macro, and a preference |
+| User-tool **format** | Defined in Go, schema generated by `make generate`, validated in TS against that generated schema | Keeps "one definition, two runtimes" true *of the extension mechanism itself*. The thing that validates user tools is as anti-drift-guarded as the tool surface is |
+| Template quoting | Shell-quote interpolations by **default**; explicit `{param:raw}` to opt out | Correctness first: a pattern containing a space or a quote must work. It also makes a future restricted mode safe by construction rather than by audit (risk 15) |
+| Tool exposure | Per-session opt-in, default = today's single tool | §10.1's 2301-character measurement. More tools must be a choice someone makes, not a default they absorb |
+| Testability | A scripted **`FakeModel`** behind the same worker interface as the real one | The only way any of this gets CI coverage. This is M7's mock-caller trick one level up |
+
+### 10.3 M9 — chat UI and the multi-turn loop
+
+The agent page stops being a spike and becomes something a person uses.
+
+**The loop.** One user message drives: generate → parse → execute every returned call → append results
+→ generate again, until the model returns no tool calls or the iteration cap is hit. The cap is a
+session setting with a small default; hitting it ends the turn with a visible "stopped after N tool
+calls" rather than silently truncating the model's plan.
+
+**Budgets, which are the real content of this milestone.** Three, and they are different:
+
+- *Per call*: the agent sets `max_output` to a few KB rather than the 1 MiB default. `truncated`
+  already flows through `Render`, so the model is told its output was cut and can narrow the command.
+- *Per history*: oldest tool outputs are elided first (command and exit code retained), then oldest
+  turns. Elision must be visible in the UI — a user who cannot see what the model has forgotten
+  cannot debug it.
+- *Per turn*: `max_new_tokens`, already present, surfaced as a setting.
+
+**Streaming.** `TextStreamer`'s `callback_function` feeds tokens to the page as they generate.
+Note the interaction with parsing: a tool call is only parseable once complete, so the UI streams
+prose but must hold the `<|tool_call_start|>` region back until the block closes rather than render
+half a call.
+
+**Stop.** A user-visible interrupt. Generation and an in-flight `exec` are separately cancellable —
+`Session.exec` already takes a timeout and the VM kills the process group, so the pieces exist.
+
+**UI shape.** A message list; tool calls rendered as a collapsible block showing the command, exit
+code, and output; the mount picker and model status inline; errors as messages rather than console
+noise. Deliberately *not* in scope: theming, persistence of conversations, markdown rendering of
+model output.
+
+**`FakeModel`.** A scripted implementation behind the worker's message contract that replays canned
+turns — including a tool call, a malformed call, and a plain answer. It makes the loop, the budgets,
+the elision policy, the stop path, and the UI drivable by Playwright **in CI, with no GPU**. Its
+scripts live in a shared table, the same trick as `cases.json`.
+
+**Done when:** a Playwright suite drives a real multi-turn conversation against `FakeModel` in CI —
+tool call executed, result fed back, budget enforced, history elided, stop honoured — and one manual
+run against the real model on WebGPU behaves the same.
+
+### 10.4 M10 — the model registry and dialects
+
+**The registry** (`web/src/agent/models.ts`) is a code-defined list. Each entry carries: HF id,
+**pinned revision**, candidate dtypes in preference order, approximate download size, context length,
+and its **dialect**. The UI is a dropdown over this list showing size and whether the weights are
+already in `dist/models`.
+
+**Dialects** (`web/src/agent/dialects/`) are the generalisation of M8's parser. A dialect owns the
+tool-call syntax and any prompt-construction quirk. Three are known to exist in the wild — LFM2's
+Pythonic, the Hermes/Qwen `<tool_call>{json}</tool_call>` form, and Llama's `<|python_tag|>` — and
+they are pure functions over strings, so each is unit-tested from **captured fixtures** with no GPU.
+
+**A dialect is `verified` only once a transcript has been captured from the real model.** Anything
+implemented from documentation alone is `unverified` and says so in the UI. This is M8's lesson
+encoded as a type: the vendor docs were wrong, and a plan that trusts the next vendor's docs will be
+wrong again.
+
+`make model MODEL=<key>` takes a registry key; the default stays LFM2 so existing commands keep
+working.
+
+**Done when:** two model families run the same conversation through their own dialects, the dialect
+parsers pass unit tests from captured fixtures in CI, and selecting a model with an unverified
+dialect warns rather than silently misparsing.
+
+### 10.5 M11 — customizable tools
+
+Three sources feed one registry, and the split is what keeps the existing invariants intact.
+
+1. **Built-in tools**, defined in Go and generated exactly as today — `run_terminal_command` plus,
+   optionally, narrow ones (`read_file`, `list_dir`, `search_files`). These keep all three anti-drift
+   gates. Note this *amends* PLAN §4.5's "commands, not more tools": that decision was made for a
+   model that did not exist yet, and §10.7's open question is whether narrow tools actually help a
+   1.2B model or just cost it 2301 characters each.
+2. **User-defined command templates**, created in the UI: a name, a description, typed parameters,
+   and a shell template such as `grep -rn {pattern} /mnt/host`. They are runtime data, validated
+   against a **generated** schema for the definition format itself, and they compile to an ordinary
+   exec `Request`.
+3. **Per-session overrides**: the description text a model reads, and defaults for `timeout_ms`,
+   `max_output`, `cwd`.
+
+**Invariants that must survive, and must be tested to survive:**
+
+- `op` is unreachable from every path. A user tool cannot name it, template it, or override it.
+- Unknown arguments are still rejected, per tool.
+- Every tool, whatever its source, compiles to an exec `Request` — there is exactly one way into the
+  guest.
+- The built-in half stays generated. Hand-editing `docs/schema/*.json` remains a test failure.
+
+**Why this is not a new security boundary.** A user-defined template grants the model nothing it
+does not already have: with `run_terminal_command` exposed it can run arbitrary shell, so
+interpolating model output into a template is the same privilege by a shorter path. Quoting is
+specified for *correctness*. That reasoning inverts the moment a "restricted mode" exists that
+removes the raw tool (risk 15) — which is exactly why quoting is the default now rather than a
+later retrofit.
+
+**Persistence** is local (the browser), with JSON export/import so a tool set can be shared or
+checked into a repo. No server, consistent with everything else here.
+
+**Done when:** a user-defined tool is created in the UI, exposed to `FakeModel`, called, and executes
+against a real session in CI; the injection and `op` cases are unit-tested; and toggling tools
+changes what the rendered system prompt contains.
+
+### 10.6 Milestones
+
+| # | Deliverable | Done when |
+|---|---|---|
+| M9 | Chat UI, multi-turn loop, the three budgets, `FakeModel` | A CI Playwright suite drives a full multi-turn conversation against `FakeModel` — tool call, feedback, budget, elision, stop — and one manual WebGPU run matches |
+| M10 | Curated model registry + per-family dialects | Two model families run the same conversation; dialect parsers unit-tested from captured fixtures in CI; unverified dialects warn |
+| M11 | Tool registry: built-ins, user templates, session overrides | A user-defined tool round-trips from UI to guest under `FakeModel` in CI; `op`-injection and quoting cases unit-tested; exposure toggles change the prompt |
+
+### 10.7 Open questions
+
+- **Do narrow tools actually help a 1.2B model?** M8 proves it uses one general tool well. Whether
+  `read_file`/`search_files` improve or degrade its choices is unmeasured, and the honest answer may
+  be "they cost 2301 characters each and help nothing". M11 should measure before it recommends.
+- How many tools before the model starts mis-selecting? Needs a small eval, not an opinion.
+- Does the dedicated-worker split still hold when generation streams *and* a tool runs concurrently?
+  (Carried over from §9.4; M9's stop button is the first thing that tests it.)
+- Whether the agent page should replace `/` as the primary page once it is a real UI, and what
+  happens to the VM-only harness that Playwright drives today.
+- Conversation persistence across reloads — deliberately out of M9, but users will expect it.
+- Whether `FakeModel` scripts and real dialect fixtures can share one table, the way `cases.json` is
+  shared across three drivers.
+
+### 10.8 Risks
+
+13. **More tools may make the model worse, and the prompt longer.** Every definition costs ~2301
+    characters of system prompt on every turn (§10.1) and adds a selection decision a small model can
+    get wrong. **Mitigation:** exposure is opt-in and defaults to today's single tool; M11 measures
+    before recommending anything wider.
+14. **A dialect implemented from documentation is a guess.** M8's central lesson: the vendor's
+    documented JSON switch did not work. **Mitigation:** the `verified`/`unverified` distinction is
+    part of the registry, surfaced in the UI, and only a captured transcript promotes a dialect.
+15. **Template quoting becomes a real boundary if a restricted mode is ever added.** Today,
+    interpolating model output into a shell template is no escalation because raw shell is already
+    exposed. Remove `run_terminal_command` from a session and that stops being true instantly.
+    **Mitigation:** quote by default *now*, make `{param:raw}` explicit and visible, and treat any
+    future restricted mode as a change that must re-audit every template.
+16. **Bigger models may not fit.** The measured adapter reports `maxBufferSize` 4 GiB and
+    `maxStorageBufferBindingSize` 2 GiB; a 3B checkpoint at q4 approaches that, and the failure mode
+    is likely an opaque allocation error rather than a clear message. **Mitigation:** the registry
+    carries sizes, and M10 checks adapter limits before attempting a load.
+17. **`FakeModel` can drift from real model behaviour.** A loop that only ever sees well-formed
+    scripted turns will not survive a real one. **Mitigation:** its scripts must include the failure
+    modes M8 actually produced — a Pythonic call, an over-long output, a malformed block — and the
+    manual WebGPU run stays part of each milestone's done-when.
