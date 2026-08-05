@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { ToolCallParseError, parseTurn } from "./parse.ts";
+import { ToolCallParseError } from "../parse.ts";
+import { parseTurn } from "./lfm2.ts";
 
 const wrap = (body: string) => `<|tool_call_start|>${body}<|tool_call_end|>`;
 
@@ -35,12 +36,12 @@ describe("parseTurn", () => {
     const turn = parseTurn(
       wrap('[{"name": "a", "arguments": {"cmd": "1"}}, {"name": "b", "arguments": {"cmd": "2"}}]'),
     );
-    expect(turn.calls.map((c) => c.name)).toEqual(["a", "b"]);
+    expect(turn.calls.map((c: { name: string }) => c.name)).toEqual(["a", "b"]);
   });
 
   test("several blocks in one turn", () => {
     const turn = parseTurn(`${wrap('[{"name": "a", "arguments": {}}]')} and then ${wrap('[{"name": "b", "arguments": {}}]')}`);
-    expect(turn.calls.map((c) => c.name)).toEqual(["a", "b"]);
+    expect(turn.calls.map((c: { name: string }) => c.name)).toEqual(["a", "b"]);
   });
 
   test("prose around a call is kept as text and the block removed", () => {
@@ -123,7 +124,7 @@ describe("parseTurn: Pythonic calls", () => {
 
   test("several Pythonic calls", () => {
     const turn = parseTurn(wrap('[a(cmd="1"), b(cmd="2")]'));
-    expect(turn.calls.map((c) => c.name)).toEqual(["a", "b"]);
+    expect(turn.calls.map((c: { name: string }) => c.name)).toEqual(["a", "b"]);
   });
 
   test("no arguments at all", () => {

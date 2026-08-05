@@ -10,7 +10,7 @@
 // only ever seen well-formed turns will not survive a real one (PLAN §10.8,
 // risk 17).
 
-import type { GenerateRequest, GenerateResult, LoadResult, ModelClient } from "./model-client.ts";
+import type { GenerateRequest, GenerateResult, LoadOptions, LoadResult, ModelClient } from "./model-client.ts";
 
 /** One scripted turn. `when` is matched against the last user message. */
 export interface FakeTurn {
@@ -37,7 +37,7 @@ export class FakeModelClient implements ModelClient {
 
   constructor(private readonly scripts: FakeScript[]) {}
 
-  load(): Promise<LoadResult> {
+  load(_local?: boolean, _opts?: LoadOptions): Promise<LoadResult> {
     return Promise.resolve({ source: "fake", loadMs: 0 });
   }
 

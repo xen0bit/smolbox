@@ -8,7 +8,8 @@
 
 import type { ChatMessage } from "./messages.ts";
 import type { ModelClient } from "./model-client.ts";
-import { type ParsedCall, ToolCallParseError, parseTurn } from "./parse.ts";
+import type { Dialect } from "./dialects/index.ts";
+import { type ParsedCall, ToolCallParseError } from "./parse.ts";
 
 export interface ToolRunner {
   /** Executes one call and returns the text the model should see. */
@@ -28,6 +29,8 @@ export type AgentEvent =
 export interface ConversationOptions {
   systemPrompt: string;
   tools: unknown[];
+  /** The model family's tool-call syntax. Swapped when the model is. */
+  dialect: Dialect;
   /** Hard cap on tool round-trips per user message. */
   maxIterations: number;
   /** Ceiling for Request.max_output on every call the model makes. */
@@ -43,7 +46,7 @@ export interface ConversationOptions {
 // guardrail against a 1 MiB cat, not an accountant.
 export const CHARS_PER_TOKEN_ESTIMATE = 4;
 
-export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools"> = {
+export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dialect"> = {
   maxIterations: 5,
   // Three orders of magnitude below the protocol's 1 MiB default. A model that
   // needs more than this from one command should narrow the command; `truncated`
@@ -116,7 +119,7 @@ export class Conversation {
         let calls: ParsedCall[];
         let prose: string;
         try {
-          const parsed = parseTurn(result.text);
+          const parsed = this.opts.dialect.parseTurn(result.text);
           calls = parsed.calls;
           prose = parsed.text;
         } catch (err) {

@@ -12,12 +12,16 @@ import { Session } from "../session.ts";
 import { getOpfsDirectoryHandle, pickDirectoryHandle } from "../mount.ts";
 import { callTool, openaiTool, toolName } from "../tool.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
+import { dialectFor } from "./dialects/index.ts";
+import { DEFAULT_MODEL_KEY, type Dtype, modelFor, models, pickDtype } from "./models.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
 import type { ParsedCall } from "./parse.ts";
 
-const MODEL_PROBE = "/models/onnx-community/LFM2-1.2B-Tool-ONNX/config.json";
+let currentModelKey = DEFAULT_MODEL_KEY;
+
+const probeFor = (repo: string) => `/models/${repo}/config.json`;
 
 const SYSTEM_PROMPT = `You are smolbox, an assistant with access to a Linux sandbox.
 
@@ -97,9 +101,14 @@ let events: AgentEvent[] = [];
 let streaming: Element | null = null;
 
 const convo = new Conversation(
-  { systemPrompt: SYSTEM_PROMPT, tools: [openaiTool()], ...DEFAULTS },
   {
-    load: (local) => modelClient.load(local),
+    systemPrompt: SYSTEM_PROMPT,
+    tools: [openaiTool()],
+    dialect: dialectFor(modelFor(DEFAULT_MODEL_KEY).dialect),
+    ...DEFAULTS,
+  },
+  {
+    load: (local, opts) => modelClient.load(local, opts),
     generate: (r) => modelClient.generate(r),
     cancel: () => modelClient.cancel(),
   },
@@ -189,12 +198,21 @@ function stripMarkers(s: string): string {
 
 // -------------------------------------------------------------- page plumbing
 
-async function haveLocalWeights(): Promise<boolean> {
+async function haveLocalWeights(repo: string): Promise<boolean> {
   try {
-    return (await fetch(MODEL_PROBE, { method: "HEAD" })).ok;
+    return (await fetch(probeFor(repo), { method: "HEAD" })).ok;
   } catch {
     return false;
   }
+}
+
+// The dtype is a runtime question, not a constant: f16 variants need shader-f16
+// on the adapter, which headless Chromium lacks and a desktop browser usually
+// has (PLAN §2.11.24).
+async function adapterFeatures(): Promise<ReadonlySet<string>> {
+  const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+  const adapter = (await gpu?.requestAdapter()) as { features?: Iterable<string> } | undefined;
+  return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
 let busy = false;
@@ -213,6 +231,7 @@ export interface SmolagentHandle {
   webgpu(): Promise<{ available: boolean; adapter: boolean; info?: unknown }>;
   /** Swaps in a scripted model. Used by CI, which has no GPU. */
   useFake(scripts: FakeScript[]): void;
+  setModel(key: string): void;
   loadModel(local?: boolean): Promise<{ source: string; loadMs: number }>;
   bootVm(timeoutMs?: number): Promise<Caps>;
   setMount(handle: DirectoryHandleLike | null, links?: Record<string, string>): void;
@@ -239,11 +258,31 @@ const handle: SmolagentHandle = {
     setStatus("model: scripted fake");
   },
   loadModel: async (local?: boolean) => {
-    const useLocal = local ?? (await haveLocalWeights());
-    setStatus(`loading model (${useLocal ? "local" : "hub"})…`);
-    const ready = await modelClient.load(useLocal);
-    setStatus(`model ready (${ready.source}, ${ready.loadMs}ms)`);
+    const entry = modelFor(currentModelKey);
+    const dialect = dialectFor(entry.dialect);
+    convo.configure({ dialect });
+
+    const dtype = pickDtype(entry, await adapterFeatures());
+    if (!dtype) {
+      throw new Error(
+        `${entry.label}: none of its quantizations (${entry.dtypes.join(", ")}) run on this adapter`,
+      );
+    }
+    if (!dialect.verified) {
+      bubble("note", "unverified dialect")!.textContent =
+        `${dialect.label}: ${dialect.note ?? "never run against the real model"}`;
+    }
+
+    const useLocal = local ?? (await haveLocalWeights(entry.repo));
+    setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
+    const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
+    setStatus(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     return ready;
+  },
+  setModel: (key: string) => {
+    currentModelKey = modelFor(key).key;
+    convo.configure({ dialect: dialectFor(modelFor(key).dialect) });
+    setStatus(`model: ${modelFor(key).label} (not loaded yet)`);
   },
   bootVm: async (timeoutMs?: number) => {
     setStatus("booting the VM…");
@@ -261,7 +300,22 @@ const handle: SmolagentHandle = {
     try {
       await convo.send(text);
     } finally {
-      setBusy(false);
+      // Populate the model dropdown from the registry, marking unverified dialects
+// so an odd answer reads as "we never checked this family" rather than a bug.
+const modelSelect = el("model");
+if (modelSelect) {
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.key;
+    const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
+    opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
+    modelSelect.appendChild(opt);
+  }
+  modelSelect.value = currentModelKey;
+  modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
+}
+
+setBusy(false);
     }
     return events;
   },

@@ -9,7 +9,7 @@ export interface ChatMessage {
 
 /** Page -> worker. */
 export type ModelRequest =
-  | { type: "load"; local: boolean }
+  | { type: "load"; local: boolean; modelKey?: string; dtype?: string }
   | {
       type: "generate";
       id: number;
@@ -26,7 +26,7 @@ export type ModelRequest =
 export type ModelResponse =
   | { type: "log"; message: string }
   | { type: "progress"; file: string; pct: number }
-  | { type: "ready"; source: "local" | "hub"; loadMs: number }
+  | { type: "ready"; source: "local" | "hub"; loadMs: number; modelKey: string; dtype: string }
   | { type: "token"; id: number; text: string }
   | {
       type: "generated";

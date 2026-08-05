@@ -1,20 +1,10 @@
-// Parses LFM2's tool-call output into calls the M7 tool surface can execute.
+// Shared machinery for reading tool calls out of model output.
 //
-// The model wraps calls in <|tool_call_start|>...<|tool_call_end|>. Two body
-// syntaxes are accepted, because the model produces both:
-//
-//   Pythonic: [run_terminal_command(cmd="ls", timeout_ms=0)]
-//   JSON:     [{"name": "run_terminal_command", "arguments": {"cmd": "ls"}}]
-//
-// Pythonic is this checkpoint's default and, measured at M8, is what it actually
-// emits — five different system-prompt wordings including the "Output function
-// calls as JSON" line from Liquid's own docs all produced Pythonic calls with
-// correct arguments. So it is parsed, not treated as an error. JSON stays
-// supported because it costs nothing and is what a future checkpoint or a
-// prompt that does take would produce.
-
-export const TOOL_CALL_START = "<|tool_call_start|>";
-export const TOOL_CALL_END = "<|tool_call_end|>";
+// The syntax a model uses is a property of the checkpoint, not of its
+// documentation — M8 established that the hard way (PLAN §9.1.3). So this file
+// holds only what every dialect needs: the call types, the Pythonic reader, the
+// JSON normaliser, and block extraction. The per-family knowledge lives in
+// dialects/, one file each.
 
 /** A tool call the model asked for. `args` is still untrusted model output. */
 export interface ParsedCall {
@@ -32,58 +22,47 @@ export interface ParsedTurn {
 export class ToolCallParseError extends Error {}
 
 /**
- * Splits a raw model turn into its prose and its tool calls.
+ * Pulls out every `start`…`end` region, returning the bodies and the text with
+ * those regions removed.
  *
- * A turn with no tool-call block is not an error: the model answering in plain
- * text is a legitimate outcome, and the caller decides whether it wanted one.
+ * A missing `end` is an error rather than a best-effort parse: generation that
+ * stopped mid-call would otherwise be turned into a call the model never
+ * finished asking for.
  */
-export function parseTurn(raw: string): ParsedTurn {
-  const text = stripSpecialTokens(raw).trim();
-  const calls: ParsedCall[] = [];
-
+export function extractBlocks(
+  raw: string,
+  start: string,
+  end: string,
+): { bodies: string[]; rest: string } {
+  const bodies: string[] = [];
+  let rest = "";
   let cursor = 0;
+
   for (;;) {
-    const open = raw.indexOf(TOOL_CALL_START, cursor);
+    const open = raw.indexOf(start, cursor);
     if (open === -1) {
-      break;
+      rest += raw.slice(cursor);
+      return { bodies, rest };
     }
-    const bodyStart = open + TOOL_CALL_START.length;
-    const close = raw.indexOf(TOOL_CALL_END, bodyStart);
-    // A missing close token means generation hit the token budget mid-call.
-    // Parsing the truncated remainder would at best invent a call the model did
-    // not finish asking for, so treat it as the error it is.
+    rest += raw.slice(cursor, open);
+    const bodyStart = open + start.length;
+    const close = raw.indexOf(end, bodyStart);
     if (close === -1) {
       throw new ToolCallParseError(
-        `tool call block is unterminated (no ${TOOL_CALL_END}); the model may have hit its token limit`,
+        `tool call block is unterminated (no ${end}); the model may have hit its token limit`,
       );
     }
-    calls.push(...parseCallBody(raw.slice(bodyStart, close)));
-    cursor = close + TOOL_CALL_END.length;
+    bodies.push(raw.slice(bodyStart, close));
+    cursor = close + end.length;
   }
-
-  return { text, calls };
 }
 
-function parseCallBody(body: string): ParsedCall[] {
-  const trimmed = body.trim();
-  if (trimmed === "") {
-    throw new ToolCallParseError("tool call block is empty");
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (err) {
-    if (looksPythonic(trimmed)) {
-      return parsePythonicCalls(trimmed);
-    }
-    throw new ToolCallParseError(
-      `tool call body is not valid JSON: ${err instanceof Error ? err.message : String(err)}: ${truncate(trimmed)}`,
-    );
-  }
-
-  // The template's own examples use a list, but a single object is the obvious
-  // thing for a model to emit when it wants one call, and both are unambiguous.
+/**
+ * Turns parsed JSON into calls. Accepts a single object or a list, and
+ * `arguments` either as an object or as a JSON string, because models have seen
+ * plenty of both in training.
+ */
+export function normalizeJsonCalls(parsed: unknown): ParsedCall[] {
   const items = Array.isArray(parsed) ? parsed : [parsed];
   if (items.length === 0) {
     throw new ToolCallParseError("tool call block contained an empty list");
@@ -102,8 +81,6 @@ function toCall(item: unknown): ParsedCall {
     throw new ToolCallParseError("tool call is missing a string `name`");
   }
 
-  // OpenAI-dialect callers stringify the arguments; the template does not, but
-  // the model has seen plenty of both in training. Accept either.
   let rawArgs = obj.arguments ?? obj.parameters ?? {};
   if (typeof rawArgs === "string") {
     try {
@@ -121,10 +98,31 @@ function toCall(item: unknown): ParsedCall {
   return { name, args: rawArgs as Record<string, unknown> };
 }
 
+/** Parses a body as JSON if it can, else as a Pythonic call list. */
+export function parseCallBody(body: string): ParsedCall[] {
+  const trimmed = body.trim();
+  if (trimmed === "") {
+    throw new ToolCallParseError("tool call block is empty");
+  }
+  try {
+    return normalizeJsonCalls(JSON.parse(trimmed));
+  } catch (err) {
+    if (err instanceof ToolCallParseError) {
+      throw err;
+    }
+    if (looksPythonic(trimmed)) {
+      return parsePythonicCalls(trimmed);
+    }
+    throw new ToolCallParseError(
+      `tool call body is not valid JSON: ${err instanceof Error ? err.message : String(err)}: ${truncate(trimmed)}`,
+    );
+  }
+}
+
 // A recursive-descent reader for the Pythonic call syntax. Small on purpose: it
-// covers the literal forms the model actually emits for this schema (strings,
-// ints, floats, dicts, lists, True/False/None) and refuses anything else rather
-// than guessing. It is not a Python expression evaluator and must not become one.
+// covers the literal forms models actually emit for this schema (strings, ints,
+// floats, dicts, lists, True/False/None) and refuses anything else rather than
+// guessing. It is not a Python expression evaluator and must not become one.
 class PythonicReader {
   private i = 0;
 
@@ -322,21 +320,25 @@ class PythonicReader {
   }
 }
 
-function parsePythonicCalls(body: string): ParsedCall[] {
+export function parsePythonicCalls(body: string): ParsedCall[] {
   return new PythonicReader(body).parseCalls();
 }
 
-// Only the tokens that leak into decoded text; the tokenizer already drops the
-// rest when skip_special_tokens is set, but the raw string is what we parse.
+// Chat-scaffolding tokens that leak into decoded text. The tokenizer drops them
+// when skip_special_tokens is set, but the raw string is what we parse, so the
+// prose half has to be cleaned here.
 const SPECIAL_TOKENS = [
-  /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/g,
   /<\|im_start\|>/g,
   /<\|im_end\|>/g,
   /<\|startoftext\|>/g,
   /<\|endoftext\|>/g,
+  /<\|eot_id\|>/g,
+  /<\|eom_id\|>/g,
+  /<\|start_header_id\|>/g,
+  /<\|end_header_id\|>/g,
 ];
 
-function stripSpecialTokens(s: string): string {
+export function stripSpecialTokens(s: string): string {
   let out = s;
   for (const re of SPECIAL_TOKENS) {
     out = out.replace(re, "");
@@ -344,7 +346,7 @@ function stripSpecialTokens(s: string): string {
   return out;
 }
 
-function looksPythonic(s: string): boolean {
+export function looksPythonic(s: string): boolean {
   return /^\[?\s*[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(s);
 }
 
@@ -353,6 +355,6 @@ function describe(v: unknown): string {
   return Array.isArray(v) ? "an array" : typeof v;
 }
 
-function truncate(s: string, max = 120): string {
+export function truncate(s: string, max = 120): string {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
 }

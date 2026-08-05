@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
+import { lfm2 } from "./dialects/lfm2.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ParsedCall } from "./parse.ts";
 
@@ -16,7 +17,7 @@ function build(scripts: FakeScript[], patch: Partial<Parameters<Conversation["co
     },
   };
   const convo = new Conversation(
-    { systemPrompt: "sys", tools: [], ...DEFAULTS, ...patch },
+    { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, ...patch },
     new FakeModelClient(scripts),
     runner,
     (e) => events.push(e),
@@ -139,6 +140,7 @@ describe("Conversation", () => {
       {
         systemPrompt: "sys",
         tools: [],
+        dialect: lfm2,
         ...DEFAULTS,
         historyBudgetChars: 6000,
         maxIterations: 6,

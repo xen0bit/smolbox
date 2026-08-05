@@ -1,6 +1,11 @@
-// Pulls the LFM2 tool-calling checkpoint into dist/models/ so the dev server can
-// serve it locally. Pinned to a revision sha, not `main`: a model that silently
-// changes under the spike would be indistinguishable from a regression.
+// Pulls a checkpoint from the registry into dist/models so the dev server can
+// serve it locally. The registry (web/src/agent/models.ts) is the single source
+// of which revision is current, so the thing that downloads weights and the
+// thing that loads them cannot disagree.
+//
+//   bun web/fetch-model.ts              # the default entry
+//   bun web/fetch-model.ts qwen3-1.7b   # a specific one
+//   bun web/fetch-model.ts --list
 //
 // transformers.js resolves a local model as <localModelPath>/<repo>/<file>, so
 // the layout here mirrors the HF repo exactly.
@@ -8,33 +13,41 @@
 import { mkdir, rename, stat } from "node:fs/promises";
 import path from "node:path";
 
-const REPO = "onnx-community/LFM2-1.2B-Tool-ONNX";
-const REVISION = "1992998ab37ef9db120f1589181db465e0f037ad";
-
-// The q4 variant, not q4f16: headless Chromium's ANGLE/Vulkan adapter does not
-// expose shader-f16 (PLAN §2.11.24), so an f16 build cannot run in the e2e path.
-const FILES = [
-  "config.json",
-  "generation_config.json",
-  "tokenizer.json",
-  "tokenizer_config.json",
-  "special_tokens_map.json",
-  "chat_template.jinja",
-  "onnx/model_q4.onnx",
-  "onnx/model_q4.onnx_data",
-];
-
-const outRoot = path.join("dist", "models", REPO);
-
-function human(n: number): string {
-  return n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${(n / 1e6).toFixed(1)} MB`;
-}
+import {
+  DEFAULT_MODEL_KEY,
+  OPTIONAL_FILES,
+  REQUIRED_FILES,
+  modelFor,
+  models,
+  weightFiles,
+} from "./src/agent/models.ts";
 
 // stderr, not console.log: bun block-buffers stdout to a pipe, so a `make model`
 // piped into a log shows nothing until it exits — useless for a 1.2 GB pull.
 function say(line: string): void {
   process.stderr.write(`${line}\n`);
 }
+
+function human(n: number): string {
+  return n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : `${(n / 1e6).toFixed(1)} MB`;
+}
+
+const args = process.argv.slice(2).filter((a) => a !== "");
+if (args.includes("--list")) {
+  for (const m of models) {
+    say(`${m.key.padEnd(24)} ${human(m.approxBytes).padStart(9)}  ${m.dialect.padEnd(7)} ${m.label}`);
+  }
+  process.exit(0);
+}
+
+const entry = modelFor(args[0] ?? DEFAULT_MODEL_KEY);
+// The first candidate dtype is what a headless run will use; f16 variants are a
+// runtime choice the page makes against the adapter, not something to download
+// speculatively.
+const dtype = entry.dtypes[0]!;
+const weights = weightFiles(dtype);
+
+const outRoot = path.join("dist", "models", entry.repo);
 
 async function sizeOf(p: string): Promise<number | null> {
   try {
@@ -44,28 +57,37 @@ async function sizeOf(p: string): Promise<number | null> {
   }
 }
 
-async function fetchFile(rel: string): Promise<void> {
+async function fetchFile(rel: string, optional: boolean): Promise<number> {
   const dest = path.join(outRoot, rel);
-  const url = `https://huggingface.co/${REPO}/resolve/${REVISION}/${rel}`;
+  const url = `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${rel}`;
 
   // Bun drops content-length on the HEAD (it negotiates a compressed transfer),
   // so the authoritative size is HF's own x-linked-size, which it exposes via
-  // access-control-expose-headers for exactly this purpose.
+  // access-control-expose-headers for exactly this.
   const head = await fetch(url, { method: "HEAD", redirect: "follow" });
   if (!head.ok) {
+    if (optional && (head.status === 404 || head.status === 403)) {
+      return 0;
+    }
     throw new Error(`HEAD ${rel}: ${head.status} ${head.statusText}`);
   }
   const expected = Number(head.headers.get("x-linked-size") ?? head.headers.get("content-length") ?? 0);
 
+  // A hit needs either a matching size or, for the small non-LFS files where HF
+  // reports no size at all, merely existing: the revision is pinned, so a file
+  // already on disk cannot be a stale version of itself.
   const have = await sizeOf(dest);
-  if (have !== null && expected > 0 && have === expected) {
+  if (have !== null && have > 0 && (expected === 0 || have === expected)) {
     say(`  ok    ${rel} (${human(have)}, cached)`);
-    return;
+    return have;
   }
 
   await mkdir(path.dirname(dest), { recursive: true });
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok || !res.body) {
+    if (optional) {
+      return 0;
+    }
     throw new Error(`GET ${rel}: ${res.status} ${res.statusText}`);
   }
 
@@ -94,12 +116,16 @@ async function fetchFile(rel: string): Promise<void> {
   // file that the cached-size check above would then accept.
   await rename(tmp, dest);
   say(`  fetch ${rel} (${human(written)})`);
+  return written;
 }
 
-say(`fetching ${REPO}@${REVISION.slice(0, 8)} -> ${outRoot}`);
+say(`fetching ${entry.key} (${entry.repo}@${entry.revision.slice(0, 8)}, ${dtype}) -> ${outRoot}`);
+
 let total = 0;
-for (const rel of FILES) {
-  await fetchFile(rel);
-  total += (await sizeOf(path.join(outRoot, rel))) ?? 0;
+for (const rel of [...REQUIRED_FILES, ...weights.required]) {
+  total += await fetchFile(rel, false);
 }
-say(`done: ${FILES.length} files, ${human(total)}`);
+for (const rel of [...OPTIONAL_FILES, ...weights.optional]) {
+  total += await fetchFile(rel, true);
+}
+say(`done: ${human(total)}`);

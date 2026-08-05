@@ -28,8 +28,14 @@ export interface LoadResult {
   loadMs: number;
 }
 
+/** Which checkpoint to load, and at which quantization. */
+export interface LoadOptions {
+  modelKey?: string;
+  dtype?: string;
+}
+
 export interface ModelClient {
-  load(local?: boolean): Promise<LoadResult>;
+  load(local?: boolean, opts?: LoadOptions): Promise<LoadResult>;
   generate(req: GenerateRequest): Promise<GenerateResult>;
   /** Best-effort interrupt of an in-flight generate. Safe to call when idle. */
   cancel(): void;
@@ -92,10 +98,10 @@ export class WorkerModelClient implements ModelClient {
     }
   }
 
-  load(local = true): Promise<LoadResult> {
+  load(local = true, opts: LoadOptions = {}): Promise<LoadResult> {
     return new Promise((resolve, reject) => {
       this.pendingLoad = { resolve, reject };
-      this.worker.postMessage({ type: "load", local });
+      this.worker.postMessage({ type: "load", local, modelKey: opts.modelKey, dtype: opts.dtype });
     });
   }
 
