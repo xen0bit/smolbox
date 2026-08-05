@@ -336,6 +336,12 @@ const SPECIAL_TOKENS = [
   /<\|eom_id\|>/g,
   /<\|start_header_id\|>/g,
   /<\|end_header_id\|>/g,
+  // Granite 4.0, which is what Antares is built on. Note `end_of_text` is not
+  // the same token as `endoftext` above — Granite spells it with underscores
+  // and uses it as both BOS and EOS, so it turns up mid-stream routinely.
+  /<\|end_of_text\|>/g,
+  /<\|start_of_role\|>/g,
+  /<\|end_of_role\|>/g,
 ];
 
 export function stripSpecialTokens(s: string): string {

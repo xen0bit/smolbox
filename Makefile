@@ -69,10 +69,15 @@ web:
 		cp -r $(DIST)/js/. web/dist/js/ && \
 		cp web/js.html web/dist/js/index.html; \
 	else echo "note: dist/js not built yet; run 'make wasm-js' (M6)"; fi
-	mkdir -p web/dist/agent web/dist/ort
+	mkdir -p web/dist/agent web/dist/scan web/dist/ort
 	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \
 		--target=browser --outdir web/dist/agent
 	cp web/agent.html web/dist/agent/index.html
+	@# The Antares localization page. Its own entry point rather than a mode of
+	@# the chat page: the run has a budget, a termination protocol and a ranked
+	@# answer, none of which chat has (PLAN §11.5).
+	bun build web/src/agent/scan-main.ts --target=browser --outdir web/dist/scan
+	cp web/scan.html web/dist/scan/index.html
 	@# onnxruntime-web otherwise pulls these from jsdelivr at runtime; serving them
 	@# locally keeps the page pinned to the installed version and works offline.
 	@# Copy every simd-threaded variant rather than guessing: ORT picks the build
@@ -90,6 +95,26 @@ web:
 #   make model MODEL=--list     what is on offer
 model:
 	bun web/fetch-model.ts $(MODEL)
+
+# Builds Antares into ONNX, because nobody publishes one (PLAN §11.1.5). This is
+# the only target in the repo that needs Python, uv and an HF_TOKEN; everything
+# else is Go and bun. The weights are gated, and acceptance is per repository —
+# accepting antares-1b does not grant antares-350m.
+#   make antares-onnx                     the shipping model (1B)
+#   make antares-onnx ANTARES=antares-350m the small one (cannot follow the
+#                                          protocol — see PLAN §11.10)
+ANTARES ?= antares-1b
+antares-onnx:
+	@test -f .env || { echo "error: .env not found. Copy .env.example and set HF_TOKEN."; exit 1; }
+	set -a && . ./.env && set +a && cd tools && uv run python convert_antares.py $(ANTARES)
+
+# Checks a converted build still behaves like the checkpoint it came from:
+# greedy agreement against the safetensors reference, and whether it still
+# emits tool calls under Antares' own sampling settings.
+antares-verify:
+	cd tools && uv run python verify_onnx.py \
+		--source dist/models/fdtn-ai/$(ANTARES) \
+		--onnx dist/models/fdtn-ai/$(ANTARES)-ONNX --dtype fp16
 
 serve:
 	bun web/serve.ts

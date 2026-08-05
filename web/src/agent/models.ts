@@ -12,7 +12,28 @@
 import type { DialectName } from "./dialects/index.ts";
 
 /** Quantizations, in the order transformers.js names them. */
-export type Dtype = "q4" | "q4f16" | "fp16" | "q8";
+export type Dtype = "q4" | "q4f16" | "fp16" | "q8" | "fp32";
+
+/**
+ * Sampling settings a checkpoint needs to behave as trained.
+ *
+ * M8 chose greedy decoding so a spike's output would not change run to run, and
+ * that was right for a spike. It is wrong for Antares: at temperature 0 both
+ * sizes fall into repetition loops and never reach a tool call — the reference
+ * safetensors model does it too, so it is the checkpoint's property, not the
+ * runtime's (PLAN §11.10). An entry that needs sampling has to say so.
+ *
+ * `frequency_penalty` is deliberately absent. Antares specifies 0.3, and
+ * transformers.js has no additive frequency penalty — only a multiplicative
+ * `repetition_penalty`, which is a different function. Recording the gap beats
+ * substituting a lookalike.
+ */
+export interface GenerationDefaults {
+  do_sample: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_new_tokens?: number;
+}
 
 export interface ModelEntry {
   key: string;
@@ -31,6 +52,23 @@ export interface ModelEntry {
   contextTokens: number;
   dialect: DialectName;
   note?: string;
+  /**
+   * Built locally by `make antares-onnx` rather than downloadable.
+   *
+   * No ONNX build of Antares exists anywhere and the source weights are gated
+   * (PLAN §11.1.5), so `make model` cannot help. The UI needs this to say "run
+   * the build" instead of offering a download that would 404.
+   */
+  local?: boolean;
+  /** Sampling this checkpoint needs. Absent means the page's defaults are fine. */
+  generation?: GenerationDefaults;
+  /**
+   * The task this model is for, when it is not general chat.
+   *
+   * Antares is trained for exactly one job with a fixed termination protocol;
+   * offering it in a chat box without saying so produces confident nonsense.
+   */
+  task?: "chat" | "localize";
 }
 
 /** Quantizations that need `shader-f16` on the adapter. */
@@ -71,6 +109,47 @@ export const models: ModelEntry[] = [
     contextTokens: 32_768,
     dialect: "hermes",
     note: "Emits <think> blocks. 2.1 GB at q4 — check adapter limits before loading.",
+  },
+  {
+    key: "antares-1b",
+    label: "Antares 1B (vulnerability localization)",
+    // Built by `make antares-onnx`, not downloaded. The revision pins the
+    // SOURCE checkpoint the local build came from, which is the only thing that
+    // makes a locally-built artifact reproducible.
+    repo: "fdtn-ai/antares-1b-ONNX",
+    revision: "10417eb35641b32e7141157db19c76eb545193b6",
+    // fp16 only, and that is a measured decision rather than an omission.
+    // Antares' RL-tuned weights are quantization-hostile: this repo's quantizer
+    // scores 0.943 logit correlation on the Granite base model it came from —
+    // better than onnx-community's own published q4 — and 0.816 on Antares,
+    // which costs it the tool-call protocol entirely (PLAN §11.10).
+    dtypes: ["fp16"],
+    approxBytes: 3_676_884_858,
+    contextTokens: 131_072,
+    dialect: "antares",
+    local: true,
+    task: "localize",
+    generation: { do_sample: true, temperature: 0.3, top_p: 1.0, max_new_tokens: 4096 },
+    note: "Built locally: run `make antares-onnx`. 3.7 GB at fp16 — the largest entry by far.",
+  },
+  {
+    key: "antares-350m",
+    label: "Antares 350M (does not follow the protocol)",
+    repo: "fdtn-ai/antares-350m-ONNX",
+    revision: "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
+    dtypes: ["fp16"],
+    approxBytes: 911_780_067,
+    contextTokens: 32_768,
+    dialect: "antares",
+    local: true,
+    task: "localize",
+    generation: { do_sample: true, temperature: 0.3, top_p: 1.0, max_new_tokens: 4096 },
+    // Listed rather than dropped because "we tried the small one" is worth
+    // recording where someone will look for it: at fp32, temperature 0 and 0.3,
+    // against the exact CLI prompt, it produces fluent reasoning and then loops
+    // without ever emitting a tool call (PLAN §11.10). Its conversion is
+    // verified; its behaviour is not usable.
+    note: "Converts and runs, but never emits a tool call. Kept for comparison — use 1B.",
   },
 ];
 

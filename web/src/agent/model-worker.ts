@@ -17,7 +17,7 @@ import {
 } from "@huggingface/transformers";
 
 import type { ModelRequest, ModelResponse } from "./messages.ts";
-import { DEFAULT_MODEL_KEY, type Dtype, modelFor } from "./models.ts";
+import { DEFAULT_MODEL_KEY, type Dtype, type ModelEntry, modelFor } from "./models.ts";
 
 // onnxruntime-web otherwise fetches its wasm from jsdelivr at runtime. Serving
 // it from our own origin pins it to the installed version and keeps the page
@@ -36,6 +36,9 @@ const scope = globalThis as unknown as {
 
 let tokenizer: PreTrainedTokenizer | null = null;
 let model: PreTrainedModel | null = null;
+// Remembered from the load so generate() can apply the checkpoint's own
+// sampling settings without the page having to pass them on every turn.
+let loaded: ModelEntry | null = null;
 
 // One generation at a time, so one criteria object is enough. It is reset
 // before each run rather than recreated, because generate() holds the reference.
@@ -47,6 +50,15 @@ function post(msg: ModelResponse): void {
 
 async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<void> {
   const entry = modelFor(modelKey);
+  loaded = entry;
+  // A locally-built checkpoint has no hub copy to fall back to, so failing here
+  // with the build command beats a 404 from deep inside transformers.js.
+  if (entry.local && !local) {
+    throw new Error(
+      `${entry.label} is built locally, not downloaded: run \`make antares-onnx\` ` +
+        `to produce dist/models/${entry.repo}, then reload.`,
+    );
+  }
   // Local weights come from dist/models via the dev server; the hub is the
   // fallback so the page still works for someone who has not run `make model`.
   env.allowLocalModels = local;
@@ -106,12 +118,16 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     callback_function: (text: string) => post({ type: "token", id: req.id, text }),
   });
 
+  // Greedy was M8's choice so a spike's output could not change run to run, and
+  // it remains the default. It is actively wrong for some checkpoints: Antares
+  // at temperature 0 falls into repetition loops and never reaches a tool call,
+  // in the reference safetensors model as much as in the converted one
+  // (PLAN §11.10). An entry that needs sampling declares it in the registry.
+  const sampling = loaded?.generation ?? { do_sample: false };
   const out = await model.generate({
     ...inputs,
-    // Greedy: a spike whose output changes run to run cannot tell a prompt
-    // problem from a sampling one.
-    do_sample: false,
-    max_new_tokens: req.maxNewTokens ?? 256,
+    ...sampling,
+    max_new_tokens: req.maxNewTokens ?? sampling.max_new_tokens ?? 256,
     streamer,
     stopping_criteria: stopper,
   });

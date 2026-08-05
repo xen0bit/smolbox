@@ -31,6 +31,9 @@ interface Element {
   appendChild(child: Element): Element;
   replaceChildren(...children: Element[]): void;
   setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+  /** Only used to trigger the JSON download on a synthesised anchor. */
+  click(): void;
   addEventListener(type: "click" | "keydown" | "change" | "input", listener: (ev: KeyboardEventLike) => void): void;
 }
 
@@ -57,4 +60,10 @@ declare function showDirectoryPicker(
 
 interface Navigator {
   storage: import("./fsbridge/main-host").StorageManagerLike;
+  /**
+   * WebGPU, structurally typed. The page reads the adapter's feature set to
+   * choose a quantization (PLAN §10.2) and needs nothing else from it, so this
+   * stays a two-field shape rather than pulling in @webgpu/types.
+   */
+  gpu?: { requestAdapter(): Promise<{ features: Iterable<string> } | null> };
 }

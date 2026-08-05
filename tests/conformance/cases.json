@@ -144,7 +144,9 @@
     },
     {
       "name": "mount: read a file through the host mount",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -159,7 +161,9 @@
     },
     {
       "name": "mount: nested subdirectory read",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -174,7 +178,9 @@
     },
     {
       "name": "mount: directory listing matches the fixture tree",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -189,7 +195,9 @@
     },
     {
       "name": "mount: symlink resolves through the mount",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -204,7 +212,9 @@
     },
     {
       "name": "mount: writes are rejected (read-only at the host boundary)",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -220,7 +230,9 @@
     },
     {
       "name": "mount: ../ escape above the mount root fails without leaking host files",
-      "requires": ["mount"],
+      "requires": [
+        "mount"
+      ],
       "steps": [
         {
           "request": {
@@ -230,6 +242,103 @@
             "exit_code": 0,
             "stdout_contains": "rc=1",
             "stdout_not_contains": "SMOLBOX-TRAVERSAL-SENTINEL"
+          }
+        }
+      ]
+    },
+    {
+      "name": "search tooling: ripgrep is installed (the Antares prompt names rg)",
+      "steps": [
+        {
+          "request": {
+            "cmd": "rg --version | head -1"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "ripgrep"
+          }
+        }
+      ]
+    },
+    {
+      "name": "search tooling: tree is installed (the Antares prompt names tree)",
+      "steps": [
+        {
+          "request": {
+            "cmd": "tree --version"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "tree"
+          }
+        }
+      ]
+    },
+    {
+      "name": "search tooling: tree walks the host mount (stats, so d_type does not matter)",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "tree /mnt/host"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "nested.txt"
+          }
+        }
+      ]
+    },
+    {
+      "name": "search tooling: grep -r is the working recursive search on the mount",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "grep -rn nested /mnt/host"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "sub/nested.txt"
+          }
+        }
+      ]
+    },
+    {
+      "name": "search tooling: rg reads an explicit mount file (traversal is a known gap)",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "rg --no-heading -n hello /mnt/host/hello.txt"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "hello from the mount"
+          }
+        }
+      ]
+    },
+    {
+      "name": "mount: KNOWN GAP \u2014 readdir has no d_type, so find does not recurse",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "find /mnt/host -type f | tr '\\n' ' '"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "hello.txt",
+            "stdout_not_contains": "nested.txt"
           }
         }
       ]

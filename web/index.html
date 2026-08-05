@@ -37,6 +37,12 @@
       <button id="pick" type="button">…</button>
       <pre id="output"></pre>
       <p>
+        <strong>Also here:</strong> <a href="/agent/">/agent/</a> is a chat UI with a
+        local model driving this VM, and <a href="/scan/">/scan/</a> runs Cisco's
+        Antares over a folder you pick to suggest files that may contain a given
+        CWE. Both need <code>make model</code> or <code>make antares-onnx</code> first.
+      </p>
+      <p>
         This is the WASI build: it runs under wazero and in the browser, and it
         is the one that can mount a host folder read-only at
         <code>/mnt/host</code>. The faster emscripten build lives at
