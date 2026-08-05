@@ -18,11 +18,10 @@ conformance driver), M6 (emscripten `--to-js` target + its conformance driver), 
 docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.**
 Component 2 has started: **M8 (the WebGPU tool-call spike) is done** — a local LFM2 model on WebGPU
 drives a real VM through the M7 tool surface, which needed **no changes** to serve it (PLAN §9).
-**M9–M11 are designed but not built** (PLAN §10): the chat UI and multi-turn loop, a curated model
-registry with per-family call-syntax dialects, and customizable tools. Two rules from that design
-bind any work in this area: new capability goes *around* the exec API rather than inside it, and
-anything that needs a GPU cannot be tested in CI — so keep the logic pure and put it behind
-`FakeModel`.
+**M9 (chat UI + multi-turn loop), M10 (model registry + dialects) and M11 (customizable tools) are
+done too** (PLAN §10). Two rules bind any further work here: new capability goes *around* the exec
+API rather than inside it, and anything needing a GPU cannot be tested in CI — so keep the logic
+pure and drive it with `FakeModelClient`.
 
 ## Toolchain
 
@@ -57,7 +56,8 @@ anything that needs a GPU cannot be tested in CI — so keep the logic pure and 
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
-| `make test-e2e-agent` | Playwright: the M8 agent spike at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
+| `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
+| `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
@@ -264,6 +264,29 @@ wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.
 `make web` copies **every** variant. A missing one surfaces as "no available backend found", not a
 404. (PLAN §2.11.25-26.)
 
+### The agent loop: budgets belong to the request, not to the arguments
+`Conversation` caps output per call, but it passes the budget to the `ToolRunner` — it must never
+write `max_output` into the model's argument object. Template tools declare their own parameters and
+reject anything else, so an injected argument breaks every one of them. This was shipped wrong at M9
+and caught by the e2e suite at M11, with green unit tests on both sides; the regression tests are in
+`conversation.test.ts` and `tool-registry.test.ts`. The other two budgets are history elision (oldest
+tool *outputs* first, keeping command and exit code) and `max_new_tokens`. (PLAN §10.9.)
+
+### Tools: three sources, one way into the guest
+`web/src/agent/tool-registry.ts` merges the exec tool, the Go-generated built-in templates
+(`docs/schema/builtin-tools.json`), and user-defined templates. Whatever the source, a call compiles
+to a `protocol.Request` with `op` fixed to exec — **more tools must never mean more ways in**. The
+definition format is defined in Go (`internal/tool/template.go`) and its schema generated, with
+`web/src/agent/user-tools.ts` as the hand-written twin held to it by
+`tests/tool/template-cases.json`, run by both suites. Templates shell-quote by default
+(`{param:raw}` opts out): correctness while raw shell is exposed, and the thing that would make a
+template-only session safe. Exposure is opt-in — a definition is ~0.5–2.3 KB of prompt on every turn.
+
+### Dialects: verified means a transcript exists
+`Dialect.verified` is false for anything implemented from documentation. Only `lfm2` is verified;
+`hermes` and `llama` are marked unverified and say so in the UI. Promote a dialect by capturing a
+real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
@@ -284,7 +307,11 @@ wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.
   side (`tests/e2e/harness.ts` `walkFixture`), with the fixture's symlink registered as a virtual
   link. Playwright runs under bun (`bunx --bun playwright test`); install browsers with
   `bunx --bun playwright install chromium`. `test-e2e` is in CI (M5).
-- `tests/e2e/agent.spec.ts` (M8) drives `/agent/` from `playwright.agent.config.ts`, which is the
+- `tests/e2e/chat.spec.ts` (M9+) is the agent suite CI **can** run: a real VM driven by
+  `FakeModelClient` replaying `tests/agent/scripts.json`. Those scripts are raw model output, markers
+  and all, and deliberately include the failure modes a real model produces. Add a case there before
+  reaching for the GPU suite.
+- `tests/e2e/agent.spec.ts` drives `/agent/` from `playwright.agent.config.ts`, which is the
   only config carrying the WebGPU launch flags. It is skipped unless `SMOLBOX_WEBGPU=1`, and both
   other configs exclude it (the WASI config by `testIgnore`, the emscripten one by `testMatch`).
   It asserts the *mechanism* — a parseable call for the one tool that exists, reaching a real

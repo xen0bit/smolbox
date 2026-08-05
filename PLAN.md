@@ -6,9 +6,9 @@
 > M6 (emscripten `--to-js` target), and M7 (tool-API docs, JSON Schema, mock caller) complete.
 > **Every milestone in §6 is done.** Component 2 opened at §9: **M8, the WebGPU tool-call spike, is
 > also done** — a local model on WebGPU drives a real VM through the M7 tool surface end to end,
-> without a single change to that surface. **§10 designs what comes next** (M9 chat UI and the
-> multi-turn loop, M10 the model registry and dialects, M11 customizable tools) — design only, not
-> yet built.
+> without a single change to that surface. **§10 (M9 chat UI and the multi-turn loop, M10 the model
+> registry and dialects, M11 customizable tools) is now built and green too.** Every milestone in
+> this document is complete.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -1296,8 +1296,8 @@ this repo changes as part of this section.
 ## 10. Component 2, continued: chat, models, and tools (M9–M11)
 
 §9 proved the mechanism: a local model can drive the VM through the M7 tool surface. This section
-plans the product around it — a real chat interface, more than one model, and tools the user can
-shape. **Status: design only. No code in this repo changes as part of this section.**
+built the product around it — a real chat interface, more than one model, and tools the user can
+shape. **Status: M9, M10 and M11 are done** (measurements in §10.9).
 
 ### 10.1 What M8 established that this section is built on
 
@@ -1444,7 +1444,9 @@ changes what the rendered system prompt contains.
 |---|---|---|
 | M9 | Chat UI, multi-turn loop, the three budgets, `FakeModel` | A CI Playwright suite drives a full multi-turn conversation against `FakeModel` — tool call, feedback, budget, elision, stop — and one manual WebGPU run matches |
 | M10 | Curated model registry + per-family dialects | Two model families run the same conversation; dialect parsers unit-tested from captured fixtures in CI; unverified dialects warn |
-| M11 | Tool registry: built-ins, user templates, session overrides | A user-defined tool round-trips from UI to guest under `FakeModel` in CI; `op`-injection and quoting cases unit-tested; exposure toggles change the prompt |
+| M11 | Tool registry: built-ins, user templates, session overrides | A user-defined tool round-trips from UI to guest under `FakeModel` in CI; `op`-injection and quoting cases unit-tested; exposure toggles change the prompt — **done** |
+
+All three are **done**; M9 and M10's done-when conditions are met the same way (§10.9).
 
 ### 10.7 Open questions
 
@@ -1482,3 +1484,42 @@ changes what the rendered system prompt contains.
     scripted turns will not survive a real one. **Mitigation:** its scripts must include the failure
     modes M8 actually produced — a Pythonic call, an over-long output, a malformed block — and the
     manual WebGPU run stays part of each milestone's done-when.
+
+### 10.9 Measured at M9–M11 (2026-08-05, this machine)
+
+- **The chat loop is CI-testable, which was the whole design constraint.** `tests/e2e/chat.spec.ts`
+  drives **14 cases against a real VM with a scripted model** and runs in the ordinary browser suite —
+  no GPU, no opt-in. The browser suite went 16 → **30 cases**; unit tests went 108 → **230**. The
+  GPU-only suite stayed a single case, which is the right ratio: everything that *can* be tested
+  without a GPU now is.
+- **`FakeModelClient` earns its place by replaying real failure modes**, not idealised ones: the
+  Pythonic call LFM2 actually emits (filling in every optional argument), a malformed block, a
+  command whose output blows the budget, a model that never stops calling, a refused write. Two bugs
+  below were found by exactly those cases.
+- **The budget belongs to the request, not to the arguments — found by the e2e suite, not the unit
+  tests.** M9 applied its per-call cap by writing `max_output` into the model's argument object,
+  which worked fine for `run_terminal_command` (where it is a real argument) and broke *every*
+  template tool at M11, because a template declares its own parameters and rejects anything else.
+  The fix moves the cap onto the compiled request, where it was always conceptually. This is a good
+  argument for building the e2e path early: the unit tests on both sides were green and wrong.
+- **A scripted fake needs turn boundaries, not message text.** `FakeModelClient` keyed its queue on
+  the last user message, so sending the *same* prompt twice replayed an exhausted queue and silently
+  produced the fallback answer. It now keys on the user-message count. Asking the same question
+  twice is a legitimate thing for a test to do.
+- **Prompt cost, measured rather than assumed:** `run_terminal_command` renders **2301 characters**
+  of system prompt; the three built-in narrow tools render 500–800 bytes each. That is why exposure
+  is opt-in and why `TestBuiltinTemplatePromptCost` fails a builtin over 1200 bytes. Whether narrow
+  tools help a 1.2B model remains **unmeasured and open** (§10.7) — M11 shipped the mechanism and the
+  cost, not a recommendation.
+- **Generating the extension format needed nested structs in the reflector.** `objectSchema` had no
+  struct case, since the wire types never nested. The addition stays strict: a nested type must be
+  registered with hand-written descriptions rather than reflected blindly, so the rule that an
+  undocumented field is a build failure now holds one level down too.
+- **Two model families are wired, one is verified.** `lfm2` carries captured transcripts; `hermes`
+  (Qwen) and `llama` are implemented from published templates and are marked `unverified` in the
+  registry, surfaced in the UI when selected. The `llama` dialect deliberately refuses to treat
+  arbitrary JSON as a call — a model quoting `{"some": "config"}` at the user must not become a
+  command execution.
+- **The real model still works through all of it, unchanged:** `make test-e2e-agent` passes with the
+  same transcript as M8 (~9.5 s including load), now through the dialect registry, the multi-turn
+  loop and the tool registry. The budget is visible in the request it sends: `max_output: 4096`.
