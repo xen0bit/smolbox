@@ -12,8 +12,18 @@ import type { Dialect } from "./dialects/index.ts";
 import { type ParsedCall, ToolCallParseError } from "./parse.ts";
 
 export interface ToolRunner {
-  /** Executes one call and returns the text the model should see. */
-  run(call: ParsedCall): Promise<{ text: string; exitCode: number }>;
+  /**
+   * Executes one call and returns the text the model should see.
+   *
+   * The budget is passed rather than written into the call's arguments: a
+   * template tool declares its own parameters and rejects anything else, so an
+   * injected max_output would make every template call fail as an unknown
+   * argument. The runner applies it to the compiled request instead.
+   */
+  run(
+    call: ParsedCall,
+    opts: { maxOutput: number },
+  ): Promise<{ text: string; exitCode: number; request?: { cmd?: string; max_output?: number } }>;
 }
 
 export type AgentEvent =
@@ -21,7 +31,14 @@ export type AgentEvent =
   | { kind: "token"; text: string }
   | { kind: "assistant"; text: string; raw: string }
   | { kind: "tool-start"; call: ParsedCall }
-  | { kind: "tool-end"; call: ParsedCall; rendered: string; exitCode: number }
+  | {
+      kind: "tool-end";
+      call: ParsedCall;
+      rendered: string;
+      exitCode: number;
+      /** The request that actually ran, budget applied. */
+      request?: { cmd?: string; max_output?: number };
+    }
   | { kind: "elided"; messages: number; chars: number }
   | { kind: "stopped"; reason: "iteration-cap" | "cancelled" }
   | { kind: "error"; message: string };
@@ -150,9 +167,24 @@ export class Conversation {
             return;
           }
           this.emit({ kind: "tool-start", call });
-          const budgeted = this.applyCallBudget(call);
-          const out = await this.tools.run(budgeted);
-          this.emit({ kind: "tool-end", call: budgeted, rendered: out.text, exitCode: out.exitCode });
+          let out: Awaited<ReturnType<ToolRunner["run"]>>;
+          try {
+            out = await this.tools.run(call, { maxOutput: this.opts.perCallMaxOutput });
+          } catch (err) {
+            // A call the registry refuses — an unknown tool, a bad argument — is
+            // the model's mistake and correctable, exactly like a parse failure.
+            const message = err instanceof Error ? err.message : String(err);
+            this.emit({ kind: "error", message });
+            this.history.push({ role: "tool", content: `error: ${message}` });
+            continue;
+          }
+          this.emit({
+            kind: "tool-end",
+            call,
+            rendered: out.text,
+            exitCode: out.exitCode,
+            request: out.request,
+          });
           this.history.push({ role: "tool", content: out.text });
         }
       }
@@ -161,19 +193,6 @@ export class Conversation {
     } finally {
       this.running = false;
     }
-  }
-
-  // The protocol already has the knob and Render already reports `truncated`,
-  // so the budget is applied by setting max_output rather than by trimming the
-  // text afterwards — two truncation layers would show the model two different
-  // stories about the same command.
-  private applyCallBudget(call: ParsedCall): ParsedCall {
-    const requested = call.args.max_output;
-    const cap = this.opts.perCallMaxOutput;
-    if (typeof requested === "number" && requested > 0 && requested <= cap) {
-      return call;
-    }
-    return { ...call, args: { ...call.args, max_output: cap } };
   }
 
   // Oldest tool outputs go first, and only their bodies: the command and its

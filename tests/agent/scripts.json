@@ -4,7 +4,11 @@
     {
       "name": "plain answer, no tool",
       "when": "who are you",
-      "turns": [{ "text": "I am smolbox, an assistant with a Linux sandbox." }]
+      "turns": [
+        {
+          "text": "I am smolbox, an assistant with a Linux sandbox."
+        }
+      ]
     },
     {
       "name": "one tool call, pythonic, as LFM2 really emits it",
@@ -13,7 +17,9 @@
         {
           "text": "<|tool_call_start|>[run_terminal_command(cmd=\"ls -1 /mnt/host\", cwd=\"/mnt/host\", env={}, stdin=\"\", timeout_ms=0, max_output=0)]<|tool_call_end|>"
         },
-        { "text": "The folder contains hello.txt, link.txt and sub." }
+        {
+          "text": "The folder contains hello.txt, link.txt and sub."
+        }
       ]
     },
     {
@@ -23,7 +29,9 @@
         {
           "text": "<|tool_call_start|>[{\"name\": \"run_terminal_command\", \"arguments\": {\"cmd\": \"cat /mnt/host/hello.txt\"}}]<|tool_call_end|>"
         },
-        { "text": "The file says hello." }
+        {
+          "text": "The file says hello."
+        }
       ]
     },
     {
@@ -33,25 +41,39 @@
         {
           "text": "Let me check the folder first. <|tool_call_start|>[run_terminal_command(cmd=\"ls /mnt/host\")]<|tool_call_end|>"
         },
-        { "text": "Done looking." }
+        {
+          "text": "Done looking."
+        }
       ]
     },
     {
       "name": "two calls in sequence",
       "when": "two steps",
       "turns": [
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"pwd\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo second\")]<|tool_call_end|>" },
-        { "text": "Both steps ran." }
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"pwd\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo second\")]<|tool_call_end|>"
+        },
+        {
+          "text": "Both steps ran."
+        }
       ]
     },
     {
       "name": "malformed call, then recovery",
       "when": "malformed",
       "turns": [
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=)]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo recovered\")]<|tool_call_end|>" },
-        { "text": "I corrected the call." }
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=)]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo recovered\")]<|tool_call_end|>"
+        },
+        {
+          "text": "I corrected the call."
+        }
       ]
     },
     {
@@ -61,19 +83,33 @@
         {
           "text": "<|tool_call_start|>[run_terminal_command(cmd=\"head -c 200000 /dev/zero | tr '\\\\0' 'x'\")]<|tool_call_end|>"
         },
-        { "text": "That was a lot of output." }
+        {
+          "text": "That was a lot of output."
+        }
       ]
     },
     {
       "name": "never stops calling",
       "when": "loop forever",
       "turns": [
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 1\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 2\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 3\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 4\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 5\")]<|tool_call_end|>" },
-        { "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 6\")]<|tool_call_end|>" }
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 1\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 2\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 3\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 4\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 5\")]<|tool_call_end|>"
+        },
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo 6\")]<|tool_call_end|>"
+        }
       ]
     },
     {
@@ -93,7 +129,45 @@
         {
           "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo nope > /mnt/host/hello.txt\")]<|tool_call_end|>"
         },
-        { "text": "The mount is read-only, so that failed." }
+        {
+          "text": "The mount is read-only, so that failed."
+        }
+      ]
+    },
+    {
+      "name": "calls a user-defined tool",
+      "when": "user tool",
+      "turns": [
+        {
+          "text": "<|tool_call_start|>[find_in_folder(pattern=\"hello\")]<|tool_call_end|>"
+        },
+        {
+          "text": "Found it."
+        }
+      ]
+    },
+    {
+      "name": "calls a narrow builtin",
+      "when": "disabled tool",
+      "turns": [
+        {
+          "text": "<|tool_call_start|>[list_dir(path=\"/mnt/host\")]<|tool_call_end|>"
+        },
+        {
+          "text": "That is the listing."
+        }
+      ]
+    },
+    {
+      "name": "tries shell injection through a tool argument",
+      "when": "injection attempt",
+      "turns": [
+        {
+          "text": "<|tool_call_start|>[echo_it(value=\"hi; echo PWNED\")]<|tool_call_end|>"
+        },
+        {
+          "text": "Echoed."
+        }
       ]
     }
   ]

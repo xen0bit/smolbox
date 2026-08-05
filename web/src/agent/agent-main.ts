@@ -10,7 +10,7 @@ import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
 import { getOpfsDirectoryHandle, pickDirectoryHandle } from "../mount.ts";
-import { callTool, openaiTool, toolName } from "../tool.ts";
+import { toolName } from "../tool.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { dialectFor } from "./dialects/index.ts";
 import { DEFAULT_MODEL_KEY, type Dtype, modelFor, models, pickDtype } from "./models.ts";
@@ -18,6 +18,8 @@ import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
 import type { ParsedCall } from "./parse.ts";
+import { ToolRegistry } from "./tool-registry.ts";
+import type { TemplateTool } from "./user-tools.ts";
 
 let currentModelKey = DEFAULT_MODEL_KEY;
 
@@ -90,10 +92,31 @@ let modelClient: ModelClient = new WorkerModelClient(
   (file, pct) => setStatus(`loading ${file}: ${pct}%`),
 );
 
+const TOOLS_KEY = "smolbox.tools";
+const registry = new ToolRegistry();
+try {
+  const saved = localStorage.getItem(TOOLS_KEY);
+  if (saved) {
+    registry.load(JSON.parse(saved));
+  }
+} catch (err) {
+  console.warn("[smolagent] ignoring saved tools:", err);
+}
+
+function persistTools(): void {
+  try {
+    localStorage.setItem(TOOLS_KEY, JSON.stringify(registry.snapshot()));
+  } catch {
+    // Private-mode storage failures must not take the page down.
+  }
+  convo.configure({ tools: registry.definitions() });
+  renderToolList();
+}
+
 const runner: ToolRunner = {
-  run: async (call: ParsedCall) => {
-    const result = await callTool(session, call.args);
-    return { text: result.text, exitCode: result.response.exit_code };
+  run: async (call: ParsedCall, opts) => {
+    const out = await registry.run(session, call, { maxOutput: opts.maxOutput });
+    return { text: out.text, exitCode: out.response.exit_code, request: out.request };
   },
 };
 
@@ -103,7 +126,7 @@ let streaming: Element | null = null;
 const convo = new Conversation(
   {
     systemPrompt: SYSTEM_PROMPT,
-    tools: [openaiTool()],
+    tools: registry.definitions(),
     dialect: dialectFor(modelFor(DEFAULT_MODEL_KEY).dialect),
     ...DEFAULTS,
   },
@@ -152,7 +175,7 @@ function onEvent(ev: AgentEvent): void {
       if (body) {
         const cmd = document.createElement("span");
         cmd.className = "cmd";
-        cmd.textContent = `$ ${String(ev.call.args.cmd ?? "")}`;
+        cmd.textContent = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
         const out = document.createElement("span");
         out.textContent = ev.rendered;
         body.appendChild(cmd);
@@ -238,6 +261,10 @@ export interface SmolagentHandle {
   send(text: string): Promise<AgentEvent[]>;
   cancel(): void;
   configure(patch: Record<string, number>): void;
+  tools(): { name: string; source: string; enabled: boolean }[];
+  addTool(tool: TemplateTool): void;
+  enableTool(name: string, on: boolean): void;
+  setToolDefaults(d: { timeout_ms?: number; max_output?: number; cwd?: string }): void;
   options(): Record<string, unknown>;
   messages(): { role: string; content: string }[];
   reset(): void;
@@ -300,27 +327,25 @@ const handle: SmolagentHandle = {
     try {
       await convo.send(text);
     } finally {
-      // Populate the model dropdown from the registry, marking unverified dialects
-// so an odd answer reads as "we never checked this family" rather than a bug.
-const modelSelect = el("model");
-if (modelSelect) {
-  for (const m of models) {
-    const opt = document.createElement("option");
-    opt.value = m.key;
-    const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
-    opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
-    modelSelect.appendChild(opt);
-  }
-  modelSelect.value = currentModelKey;
-  modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
-}
-
-setBusy(false);
+      setBusy(false);
     }
     return events;
   },
   cancel: () => convo.cancel(),
   configure: (patch) => convo.configure(patch as never),
+  tools: () => registry.list().map((t) => ({ name: t.name, source: t.source, enabled: t.enabled })),
+  addTool: (tool: TemplateTool) => {
+    registry.addUserTool(tool);
+    persistTools();
+  },
+  enableTool: (name: string, on: boolean) => {
+    registry.setEnabled(name, on);
+    persistTools();
+  },
+  setToolDefaults: (d) => {
+    registry.setDefaults(d);
+    persistTools();
+  },
   options: () => convo.options() as unknown as Record<string, unknown>,
   messages: () => convo.messages(),
   reset: () => {
@@ -435,5 +460,108 @@ pickEl?.addEventListener("click", async () => {
     setStatus(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
+
+setBusy(false);
+
+// ------------------------------------------------------------------ tools UI
+
+const toolListEl = el("tool-list");
+const toolJsonEl = el("tool-json");
+const toolMsgEl = el("tool-msg");
+
+function toolMessage(text: string): void {
+  if (toolMsgEl) {
+    toolMsgEl.textContent = text;
+  }
+}
+
+function renderToolList(): void {
+  if (!toolListEl) {
+    return;
+  }
+  const rows: Element[] = [];
+  for (const t of registry.list()) {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+
+    const box = document.createElement("input");
+    box.setAttribute("type", "checkbox");
+    if (t.enabled) {
+      box.setAttribute("checked", "checked");
+    }
+    box.addEventListener("change", () => {
+      registry.setEnabled(t.name, !t.enabled);
+      persistTools();
+    });
+
+    const label = document.createElement("span");
+    label.textContent = t.name;
+
+    const src = document.createElement("span");
+    src.className = "src";
+    src.textContent = t.source === "exec" ? "built in · the exec surface" : t.source;
+
+    row.appendChild(box);
+    row.appendChild(label);
+    row.appendChild(src);
+
+    if (t.source === "user") {
+      const del = document.createElement("button");
+      del.textContent = "remove";
+      del.addEventListener("click", () => {
+        registry.removeUserTool(t.name);
+        persistTools();
+      });
+      row.appendChild(del);
+    }
+    rows.push(row);
+  }
+  toolListEl.replaceChildren(...rows);
+}
+
+el("tool-add")?.addEventListener("click", () => {
+  try {
+    const parsed = JSON.parse(toolJsonEl?.value ?? "") as TemplateTool;
+    registry.addUserTool(parsed);
+    persistTools();
+    toolMessage(`added ${parsed.name}`);
+  } catch (err) {
+    toolMessage(err instanceof Error ? err.message : String(err));
+  }
+});
+
+el("tool-export")?.addEventListener("click", () => {
+  if (toolJsonEl) {
+    toolJsonEl.value = JSON.stringify(registry.snapshot(), null, 2);
+  }
+  toolMessage("exported the whole tool state into the box");
+});
+
+el("tool-import")?.addEventListener("click", () => {
+  try {
+    registry.load(JSON.parse(toolJsonEl?.value ?? ""));
+    persistTools();
+    toolMessage("imported");
+  } catch (err) {
+    toolMessage(err instanceof Error ? err.message : String(err));
+  }
+});
+
+renderToolList();
+
+// Populate the model dropdown from the registry, marking unverified dialects
+// so an odd answer reads as "we never checked this family" rather than a bug.
+const modelSelect = el("model");
+if (modelSelect) {
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.key;
+    const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
+    opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
+    modelSelect.appendChild(opt);
+  }
+  modelSelect.value = currentModelKey;
+  modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
+}
 
 setBusy(false);

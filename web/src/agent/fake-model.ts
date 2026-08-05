@@ -32,7 +32,10 @@ const FALLBACK: FakeTurn = { text: "I do not have a scripted answer for that." }
 
 export class FakeModelClient implements ModelClient {
   private queue: FakeTurn[] = [];
-  private lastUser = "";
+  // A new turn is detected by the user-message COUNT, not by the text: asking
+  // the same question twice is a legitimate thing for a test to do, and keying
+  // on the text would leave the second one replaying an exhausted queue.
+  private lastUserCount = -1;
   private cancelled = false;
 
   constructor(private readonly scripts: FakeScript[]) {}
@@ -45,9 +48,10 @@ export class FakeModelClient implements ModelClient {
     const started = Date.now();
     this.cancelled = false;
 
-    const user = [...req.messages].reverse().find((m) => m.role === "user")?.content ?? "";
-    if (user !== this.lastUser) {
-      this.lastUser = user;
+    const userMessages = req.messages.filter((m) => m.role === "user");
+    const user = userMessages.at(-1)?.content ?? "";
+    if (userMessages.length !== this.lastUserCount) {
+      this.lastUserCount = userMessages.length;
       this.queue = [...(this.pick(user)?.turns ?? [FALLBACK])];
     }
     const turn = this.queue.shift() ?? FALLBACK;

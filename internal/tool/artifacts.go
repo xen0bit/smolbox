@@ -21,6 +21,13 @@ func Artifacts() (map[string][]byte, error) {
 		SchemaDir + "/caps.schema.json":                    CapsSchema,
 		SchemaDir + "/run_terminal_command.anthropic.json": RunTerminalCommand.Anthropic(),
 		SchemaDir + "/run_terminal_command.openai.json":    RunTerminalCommand.OpenAI(),
+		// The extension mechanism is generated too: the format a user-defined
+		// tool must satisfy, and the narrow tools shipped with smolbox. The
+		// browser validates against these rather than against a hand-copied
+		// shape, so "one definition, two runtimes" holds for tools a user
+		// invents, not only for the wire.
+		SchemaDir + "/template-tool.schema.json": TemplateToolSchema,
+		SchemaDir + "/builtin-tools.json":        BuiltinTemplates,
 	}
 	out := make(map[string][]byte, len(files))
 	for path, v := range files {

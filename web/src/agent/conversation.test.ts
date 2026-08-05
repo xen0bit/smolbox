@@ -10,10 +10,20 @@ const call = (cmd: string) => `<|tool_call_start|>[run_terminal_command(cmd="${c
 function build(scripts: FakeScript[], patch: Partial<Parameters<Conversation["configure"]>[0]> = {}) {
   const events: AgentEvent[] = [];
   const ran: ParsedCall[] = [];
+  const budgets: number[] = [];
   const runner: ToolRunner = {
-    run: async (c) => {
+    run: async (c, opts) => {
       ran.push(c);
-      return { text: `exit_code: 0\n\n<stdout>\nran ${String(c.args.cmd)}\n</stdout>\n`, exitCode: 0 };
+      budgets.push(opts.maxOutput);
+      // The budget lands on the request, as the registry does it for real.
+      const max = typeof c.args.max_output === "number" && c.args.max_output > 0
+        ? Math.min(c.args.max_output, opts.maxOutput)
+        : opts.maxOutput;
+      return {
+        text: `exit_code: 0\n\n<stdout>\nran ${String(c.args.cmd)}\n</stdout>\n`,
+        exitCode: 0,
+        request: { cmd: String(c.args.cmd ?? ""), max_output: max },
+      };
     },
   };
   const convo = new Conversation(
@@ -22,7 +32,7 @@ function build(scripts: FakeScript[], patch: Partial<Parameters<Conversation["co
     runner,
     (e) => events.push(e),
   );
-  return { convo, events, ran };
+  return { convo, events, ran, budgets };
 }
 
 const kinds = (events: AgentEvent[]) => events.map((e) => e.kind);
@@ -77,16 +87,29 @@ describe("Conversation", () => {
     expect(events.at(-1)).toEqual({ kind: "stopped", reason: "iteration-cap" });
   });
 
-  test("max_output is capped on every call", async () => {
-    const { convo, ran } = build([{ name: "x", turns: [{ text: call("cat big") }, { text: "ok" }] }], {
-      perCallMaxOutput: 1234,
-    });
+  test("the budget is handed to the runner on every call", async () => {
+    const { convo, budgets, events } = build(
+      [{ name: "x", turns: [{ text: call("cat big") }, { text: "ok" }] }],
+      { perCallMaxOutput: 1234 },
+    );
     await convo.send("go");
-    expect(ran[0]!.args.max_output).toBe(1234);
+    expect(budgets).toEqual([1234]);
+    expect(events.find((e) => e.kind === "tool-end")).toMatchObject({ request: { max_output: 1234 } });
   });
 
-  test("a smaller max_output the model chose itself is respected", async () => {
-    const { convo, ran } = build([
+  // The budget must not be written into the model's arguments: a template tool
+  // declares its own parameters and rejects anything else, so an injected
+  // max_output would make every template call fail as an unknown argument.
+  test("the budget never appears in the call's arguments", async () => {
+    const { convo, ran } = build([{ name: "x", turns: [{ text: call("ls") }, { text: "ok" }] }], {
+      perCallMaxOutput: 4096,
+    });
+    await convo.send("go");
+    expect("max_output" in ran[0]!.args).toBe(false);
+  });
+
+  test("a smaller max_output the model chose itself is preserved", async () => {
+    const { convo, ran, events } = build([
       {
         name: "x",
         turns: [
@@ -97,10 +120,11 @@ describe("Conversation", () => {
     ]);
     await convo.send("go");
     expect(ran[0]!.args.max_output).toBe(64);
+    expect(events.find((e) => e.kind === "tool-end")).toMatchObject({ request: { max_output: 64 } });
   });
 
   test("an oversized max_output is pulled back to the cap", async () => {
-    const { convo, ran } = build(
+    const { convo, events } = build(
       [
         {
           name: "x",
@@ -113,7 +137,22 @@ describe("Conversation", () => {
       { perCallMaxOutput: 4096 },
     );
     await convo.send("go");
-    expect(ran[0]!.args.max_output).toBe(4096);
+    expect(events.find((e) => e.kind === "tool-end")).toMatchObject({ request: { max_output: 4096 } });
+  });
+
+  test("a runner error is reported to the model rather than thrown", async () => {
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS },
+      new FakeModelClient([
+        { name: "bad", turns: [{ text: call("x") }, { text: "sorry" }] },
+      ]),
+      { run: async () => { throw new Error('no tool named "x" is available'); } },
+      (e) => events.push(e),
+    );
+    await convo.send("go");
+    expect(events.some((e) => e.kind === "error" && /no tool named/.test(e.message))).toBe(true);
+    expect(events.some((e) => e.kind === "assistant")).toBe(true);
   });
 
   test("a malformed tool call is reported back to the model rather than thrown", async () => {

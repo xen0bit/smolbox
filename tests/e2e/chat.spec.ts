@@ -25,6 +25,7 @@ interface AgentEvent {
   exitCode?: number;
   messages?: number;
   call?: { name: string; args: Record<string, unknown> };
+  request?: { cmd?: string; max_output?: number };
 }
 
 type AgentGlobal = {
@@ -33,6 +34,9 @@ type AgentGlobal = {
     loadModel(local?: boolean): Promise<{ source: string }>;
     bootVm(timeoutMs?: number): Promise<{ version: string }>;
     send(text: string): Promise<AgentEvent[]>;
+    tools(): { name: string; source: string; enabled: boolean }[];
+    addTool(tool: unknown): void;
+    enableTool(name: string, on: boolean): void;
     cancel(): void;
     configure(patch: Record<string, number>): void;
     messages(): { role: string; content: string }[];
@@ -132,9 +136,10 @@ test.describe("agent chat loop", () => {
     const events = await send(page, "big output");
     const toolEnd = events.find((e) => e.kind === "tool-end")!;
 
-    // The cap is applied by setting Request.max_output, so the guest truncates
-    // and Render says so — one truncation, one story.
-    expect(toolEnd.call!.args.max_output).toBe(4096);
+    // The cap is applied to the request (never to the model's arguments, which a
+    // template tool would reject), so the guest truncates and Render says so —
+    // one truncation, one story.
+    expect(toolEnd.request!.max_output).toBe(4096);
     expect(toolEnd.rendered).toContain("output truncated");
     expect(toolEnd.rendered!.length).toBeLessThan(20_000);
   });
@@ -161,6 +166,64 @@ test.describe("agent chat loop", () => {
     const toolEnd = events.find((e) => e.kind === "tool-end")!;
     expect(toolEnd.exitCode).not.toBe(0);
     expect(toolEnd.rendered).toContain("can't create");
+  });
+
+  // M11: a tool the user invented, executed against the real guest. The model
+  // is scripted, but everything from the call onward is the real path:
+  // template compilation, shell quoting, the exec request, the guest.
+  test("a user-defined tool compiles, runs against the guest, and returns real output", async ({ page }) => {
+    await page.evaluate(() => {
+      const api = (globalThis as AgentGlobal).__smolagent!;
+      api.addTool({
+        name: "find_in_folder",
+        description: "Find a pattern in the mounted folder.",
+        params: [{ name: "pattern", type: "string", description: "what to look for", required: true }],
+        template: "grep -rn -- {pattern} /mnt/host",
+      });
+    });
+
+    const tools = await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.tools());
+    expect(tools.find((t) => t.name === "find_in_folder")).toMatchObject({ source: "user", enabled: true });
+
+    const events = await send(page, "user tool");
+    const toolEnd = events.find((e) => e.kind === "tool-end")!;
+    expect(toolEnd.call!.name).toBe("find_in_folder");
+    expect(toolEnd.exitCode).toBe(0);
+    // hello.txt in testdata/mount contains "hello", found by the real grep.
+    expect(toolEnd.rendered).toContain("hello.txt");
+  });
+
+  test("narrow tools are off until enabled, and the model cannot call one that is not", async ({ page }) => {
+    const before = await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.tools());
+    expect(before.find((t) => t.name === "list_dir")).toMatchObject({ source: "builtin", enabled: false });
+
+    // Calling a disabled tool comes back as a correctable error, not a crash.
+    const events = await send(page, "disabled tool");
+    expect(events.some((e) => e.kind === "error")).toBe(true);
+
+    await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.enableTool("list_dir", true));
+    const after = await send(page, "disabled tool");
+    const toolEnd = after.find((e) => e.kind === "tool-end")!;
+    expect(toolEnd.call!.name).toBe("list_dir");
+    expect(toolEnd.exitCode).toBe(0);
+    expect(toolEnd.rendered).toContain("hello.txt");
+  });
+
+  test("shell metacharacters in a tool argument are inert", async ({ page }) => {
+    await page.evaluate(() => {
+      (globalThis as AgentGlobal).__smolagent!.addTool({
+        name: "echo_it",
+        description: "Echo a value.",
+        params: [{ name: "value", type: "string", description: "what to echo", required: true }],
+        template: "echo {value}",
+      });
+    });
+
+    const events = await send(page, "injection attempt");
+    const toolEnd = events.find((e) => e.kind === "tool-end")!;
+    // The metacharacters came back as text; the second command never ran.
+    expect(toolEnd.rendered).toContain("hi; echo PWNED");
+    expect(toolEnd.rendered!.match(/PWNED/g)).toHaveLength(1);
   });
 
   test("the transcript renders into the page, not just the hook", async ({ page }) => {

@@ -130,6 +130,58 @@
         width: 6rem;
         padding: 0.15rem 0.35rem;
       }
+      #tools-panel {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.5rem 0.75rem;
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+      }
+      #tools-panel summary {
+        cursor: pointer;
+        font-weight: bold;
+      }
+      #tools-panel .hint {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      #tools-panel .block {
+        display: block;
+        margin: 0.5rem 0;
+        color: var(--muted);
+      }
+      #tools-panel textarea {
+        display: block;
+        width: 100%;
+        font: inherit;
+        font-size: 0.8rem;
+        margin-top: 0.25rem;
+        padding: 0.4rem;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--fg);
+      }
+      #tools-panel .row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .tool-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: baseline;
+        padding: 0.2rem 0;
+      }
+      .tool-row .src {
+        color: var(--muted);
+        font-size: 0.75rem;
+      }
+      #tool-msg {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
       @media (prefers-color-scheme: dark) {
         :root {
           --fg: #e6edf3;
@@ -166,6 +218,30 @@
       <button id="send" type="submit">send</button>
       <button id="stop" type="button" disabled>stop</button>
     </form>
+
+    <details id="tools-panel">
+      <summary>tools</summary>
+      <p class="hint">
+        Each tool you expose is prompt text the model re-reads every turn —
+        <code>run_terminal_command</code> alone is ~2.3&nbsp;KB — so narrow tools
+        are off by default. Whether they help a small model is an open question.
+      </p>
+      <div id="tool-list"></div>
+      <label class="block">custom tool (JSON)
+        <textarea id="tool-json" rows="7" spellcheck="false" placeholder='{
+  "name": "find_todo",
+  "description": "Find TODO comments in the folder.",
+  "params": [{"name": "path", "type": "string", "description": "Where to look", "default": "/mnt/host"}],
+  "template": "grep -rn TODO {path}"
+}'></textarea>
+      </label>
+      <div class="row">
+        <button id="tool-add" type="button">add / replace</button>
+        <button id="tool-export" type="button">export</button>
+        <button id="tool-import" type="button">import from box</button>
+        <span id="tool-msg"></span>
+      </div>
+    </details>
 
     <div id="settings">
       <label>max tool calls <input id="opt-iterations" type="number" min="1" max="20" /></label>

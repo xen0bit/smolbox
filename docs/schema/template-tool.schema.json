@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "smolbox template tool definition",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Function-calling name. Lowercase letters, digits and underscores; must not be `run_terminal_command`."
+    },
+    "description": {
+      "type": "string",
+      "description": "What the tool does, in the words the model will read. This is prompt text on every turn, so keep it to a sentence or two."
+    },
+    "params": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "The typed inputs the model fills in.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Parameter name, as the model will pass it."
+          },
+          "type": {
+            "type": "string",
+            "description": "One of string, integer, number, boolean."
+          },
+          "description": {
+            "type": "string",
+            "description": "What the model should put here."
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Whether the model must supply a value."
+          },
+          "default": {
+            "type": "string",
+            "description": "Value used when the model omits an optional parameter."
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "description"
+        ]
+      }
+    },
+    "template": {
+      "type": "string",
+      "description": "A shell command with {param} placeholders. Interpolations are shell-quoted; use {param:raw} to insert a value literally."
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "description": "Kill the command after this many milliseconds. 0 means no timeout."
+    },
+    "max_output": {
+      "type": "integer",
+      "description": "Cap stdout and stderr at this many bytes each. 0 uses the session default."
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "params",
+    "template"
+  ]
+}

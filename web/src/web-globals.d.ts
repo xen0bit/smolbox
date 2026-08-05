@@ -43,6 +43,11 @@ interface KeyboardEventLike {
 
 declare const location: { search: string };
 
+declare const localStorage: {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+};
+
 // File System Access API: the browser globals our mount providers use, typed
 // against the structural handles in fsbridge/main-host.ts so no DOM lib is
 // pulled in. bun-types declares a minimal Navigator; merge `storage` into it.
