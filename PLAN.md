@@ -4,8 +4,9 @@
 > mount under wazero + shared conformance table), M4 (browser worker + stdio router + TS session,
 > with the preopen spike), M5 (sync FS bridge + browser mount + browser conformance driver), and
 > M6 (emscripten `--to-js` target), and M7 (tool-API docs, JSON Schema, mock caller) complete.
-> **Every milestone in §6 is done**; what remains is component 2, the WebGPU model, which is out of
-> scope for this plan and now has a specified, tested surface to drop into.
+> **Every milestone in §6 is done.** Component 2 opened at §9: **M8, the WebGPU tool-call spike, is
+> also done** — a local model on WebGPU drives a real VM through the M7 tool surface end to end,
+> without a single change to that surface. What remains is M9+ (multi-turn, chat UI), still undesigned.
 > This document is the working plan **and** the research notebook. Every external claim below
 > carries a link to where it was verified, so later sessions do not have to re-derive it.
 
@@ -216,6 +217,54 @@ runner at M4 — revisit whether `bunx playwright` suffices, else pin a modern N
   `"stdout": null` and not `""` (§2.11.22), and the TS `Request.stdin` contract inverts the wire's
   (§2.11.23). The first is now in the generated schema as `["string", "null"]`; the second would
   have double-encoded every tool call carrying stdin.
+
+### Measured at M8 (2026-08-05, this machine)
+
+- **The spike passes end to end: one prompt, one real tool call, one grounded answer, in 3.6 s**
+  (`make test-e2e-agent`, 9.5 s including page load and VM boot). The transcript, verbatim:
+  the model emitted `run_terminal_command(cmd="ls /mnt/host", cwd="/mnt/host", env={}, stdin="",
+  timeout_ms=0, max_output=0)`, the call went through `callTool` into a live `Session`, the guest
+  listed the OPFS-backed mount (`hello.txt`, `link.txt`, `sub`), and the model read that result and
+  answered *"The files found in /mnt/host are hello.txt, link.txt, and sub."* Component 2 is a
+  consumer of the M7 surface exactly as designed — **no file under `internal/tool` or `web/src/tool.ts`
+  changed to make this work.**
+- **Model load is far cheaper than expected: ~4.2 s** for 1.22 GB of q4 weights from `dist/models`
+  onto the GPU, and **~2.1 s per generation** (46 tokens). The 1.2 GB download is a one-off
+  (`make model`), not a per-run cost.
+- **The chat template does the tool wrapping for us — §9.1.4's open question resolved, favourably.**
+  `apply_chat_template(messages, { tools })` renders `<|tool_list_start|>[…]<|tool_list_end|>` itself
+  and serialises whatever tool objects it is handed **verbatim**, so `web/src/tool.ts`'s
+  `openaiTool()` — the anti-drift-guarded, generated schema — reaches the model untouched. No
+  hand-rolled special tokens. The `tool` role is wrapped in `<|tool_response_start|>` by the same
+  template, so `renderResult`'s M7 output feeds straight back in.
+- **The model emits Pythonic tool calls, not JSON, and no prompt wording changed that** — the one
+  decision in §9.2 that did not survive contact. Five system prompts were tried against a loaded
+  model, including the exact "Output function calls as JSON" line from Liquid's own docs (§9.1.3),
+  leading, trailing, on its own line, and with a worked JSON example. **Four produced correct
+  Pythonic calls; the fifth produced JSON only because dropping the sandbox context made the model
+  hallucinate a fake directory listing instead of calling anything** — a false positive, not a win.
+  The calls themselves were consistently *right* (`cmd="ls /mnt/host"` every time), so the fix is to
+  parse the syntax the model actually speaks rather than keep bargaining with the prompt.
+  `web/src/agent/parse.ts` now reads both syntaxes; JSON stays supported because it costs nothing.
+- **`stdin=None` is why the Pythonic reader drops None-valued arguments.** The model fills in every
+  optional parameter rather than omitting it, and Python `None` means "not provided". Passing it
+  through as `null` would hit `decodeArgs`' type check ("stdin must be a string") and fail a call
+  that was actually well-formed.
+- **The agent spike cannot run in CI, and that is structural** (§2.11.25). Headless Chromium needs
+  `--use-angle=vulkan --enable-features=Vulkan` for a real adapter, and
+  `--enable-unsafe-swiftshader` provides **no** software fallback — `requestAdapter()` simply returns
+  null. A GPU-less runner has no path to WebGPU at any speed. `make test-e2e-agent` is therefore
+  opt-in (`SMOLBOX_WEBGPU=1`) and deliberately absent from CI; the parser it depends on is covered by
+  28 GPU-free unit tests that do run there (`make test-web`, **136 total**, was 108).
+- **Toolchain drift since M1** (this machine, verified 2026-08-05): **go1.26.5** (go.mod still pins
+  `go 1.24.3` and builds clean; the wazero v1.11.0 pin's rationale — v1.12+ needs go ≥ 1.25 — no
+  longer binds locally, though CI's pin still decides), **bun 1.3.14** (was 1.2.18), Docker 29.7.1,
+  golangci-lint 2.12.2. All five suites re-verified green on a fresh install: `lint`, `test`,
+  `test-web` (136), `test-e2e` (16/16), `test-e2e-js` (10/10 in 1.5 min, against PLAN's 2.0 min).
+- **`transformers.js` is at 4.2.0, not the v3 §9.1.2 assumed.** Its browser export resolves to
+  `dist/transformers.web.js` under `bun build --target=browser`; the `onnxruntime-node` and `sharp`
+  dependencies are node-only and bun blocks their postinstalls, so the browser bundle is unaffected
+  (`model-worker.js` bundles to 0.99 MB).
 
 ---
 
@@ -563,6 +612,50 @@ boot-time or artifact-size table exists. **M1 must measure and record real numbe
     call carrying stdin. The mock caller's stdin step is what pins the Go side of this, and
     `tool.test.ts` asserts the decoded bytes on the TS side.
 
+24. **WebGPU needs a secure context, real launch flags, and has no software fallback** (M8). Three
+    things that each look like "WebGPU is broken" and are not:
+    (a) `navigator.gpu` is **undefined** on `data:` and `about:blank` URLs — it is gated on a secure
+    context, so any probe must run against `http://localhost` or https;
+    (b) in headless Chromium `requestAdapter()` returns **null** with default flags — the minimum
+    that yields a real adapter is `--use-angle=vulkan --enable-features=Vulkan` (measured:
+    `{vendor: "nvidia", architecture: "lovelace"}`);
+    (c) **`--enable-unsafe-swiftshader` does not help** — it yields no adapter either, so there is no
+    GPU-less path. That is why `make test-e2e-agent` is opt-in and not in CI.
+    Also absent from this adapter's feature list: **`shader-f16`**. That rules out the `q4f16`
+    checkpoint (868 MB, against q4's 1.22 GB) for any run that has to work headless.
+25. **onnxruntime-web picks its wasm build at runtime, and a missing variant fails as "no available
+    backend found".** transformers.js defaults `ONNX_ENV.wasm.wasmPaths` to a jsdelivr URL
+    (`transformers.web.js:7788`); pointing it at a local `/ort/` directory is right for offline use
+    and version pinning, **but copying only the variant you expect is not.** This version asks for
+    `ort-wasm-simd-threaded.asyncify.mjs` on the WebGPU path, not the `.jsep` build the file names
+    suggest, and the failure surfaces as an opaque backend error rather than a 404 for the file.
+    `make web` copies **every** `ort-wasm-simd-threaded.*` variant for this reason. (Note the CDN
+    default would not itself have been blocked by COEP: jsdelivr sends
+    `cross-origin-resource-policy: cross-origin` and `access-control-allow-origin: *`. Vendoring is
+    about offline and pinning, not isolation.)
+26. **Cache Storage cannot hold a 1.2 GB model file.** transformers.js caches downloaded weights in
+    the Cache API by default; a `put` of the q4 `.onnx_data` fails with
+    `UnknownError: Failed to execute 'put' on 'Cache': Unexpected internal error`. It is noisy but
+    survivable — except it fires on every load. `env.useBrowserCache = false` when serving from
+    `dist/models`, where the browser cache buys nothing anyway (the file is already local).
+27. **c2w's output is root-owned, and `docker run --user` is the wrong fix.** The converter runs as
+    root in the container, so `dist/smolbox.wasm` and `dist/js/` land root-owned and the *next*
+    `mkdir dist/js` fails with EPERM for whoever ran make — a confusing failure that has nothing to
+    do with the build. The obvious fix breaks it: with `--user $(id -u):$(id -g)` there is no passwd
+    entry for the uid, so `$HOME` is `/` and buildx dies on `ERROR: mkdir /.docker: permission
+    denied` before conversion starts. (`--group-add` off `getent group docker` is separately unsafe:
+    the group is not named `docker` everywhere, and an empty expansion swallows the next argument.)
+    The Makefile therefore leaves the conversion byte-for-byte as it was — the path CI exercises —
+    and hands ownership back afterwards with a one-shot root container (`RECLAIM_DIST`).
+28. **bun block-buffers stdout to a pipe, which makes a long download look like a hang.** `make model`
+    piped into a log file showed nothing for minutes while it was working normally; the progress
+    lines were sitting in a 4 KB buffer and were lost entirely when the process was killed. Anything
+    that reports progress over a multi-minute operation must write to **stderr** (unbuffered) or
+    flush explicitly — `web/fetch-model.ts` uses stderr. Related: HF does not return a usable
+    `content-length` on a HEAD through bun's fetch (it negotiates a compressed transfer), so the
+    size check uses HF's own `x-linked-size` header, which it exposes via
+    `access-control-expose-headers` for exactly this.
+
 ---
 
 ## 3. Repository layout
@@ -585,10 +678,17 @@ internal/tool/                # M7: the model-facing tool surface over the exec 
   tool.go                     #   definition, dialect adapters, DecodeArgs, Call, Render
   artifacts.go                #   the generated file set, shared by the generator and its test
 web/
-  serve.ts                    # dev server: Bun.serve with COOP/COEP headers
+  serve.ts                    # dev server: Bun.serve with COOP/COEP headers; /models/ -> dist/models
+  fetch-model.ts              # M8: pulls the pinned checkpoint into dist/models (`make model`)
   index.html                  # minimal page: boot/run UI + crossOriginIsolated check
   js.html                     # M6: the same UI for the emscripten build, served at /js/
+  agent.html                  # M8: the WebGPU agent spike, served at /agent/
   src/
+    agent/                    # M8: the model side (no GPU-free logic below this line)
+      messages.ts             #   page <-> model-worker message contract
+      model-worker.ts         #   transformers.js on WebGPU, its own dedicated worker
+      parse.ts                #   tool-call parser: Pythonic AND JSON (28 unit tests)
+      agent-main.ts           #   page entry: VM + model + the transcript; window.__smolagent
     emscripten/               # M6: the --to-js page (no worker, no fsbridge)
       js-main.ts              #   page entry: Module wiring + window.__smolbox
       protocol-pty.ts         #   Module['pty'] over the shared StdinChannel
@@ -612,6 +712,7 @@ tests/
   e2e/                        # Playwright: boot + echo hello + OPFS mount + conformance drivers
     conformance.spec.ts       #   M5: the WASI page, all 14 cases
     emscripten.spec.ts        #   M6: the /js/ page, the 8 non-mount cases
+    agent.spec.ts             #   M8: the agent spike; opt-in (SMOLBOX_WEBGPU=1), needs a GPU
 testdata/mount/               # fixture directory used as the mounted folder
 docs/tool-api.md              # M7: the tool-call surface, hand-written spec
 docs/schema/                  # M7: GENERATED from the Go types — never hand-edit
@@ -908,6 +1009,8 @@ the text a model would read is stable enough to assert.
 | `wasm` | deps `vm-image builder-image` → `dist/smolbox.wasm` (WASI, primary) |
 | `wasm-js` | same via `c2w --to-js` → `dist/js/` (emscripten, **no host mount**) |
 | `test-e2e-js` | Playwright against the `/js/` page: boot smoke + the non-mount conformance cases |
+| `model` | `bun web/fetch-model.ts` → pulls the pinned q4 checkpoint (1.22 GB) into `dist/models` |
+| `test-e2e-agent` | Playwright against `/agent/`: the M8 spike. Opt-in, needs a GPU and `make model`; **not in CI** |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
 | `web` | bundle `web/src/{worker,main}.ts` + copy `index.html` and `dist/smolbox.wasm` → `web/dist` |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` |
@@ -1065,19 +1168,24 @@ research-before-code spirit as §2: verify what the named model and library actu
 anything against them. **Status: design only — M8 below is scoped but not implemented.** No code in
 this repo changes as part of this section.
 
-### 9.1 Research notes (verified 2026-08-05)
+### 9.1 Research notes (verified 2026-08-05; items 1-4 re-verified against a running model at M8)
 
 1. **Model: `onnx-community/LFM2-1.2B-Tool-ONNX`.** Liquid AI publishes a checkpoint,
    `LiquidAI/LFM2-1.2B-Tool`, fine-tuned specifically for tool use, and `onnx-community` mirrors it
-   pre-converted for `transformers.js`. It ships several quantizations: `model.onnx` (fp32),
-   `model_fp16.onnx`, `model_q4.onnx` (q4 weights, quantized embedding — documented as the
-   WebGPU-appropriate variant), `model_q4f32.onnx` (q4 weights, fp32 embedding, for servers), and
-   `model_q8.onnx`. This is a better fit than the plain `LFM2-1.2B-ONNX` the README names, since
-   tool-calling accuracy is the entire point of component 2.
+   pre-converted for `transformers.js`. This is a better fit than the plain `LFM2-1.2B-ONNX` the
+   README names, since tool-calling accuracy is the entire point of component 2.
+   **Corrected at M8** (the variant list above was wrong; these are the actual files, and the
+   weights live in external `.onnx_data` blobs rather than in the `.onnx` graph): `model.onnx`
+   (fp32, ~4.7 GB over three data files), `model_fp16.onnx` (~2.36 GB), `model_q4.onnx`
+   (**1.22 GB — what smolbox uses**), `model_q4f16.onnx` (868 MB, needs `shader-f16`, which headless
+   Chromium does not expose, §2.11.24), and `model_quantized.onnx` (q8, 1.2 GB). There is no
+   `model_q4f32`.
    (<https://huggingface.co/onnx-community/LFM2-1.2B-Tool-ONNX> ·
    <https://huggingface.co/LiquidAI/LFM2-1.2B-Tool>)
-2. **Runtime library: `@huggingface/transformers` (transformers.js v3+).** Installable with
-   `npm i @huggingface/transformers`, which works under bun like the rest of `web/`. WebGPU is enabled
+2. **Runtime library: `@huggingface/transformers` (transformers.js v3+; **4.2.0 at M8**).**
+   Installable with `bun add @huggingface/transformers`, which works under bun like the rest of
+   `web/`; its `onnxruntime-node` and `sharp` dependencies are node-only and bun blocks their
+   postinstalls, so the browser bundle is unaffected. WebGPU is enabled
    by passing `device: 'webgpu'` (and here, `dtype: 'q4'`) to `pipeline(...)` or a raw
    `AutoModelForCausalLM.from_pretrained(...)` call — a collaboration with ONNX Runtime Web. The actual
    `LiquidAI/LFM2-WebGPU` Space named in README.md is itself built on transformers.js, so the library
@@ -1087,22 +1195,28 @@ this repo changes as part of this section.
    <https://huggingface.co/spaces/LiquidAI/LFM2-WebGPU>)
 3. **The tool-call wire format is model-native, not OpenAI/Anthropic JSON.** LFM2 wraps tool
    definitions in `<|tool_list_start|>...<|tool_list_end|>` and, by default, emits **Pythonic** calls
-   (`[fn_name(arg="value")]`) between `<|tool_call_start|>...<|tool_call_end|>`. Adding "Output function
-   calls as JSON" to the system prompt switches it to JSON call syntax — the form worth targeting, since
-   it lets the agent reuse the JSON shape `internal/tool` already generates (`docs/schema/*.json`)
-   instead of writing a Pythonic-call parser. Tool results are fed back as a `"tool"`-role message
+   (`[fn_name(arg="value")]`) between `<|tool_call_start|>...<|tool_call_end|>`. The docs say adding
+   "Output function calls as JSON" to the system prompt switches it to JSON call syntax.
+   **Measured at M8: it does not, for this checkpoint.** Five wordings of that instruction all
+   produced Pythonic calls — with correct arguments — so smolbox parses both syntaxes
+   (`web/src/agent/parse.ts`) rather than relying on a prompt switch this conversion does not
+   honour. Treat the documented switch as unverified for any future checkpoint. Tool results are fed back as a `"tool"`-role message
    containing the JSON-serialized result, wrapped `<|tool_response_start|>...<|tool_response_end|>`.
    (<https://docs.liquid.ai/lfm/key-concepts/tool-use>)
-4. **The chat template probably renders the tool wrapping for us — needs a spike, not a guess.**
+4. **The chat template renders the tool wrapping for us — confirmed at M8.**
    transformers.js applies the model's own Jinja chat template (via `@huggingface/jinja`), and other
    transformers.js tool-calling examples pass a `tools` array straight into
    `apply_chat_template(...)` rather than hand-formatting special tokens. Because
-   `LFM2-1.2B-Tool`'s `tokenizer_config.json` chat template already encodes the `<|tool_list_start|>`
-   wrapping, M8 should try passing the existing generated tool schema through `tools` first, and only
-   hand-roll the prompt if that doesn't hold up in practice.
-5. **Model weights are not part of `dist/`.** Unlike `smolbox.wasm` (built and embedded), the ONNX
-   checkpoint is fetched from the HF CDN at runtime and cached by transformers.js in the browser's
-   Cache Storage API. First load needs network access from the *page* — the sandbox's offline non-goal
+   `LFM2-1.2B-Tool`'s chat template already encodes the `<|tool_list_start|>` wrapping, M8 tried
+   passing the existing generated tool schema through `tools` first — and that is all it took. The
+   template `tojson`s each tool object verbatim and wraps the `tool` role in
+   `<|tool_response_start|>`, so both directions of the round trip are the template's job, not ours.
+   No hand-rolled prompt was needed.
+5. **Model weights are not part of the wasm artifact.** Unlike `smolbox.wasm` (built and embedded),
+   the ONNX checkpoint is fetched from the HF CDN at runtime and cached by transformers.js in the
+   browser's Cache Storage API. **Revised at M8:** `make model` pulls the pinned revision into
+   `dist/models` (gitignored) and the page prefers it, because a fresh browser profile has an empty
+   cache — and Cache Storage cannot hold a 1.2 GB entry anyway (§2.11.26). First load needs network access from the *page* — the sandbox's offline non-goal
    is about the guest VM and is unaffected, but this is a real UX fact to record as a risk (§9.5), not
    a blocker.
 6. **Browser support is broader than the mount's, but unverified for this project.** WebGPU has wider
@@ -1117,15 +1231,17 @@ this repo changes as part of this section.
 | Model | `onnx-community/LFM2-1.2B-Tool-ONNX`, `dtype: 'q4'` | Purpose-built for tool use; q4 is the documented WebGPU-appropriate quantization |
 | Library | `@huggingface/transformers` (transformers.js v3+), `device: 'webgpu'` | Matches upstream's own `LiquidAI/LFM2-WebGPU` Space; npm-installable under bun |
 | Where inference runs | A **new dedicated Worker**, separate from the VM worker | The VM worker's `wasi.start()` blocks it for the VM's lifetime and cannot receive postMessage mid-run (§2.11.12); model inference must not share it. transformers.js calls are Promise-based, so this worker talks to the main thread over plain `postMessage` — no SAB/Atomics needed here, unlike the VM/fsbridge channels |
-| Tool schema → prompt | Pass the existing `web/src/tool.ts` `Definition`'s JSON schema through `apply_chat_template(..., { tools })`, with "Output function calls as JSON" in the system prompt | Reuses the generated, anti-drift-guarded schema instead of hand-building prompt text; falls back to manual `<|tool_list_start|>` formatting only if the template doesn't cooperate (verify in the spike) |
-| Tool execution | Existing `Session` / `tool.ts` `Call`/`renderResult` path, unchanged | Component 2 is a consumer of the proven M7 surface, not a reason to touch it |
+| Tool schema → prompt | Pass the existing `web/src/tool.ts` `Definition`'s JSON schema through `apply_chat_template(..., { tools })` | Reuses the generated, anti-drift-guarded schema instead of hand-building prompt text. **Confirmed at M8**: the template renders the `<|tool_list_start|>` wrapping and serialises the tool objects verbatim, so no manual formatting was needed |
+| Tool-call syntax | **Parse Pythonic *and* JSON** (`web/src/agent/parse.ts`) | **Revised at M8.** The original plan was JSON-only, via "Output function calls as JSON" in the system prompt (§9.1.3). Measured: five wordings, and the model emitted correct *Pythonic* calls every time. It speaks its documented default; parsing it is cheaper and more honest than fighting the prompt |
+| Tool execution | Existing `Session` / `tool.ts` `Call`/`renderResult` path, unchanged | Component 2 is a consumer of the proven M7 surface, not a reason to touch it. **Held at M8: no tool-surface file changed** |
+| Weight delivery | `make model` → `dist/models` (gitignored), served locally; HF CDN as fallback | **Added at M8.** A Playwright profile starts with an empty Cache Storage, so a CDN-only path would re-download 1.22 GB every run. Local load is ~4.2 s |
 | M8 scope | One hardcoded prompt, one real tool call, transcript logged to console/page — **no chat UI** | Matches the M4 spike pattern: prove the mechanism before building UI or a multi-turn loop around it |
 
 ### 9.3 Milestone M8
 
 | # | Deliverable | Done when |
 |---|---|---|
-| M8 | WebGPU tool-call spike: load `LFM2-1.2B-Tool-ONNX` via transformers.js in a dedicated worker, send one hardcoded prompt, get back one real `run_terminal_command` call, execute it against a live `Session`, log the full transcript | A single manual/scripted run in Chromium shows: model loads on WebGPU, emits a JSON tool call parsed without error, the call reaches a real VM session and returns real output, and the model's follow-up text (after the tool result is fed back) is logged — no chat UI required |
+| M8 | WebGPU tool-call spike: load `LFM2-1.2B-Tool-ONNX` via transformers.js in a dedicated worker, send one hardcoded prompt, get back one real `run_terminal_command` call, execute it against a live `Session`, log the full transcript | A single scripted run in Chromium shows: model loads on WebGPU, emits a tool call parsed without error, the call reaches a real VM session and returns real output, and the model's follow-up text (after the tool result is fed back) is logged — no chat UI required — **done** (§1, measured at M8) |
 
 ### 9.4 Open questions for M9+ (not designed yet)
 
@@ -1133,13 +1249,42 @@ this repo changes as part of this section.
 - Chat UI shape — what a person actually sees and how they intervene.
 - How the existing `setMount` picker flow hands off to the agent (does picking a folder start a
   session automatically, or stay a manual step?).
-- Model-swap/versioning story — pinning a checkpoint revision, handling a model update.
+- Model-swap/versioning story — the checkpoint revision **is** now pinned (`web/fetch-model.ts`
+  holds the sha), but nothing handles an update or a second model.
 - Whether the dedicated-worker split (§9.2) holds up once inference needs to interleave with streamed
   VM output, rather than the one-shot request/response shape M8 tests.
+- **Does the model refuse or mangle the calls a real task needs?** M8 proves one `ls` round-trip. It
+  says nothing about multi-step work, about the model recovering from a non-zero exit, or about how
+  often a 1.2B model picks a *useful* command rather than a merely well-formed one.
+- **Nothing verifies the model's arguments beyond the schema.** `decodeArgs` rejects malformed and
+  unknown fields, and `op` can never be set — but a well-formed `cmd` is still arbitrary shell.
+  That is the design (the sandbox is the boundary, not the schema), and it is worth stating out loud
+  before a chat UI puts a user's folder behind it.
+
+### 9.4b Verified at M8, worth not re-deriving
+
+- The tool surface needed **no changes** to serve a real model — the M7 bet paid off.
+- `apply_chat_template({ tools })` is the whole prompt-construction story; there is no reason to
+  hand-format special tokens.
+- The GPU-free half of the agent (the parser) is where the bugs were, and it is unit-testable in CI.
+  Keep new agent logic on that side of the line wherever possible: everything that needs a GPU is
+  untestable on a runner.
 
 ### 9.5 Risks (component 2)
 
 10. **Model weights require a live network fetch on first load.** Component 1 is fully offline once
     `dist/smolbox.wasm` is built; component 2 is not — the ONNX checkpoint comes from the HF CDN at
-    runtime (§9.1.5). Browser Cache Storage makes repeat loads free, but the first load in any given
-    browser profile needs the internet, and that should be surfaced in the UI, not silently assumed.
+    runtime (§9.1.5). **Mitigated at M8:** `make model` pulls the pinned revision into `dist/models`
+    once and the page prefers it, so repeat runs and the e2e suite are offline and fast (~4.2 s to
+    load). The CDN path remains for anyone who has not run it, and the page says which one it used.
+    Note that Cache Storage is *not* a working fallback for a file this size (§2.11.26).
+11. **The agent has no CI, by construction.** Headless Chromium offers no software WebGPU fallback
+    (§2.11.24), so `make test-e2e-agent` cannot run on a GPU-less runner and is opt-in behind
+    `SMOLBOX_WEBGPU=1`. The mitigation is to keep as much agent logic as possible GPU-free: the
+    tool-call parser carries 28 unit tests that run in CI on every push, and it is where the real
+    bugs were. Anything that can only be tested behind a GPU should stay thin.
+12. **The model's call syntax is a moving target.** M8 pinned a checkpoint revision precisely because
+    the Pythonic-vs-JSON behaviour (§9.2) is a property of *this* checkpoint, established by
+    measurement rather than documentation — Liquid's docs describe a prompt switch that did not take.
+    A model bump must re-run `make test-e2e-agent`; the parser accepts both syntaxes so a change in
+    either direction is survivable, but a third syntax would not be.

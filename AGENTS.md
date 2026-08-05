@@ -8,21 +8,25 @@ milestone status; it is the source of truth and is kept current.
 A full x86_64 Linux VM that runs as a portable `.wasm` artifact. A minimal Alpine image is converted
 with [container2wasm](https://github.com/container2wasm/container2wasm); the same `dist/smolbox.wasm`
 runs under [wazero](https://wazero.io) (local CLI, tests) and later in a browser, mounting a host
-directory read-only at `/mnt/host`. A future on-device LLM will drive it through a framed exec API.
+directory read-only at `/mnt/host`. An on-device LLM on WebGPU drives it through a framed exec API
+(M8 proves the round trip; see `web/src/agent/`).
 
 Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
 CLI), M3 (read-only host mount under wazero + shared conformance table), M4 (browser worker +
 stdio router + TS session, preopen spike proven), M5 (sync FS bridge + browser mount + browser
 conformance driver), M6 (emscripten `--to-js` target + its conformance driver), and M7 (tool-API
-docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.** What
-remains is component 2, the WebGPU model, which is out of scope for PLAN.md.
+docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.**
+Component 2 has started: **M8 (the WebGPU tool-call spike) is done** — a local LFM2 model on WebGPU
+drives a real VM through the M7 tool surface, which needed **no changes** to serve it (PLAN §9).
+M9+ (multi-turn, chat UI) is not designed yet.
 
 ## Toolchain
 
 - **Go 1.24.3** (pinned in `go.mod`; do not bump without updating PLAN.md). wazero is pinned to
-  **v1.11.0** because v1.12+ requires go ≥ 1.25.
+  **v1.11.0** because v1.12+ requires go ≥ 1.25. A newer local toolchain is fine — go1.26.5 builds
+  the pinned module clean — but the `go.mod` directive and CI's pin are what decide.
 - **Docker 29.x** with the daemon socket at `/var/run/docker.sock` — required for `make wasm`.
-- **bun 1.2.x** for all web tooling (bundle, `bun test`, `bunx --bun tsc`, dev server). Node is
+- **bun 1.2.x or newer** (1.3.14 verified) for all web tooling (bundle, `bun test`, `bunx --bun tsc`, dev server). Node is
   irrelevant; Playwright's runner works under bun (`bunx --bun playwright test`), so no Node pin
   (risk 7, resolved at M4).
 - **golangci-lint v2** (`~/.golangci.yml` uses the v2 schema). In CI it is installed via
@@ -48,11 +52,14 @@ remains is component 2, the WebGPU model, which is out of scope for PLAN.md.
 | `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
+| `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
+| `make test-e2e-agent` | Playwright: the M8 agent spike at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
 `dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`; M6 adds `make test-e2e-js`
-(needs `dist/js`).
+(needs `dist/js`). M8's `make test-e2e-agent` is **not** part of the gate — it needs a GPU and
+1.22 GB of weights, so run it by hand when touching `web/src/agent/`.
 
 ## How the VM is built (the two Dockerfiles)
 
@@ -218,6 +225,41 @@ hosts that want the timing. The exact format is pinned by `tests/tool/render-cas
 Go and bun suites both run — the same shared-table trick as the conformance table, one level up. Add
 a rendering rule there first, then implement it twice.
 
+### The agent (M8): the model speaks Pythonic, not JSON
+LFM2 emits `[run_terminal_command(cmd="ls", stdin=None)]`, **not** JSON — and no system-prompt
+wording changes that. Five were measured, including the exact "Output function calls as JSON" line
+from Liquid's docs; four produced correct Pythonic calls and the fifth only produced JSON because
+dropping the sandbox context made the model hallucinate instead of calling anything. So
+`web/src/agent/parse.ts` parses **both** syntaxes. Do not "fix" this by rewording the prompt — that
+was tried. Two details the parser earns its keep on: Python `None` means *not provided* and must be
+dropped rather than passed through as `null` (`decodeArgs` would reject it), and the whole thing is
+pure and unit-tested because it is the only part of the agent CI can run. (PLAN §9.2, §1 M8.)
+
+### The agent's prompt is the generated tool schema, unmodified
+`apply_chat_template(messages, { tools: [openaiTool()] })` renders the `<|tool_list_start|>` wrapping
+itself and serialises the tool objects verbatim, and it wraps the `tool` role in
+`<|tool_response_start|>` on the way back — so `renderResult`'s M7 output feeds straight in. There is
+no hand-formatted prompt text and there should not be: the schema is the anti-drift-guarded artifact,
+and hand-copying it into a prompt string would be the drift the M7 gates exist to prevent.
+
+### The agent has no CI and cannot have one
+Headless Chromium gives **no** WebGPU adapter without `--use-angle=vulkan --enable-features=Vulkan`,
+and `--enable-unsafe-swiftshader` provides no software fallback at all — a GPU-less runner cannot run
+this at any speed. `make test-e2e-agent` is opt-in behind `SMOLBOX_WEBGPU=1` and is deliberately
+absent from CI. The mitigation is structural: **keep agent logic GPU-free wherever it can be.** The
+parser has 28 unit tests in `make test-web`; that is where the bugs were. Also note `navigator.gpu`
+is undefined outside a secure context, so any probe must run against localhost, not `about:blank`.
+(PLAN §2.11.24.)
+
+### Model weights: `make model`, and don't let the browser cache them
+`make model` pulls a **pinned revision** into `dist/models` (gitignored, 1.22 GB); `web/serve.ts`
+serves it at `/models/` without copying it into `web/dist`. The page prefers local and falls back to
+the HF CDN. Two traps: Cache Storage cannot hold a 1.2 GB entry (the `put` fails with an opaque
+internal error), so `env.useBrowserCache = false` on the local path; and onnxruntime-web picks its
+wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.*`, not `.jsep` — so
+`make web` copies **every** variant. A missing one surfaces as "no available backend found", not a
+404. (PLAN §2.11.25-26.)
+
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
@@ -238,6 +280,15 @@ a rendering rule there first, then implement it twice.
   side (`tests/e2e/harness.ts` `walkFixture`), with the fixture's symlink registered as a virtual
   link. Playwright runs under bun (`bunx --bun playwright test`); install browsers with
   `bunx --bun playwright install chromium`. `test-e2e` is in CI (M5).
+- `tests/e2e/agent.spec.ts` (M8) drives `/agent/` from `playwright.agent.config.ts`, which is the
+  only config carrying the WebGPU launch flags. It is skipped unless `SMOLBOX_WEBGPU=1`, and both
+  other configs exclude it (the WASI config by `testIgnore`, the emscripten one by `testMatch`).
+  It asserts the *mechanism* — a parseable call for the one tool that exists, reaching a real
+  session, with the mount's real contents in the rendered result — not the model's prose, which is
+  not stable enough to assert.
+- `tests/e2e/harness.ts` `installMount(page, fixture, hook)` is shared by the VM page and the agent
+  page, so both mount through the identical bridge and virtual-symlink path. Take the hook name as a
+  parameter rather than forking it.
 - `tests/e2e/emscripten.spec.ts` (M6) drives the `/js/` page through `bootJs()` and needs `dist/js`,
   not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
   WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.
@@ -272,9 +323,11 @@ a rendering rule there first, then implement it twice.
    runs the mock caller).
 4. If `internal/protocol` or `internal/tool` changed: `make generate`, then `make test test-web` —
    the generated schemas, the TS twin, and the docs tables all have drift gates.
-5. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
+5. If `web/src/agent/` changed: `make test-web` covers the parser; run `make test-e2e-agent` by hand
+   (needs a GPU + `make model`) — CI cannot, so an untested agent change ships untested.
+6. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
    (the browser must still pass the same conformance table as Go). If shared code under `web/src/`
    changed, also run `make test-e2e-js` with `dist/js` present — the emscripten page reuses
    `protocol.ts`, `stdio.ts` and `session.ts` verbatim.
-6. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
-7. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
+7. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
+8. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.

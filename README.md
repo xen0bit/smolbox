@@ -4,7 +4,7 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: component 1 is complete (M0–M7).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
+> **Status: component 1 is complete (M0–M7), and component 2 has its first working spike (M8).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
 > 108 MB) and boots to the guest agent's ready banner under wazero in ~3.2 s and **in a browser in
 > ~2.6 s**, with the read-only host mount working under wazero and in the browser via the sync FS
 > bridge (a folder picked with the File System Access API is mounted read-only at `/mnt/host`). The
@@ -13,7 +13,9 @@ issuing terminal commands.
 > Chromium, and (minus the mount cases) under the emscripten `--to-js` build**, which ships too. The
 > tool-call surface is specified and tested: [`docs/tool-api.md`](docs/tool-api.md), JSON Schemas
 > generated from the Go types, and **a mock caller that runs a scripted tool-call transcript against
-> a real VM** — so the WebGPU model, when it lands, is a consumer of a proven API.
+> a real VM**. **M8 replaced that mock caller with a real one:** an LFM2-1.2B model running on WebGPU
+> in the page picks up the same generated schema, emits a `run_terminal_command` call, and reads the
+> folder you picked — the tool surface needed **no changes at all** to serve it.
 > See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
 
 ---
@@ -93,7 +95,10 @@ resp, err := session.Exec(ctx, protocol.Request{
   directory, reading a file, searching a tree — those are commands, not more tools.
 - The model never chooses the *operation*: `op` is not in the tool's schema, and a call that sets it
   is rejected before the session sees it. A model cannot talk its own sandbox into `shutdown`.
-- A WebGPU model in the page calls it, reads the folder the user picked, and reports back.
+- A WebGPU model in the page calls it, reads the folder the user picked, and reports back. **Working
+  as of M8**: `LFM2-1.2B-Tool` on WebGPU via transformers.js, in its own worker, loading in ~4 s and
+  answering in ~3.6 s end to end. The model emits its native Pythonic call syntax, which the page
+  parses alongside JSON.
 - The tool surface is fully specified and tested against a mock caller **before** any model is
   wired in — the model is a consumer of a proven API, not a prerequisite for it. See
   [docs/tool-api.md](docs/tool-api.md).
@@ -117,6 +122,7 @@ resp, err := session.Exec(ctx, protocol.Request{
 ```
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
 make wasm-js     # optional: the emscripten build -> dist/js (no host mount)
+make model       # optional: pull the LFM2 checkpoint (1.22 GB) -> dist/models, for the agent page
 make build       # build the smolbox CLI
 
 ./bin/smolbox exec --mount ./testdata/mount -- ls -la /mnt/host
@@ -125,13 +131,20 @@ make build       # build the smolbox CLI
 make web serve   # bundle and serve the browser runtime on localhost:8080
 ```
 
-The dev server hosts the WASI build at `/` and, if `dist/js` exists, the emscripten build at `/js/`.
+The dev server hosts the WASI build at `/`, the emscripten build at `/js/` if `dist/js` exists, and
+the agent spike at `/agent/`. The agent page needs a GPU; it loads weights from `dist/models` when
+`make model` has been run and from the Hugging Face CDN otherwise.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
 Toolchain: **Go 1.24+** for the CLI, **Docker** for the conversion, and **bun** for the web tooling
 (bundling, unit tests, typecheck, and the dev server). Run `bun install` once to fetch the web
 dependencies.
+
+The agent spike is exercised through `make test-e2e-agent` (Playwright drives `/agent/` in headless
+Chromium: the model loads on WebGPU, calls the tool, and the call reaches a real VM). It is **opt-in
+and not in CI** — headless Chromium has no software WebGPU fallback, so a GPU-less runner cannot run
+it. Its tool-call parser carries 28 unit tests that do run in CI.
 
 The VM artifact is exercised today through `make test-integration` (boots `dist/smolbox.wasm` under
 wazero and runs the framed protocol matrix over the guest agent), and by hand through the `smolbox`

@@ -96,52 +96,62 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
   await page.goto("/");
   await page.waitForFunction(() => Boolean((globalThis as SmolboxGlobal).__smolbox));
 
-
   if (fixture) {
-    await page.evaluate(
-      async (tree) => {
-        const links: Record<string, string> = {};
-        const root = await navigator.storage.getDirectory();
-        for await (const [name] of root.entries()) {
-          await root.removeEntry(name, { recursive: true });
-        }
-
-        const writeNode = async (
-          dir: FileSystemDirectoryHandle,
-          node: FixtureNode,
-          abs: string,
-        ): Promise<void> => {
-          if (node.kind === "symlink") {
-            links[abs] = node.target;
-            return;
-          }
-          if (node.kind === "dir") {
-            for (const [name, child] of Object.entries(node.children)) {
-              const childAbs = abs === "/" ? `/${name}` : `${abs}/${name}`;
-              if (child.kind === "file") {
-                const fh = await dir.getFileHandle(name, { create: true });
-                const writable = await fh.createWritable();
-                await writable.write(child.content);
-                await writable.close();
-              } else if (child.kind === "dir") {
-                const sub = await dir.getDirectoryHandle(name, { create: true });
-                await writeNode(sub, child, childAbs);
-              } else if (typeof child.target === "string") {
-                links[childAbs] = child.target;
-              }
-            }
-          }
-        };
-
-        await writeNode(root, tree as FixtureNode, "/");
-        const api = (globalThis as unknown as { __smolbox?: { setMount(h: unknown, l?: Record<string, string>): void } }).__smolbox;
-        api?.setMount(root, links);
-      },
-      fixture,
-    );
+    await installMount(page, fixture, "__smolbox");
   }
 
   return attach(page);
+}
+
+// Write the fixture into OPFS and hand it to the page's setMount. Parameterised
+// by hook name so the agent page (__smolagent) mounts through the identical code
+// path as the VM page (__smolbox) — same bridge, same virtual symlink table.
+export async function installMount(
+  page: Page,
+  fixture: FixtureNode,
+  hook: "__smolbox" | "__smolagent",
+): Promise<void> {
+  await page.evaluate(
+    async ({ tree, hook }) => {
+      const links: Record<string, string> = {};
+      const root = await navigator.storage.getDirectory();
+      for await (const [name] of root.entries()) {
+        await root.removeEntry(name, { recursive: true });
+      }
+
+      const writeNode = async (
+        dir: FileSystemDirectoryHandle,
+        node: FixtureNode,
+        abs: string,
+      ): Promise<void> => {
+        if (node.kind === "symlink") {
+          links[abs] = node.target;
+          return;
+        }
+        if (node.kind === "dir") {
+          for (const [name, child] of Object.entries(node.children)) {
+            const childAbs = abs === "/" ? `/${name}` : `${abs}/${name}`;
+            if (child.kind === "file") {
+              const fh = await dir.getFileHandle(name, { create: true });
+              const writable = await fh.createWritable();
+              await writable.write(child.content);
+              await writable.close();
+            } else if (child.kind === "dir") {
+              const sub = await dir.getDirectoryHandle(name, { create: true });
+              await writeNode(sub, child, childAbs);
+            } else if (typeof child.target === "string") {
+              links[childAbs] = child.target;
+            }
+          }
+        }
+      };
+
+      await writeNode(root, tree as FixtureNode, "/");
+      const api = (globalThis as unknown as Record<string, { setMount(h: unknown, l?: Record<string, string>): void } | undefined>)[hook];
+      api?.setMount(root, links);
+    },
+    { tree: fixture, hook },
+  );
 }
 
 // Boot the emscripten (--to-js) page at /js/. That build has no host mount, so

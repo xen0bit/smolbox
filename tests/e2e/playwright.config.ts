@@ -1,10 +1,11 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // The WASI browser suite. emscripten.spec.ts needs dist/js, which `make wasm`
-// does not produce, so it runs from playwright.emscripten.config.ts instead.
+// does not produce, so it runs from playwright.emscripten.config.ts instead;
+// agent.spec.ts needs a GPU and dist/models and runs from playwright.agent.config.ts.
 export default defineConfig({
   testDir: ".",
-  testIgnore: ["**/emscripten.spec.ts"],
+  testIgnore: ["**/emscripten.spec.ts", "**/agent.spec.ts"],
   timeout: 5 * 60 * 1000,
   fullyParallel: false,
   workers: 1,
