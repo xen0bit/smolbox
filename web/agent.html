@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>smolbox — agent spike</title>
+    <style>
+      body {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        margin: 2rem auto;
+        max-width: 60rem;
+        padding: 0 1rem;
+        color: #1f2328;
+      }
+      button {
+        font: inherit;
+        padding: 0.4rem 0.9rem;
+        cursor: pointer;
+      }
+      pre {
+        background: #f6f8fa;
+        border: 1px solid #d0d7de;
+        padding: 0.75rem;
+        min-height: 2rem;
+        white-space: pre-wrap;
+      }
+      #status {
+        color: #57606a;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>smolbox agent spike</h1>
+      <p id="status">idle</p>
+      <button id="run" type="button">run the transcript</button>
+      <button id="pick" type="button">choose a folder to mount at /mnt/host</button>
+      <pre id="log"></pre>
+      <p>
+        A local model on WebGPU drives the VM through the
+        <code>run_terminal_command</code> tool. One hardcoded prompt, one tool
+        call against a real session, one answer — this is the M8 spike, not a
+        chat UI. Weights load from <code>dist/models</code> when
+        <code>make model</code> has been run, and from the Hugging Face hub
+        otherwise (~1.2&nbsp;GB on first load).
+      </p>
+      <p>The VM-only page is at <a href="/">/</a>.</p>
+    </main>
+    <script type="module" src="./agent-main.js"></script>
+  </body>
+</html>

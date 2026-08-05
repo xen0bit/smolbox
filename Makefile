@@ -9,8 +9,17 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate \
-        test test-integration test-web test-e2e test-e2e-js test-conformance lint clean
+.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model \
+        test test-integration test-web test-e2e test-e2e-js test-e2e-agent test-conformance lint clean
+
+# c2w runs as root in the container, so everything it writes to dist/ lands
+# root-owned — and then a later `mkdir dist/js` fails with EPERM for the user who
+# ran make. Fixing this by running the converter as --user does NOT work: with no
+# passwd entry for the uid, $HOME is / and buildx dies on `mkdir /.docker`. So
+# leave the conversion exactly as it is and hand ownership back afterwards, from
+# a root container (the only thing here with the rights to do it).
+RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IMAGE) \
+		-R $(shell id -u):$(shell id -g) /out
 
 all: build wasm web
 
@@ -29,10 +38,12 @@ builder-image: require-docker
 	docker build -f build/Dockerfile.c2w -t $(C2W_IMAGE) build/
 
 wasm: vm-image builder-image
+	@mkdir -p $(DIST)
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
 		$(C2W_IMAGE) --assets /assets $(VM_IMAGE) /out/smolbox.wasm
+	@$(RECLAIM_DIST)
 
 wasm-js: vm-image builder-image
 	@mkdir -p $(DIST)/js
@@ -40,6 +51,7 @@ wasm-js: vm-image builder-image
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
 		$(C2W_IMAGE) --assets /assets --to-js $(VM_IMAGE) /out/js/
+	@$(RECLAIM_DIST)
 
 build:
 	mkdir -p $(BIN)
@@ -57,6 +69,24 @@ web:
 		cp -r $(DIST)/js/. web/dist/js/ && \
 		cp web/js.html web/dist/js/index.html; \
 	else echo "note: dist/js not built yet; run 'make wasm-js' (M6)"; fi
+	mkdir -p web/dist/agent web/dist/ort
+	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \
+		--target=browser --outdir web/dist/agent
+	cp web/agent.html web/dist/agent/index.html
+	@# onnxruntime-web otherwise pulls these from jsdelivr at runtime; serving them
+	@# locally keeps the page pinned to the installed version and works offline.
+	@# Copy every simd-threaded variant rather than guessing: ORT picks the build
+	@# at runtime (this version asks for .asyncify for WebGPU, not .jsep), and a
+	@# missing one fails as an opaque "no available backend found".
+	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.*.wasm web/dist/ort/
+	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.*.mjs web/dist/ort/
+	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm web/dist/ort/
+	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs web/dist/ort/
+
+# Pulls the ~1.2 GB q4 checkpoint into dist/models (gitignored). The agent page
+# prefers it and falls back to the HF CDN when it is absent.
+model:
+	bun web/fetch-model.ts
 
 serve:
 	bun web/serve.ts
@@ -83,6 +113,12 @@ test-e2e: web
 test-e2e-js: web
 	@test -d "$(DIST)/js" || { echo "error: $(DIST)/js missing; run 'make wasm-js' first (M6)" >&2; exit 1; }
 	bunx --bun playwright test --config tests/e2e/playwright.emscripten.config.ts
+
+# The M8 agent spike. Opt-in and not in CI: it needs a real GPU adapter (headless
+# Chromium has no software fallback for WebGPU) and the local weights.
+test-e2e-agent: web
+	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
+	SMOLBOX_WEBGPU=1 bunx --bun playwright test --config tests/e2e/playwright.agent.config.ts
 
 test-conformance:
 	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first (M1)" >&2; exit 1; }
