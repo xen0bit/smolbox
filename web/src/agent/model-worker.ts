@@ -9,6 +9,8 @@
 import {
   AutoModelForCausalLM,
   AutoTokenizer,
+  InterruptableStoppingCriteria,
+  TextStreamer,
   env,
   type PreTrainedModel,
   type PreTrainedTokenizer,
@@ -35,6 +37,10 @@ const MODEL_ID = "onnx-community/LFM2-1.2B-Tool-ONNX";
 
 let tokenizer: PreTrainedTokenizer | null = null;
 let model: PreTrainedModel | null = null;
+
+// One generation at a time, so one criteria object is enough. It is reset
+// before each run rather than recreated, because generate() holds the reference.
+const stopper = new InterruptableStoppingCriteria();
 
 function post(msg: ModelResponse): void {
   scope.postMessage(msg);
@@ -74,6 +80,7 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   if (!tokenizer || !model) {
     throw new Error("generate before ready");
   }
+  stopper.reset();
 
   const prompt = tokenizer.apply_chat_template(req.messages, {
     tools: req.tools,
@@ -83,12 +90,23 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   const inputs = tokenizer(prompt, { add_special_tokens: false });
   const started = performance.now();
+
+  // skip_prompt so the callback sees only this turn; special tokens are KEPT
+  // because the tool-call markers are exactly what the page needs to parse.
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: false,
+    callback_function: (text: string) => post({ type: "token", id: req.id, text }),
+  });
+
   const out = await model.generate({
     ...inputs,
     // Greedy: a spike whose output changes run to run cannot tell a prompt
     // problem from a sampling one.
     do_sample: false,
     max_new_tokens: req.maxNewTokens ?? 256,
+    streamer,
+    stopping_criteria: stopper,
   });
 
   // The generated ids include the prompt; slice it off so the caller parses only
@@ -100,10 +118,12 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   post({
     type: "generated",
+    id: req.id,
     text,
     prompt,
     tokens: completion.length,
     ms: Math.round(performance.now() - started),
+    stopped: stopper.interrupted,
   });
 }
 
@@ -117,6 +137,11 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
           break;
         case "generate":
           await generate(msg);
+          break;
+        case "cancel":
+          // Fire-and-forget: interrupting when nothing is running is a no-op,
+          // which is what lets the page call this without tracking state.
+          stopper.interrupt();
           break;
       }
     } catch (err) {
