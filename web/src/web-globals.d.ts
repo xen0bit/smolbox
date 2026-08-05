@@ -16,12 +16,37 @@ declare const crossOriginIsolated: boolean;
 
 declare const document: {
   getElementById(id: string): Element | null;
+  createElement(tag: string): Element;
 };
 
 interface Element {
   textContent: string | null;
-  addEventListener(type: "click", listener: (ev: unknown) => void): void;
+  className: string;
+  value: string;
+  disabled: boolean;
+  hidden: boolean;
+  scrollTop: number;
+  readonly scrollHeight: number;
+  readonly children: readonly Element[];
+  appendChild(child: Element): Element;
+  replaceChildren(...children: Element[]): void;
+  setAttribute(name: string, value: string): void;
+  addEventListener(type: "click" | "keydown" | "change" | "input", listener: (ev: KeyboardEventLike) => void): void;
 }
+
+/** Only the fields the agent page reads off a key event. */
+interface KeyboardEventLike {
+  key?: string;
+  shiftKey?: boolean;
+  preventDefault?(): void;
+}
+
+declare const location: { search: string };
+
+declare const localStorage: {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+};
 
 // File System Access API: the browser globals our mount providers use, typed
 // against the structural handles in fsbridge/main-host.ts so no DOM lib is

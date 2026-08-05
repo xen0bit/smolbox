@@ -9,12 +9,15 @@
 import {
   AutoModelForCausalLM,
   AutoTokenizer,
+  InterruptableStoppingCriteria,
+  TextStreamer,
   env,
   type PreTrainedModel,
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
 
 import type { ModelRequest, ModelResponse } from "./messages.ts";
+import { DEFAULT_MODEL_KEY, type Dtype, modelFor } from "./models.ts";
 
 // onnxruntime-web otherwise fetches its wasm from jsdelivr at runtime. Serving
 // it from our own origin pins it to the installed version and keeps the page
@@ -31,16 +34,19 @@ const scope = globalThis as unknown as {
   addEventListener(type: "message", fn: (ev: { data: ModelRequest }) => void): void;
 };
 
-const MODEL_ID = "onnx-community/LFM2-1.2B-Tool-ONNX";
-
 let tokenizer: PreTrainedTokenizer | null = null;
 let model: PreTrainedModel | null = null;
+
+// One generation at a time, so one criteria object is enough. It is reset
+// before each run rather than recreated, because generate() holds the reference.
+const stopper = new InterruptableStoppingCriteria();
 
 function post(msg: ModelResponse): void {
   scope.postMessage(msg);
 }
 
-async function load(local: boolean): Promise<void> {
+async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<void> {
+  const entry = modelFor(modelKey);
   // Local weights come from dist/models via the dev server; the hub is the
   // fallback so the page still works for someone who has not run `make model`.
   env.allowLocalModels = local;
@@ -54,12 +60,13 @@ async function load(local: boolean): Promise<void> {
   }
 
   const started = performance.now();
-  tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
-  model = await AutoModelForCausalLM.from_pretrained(MODEL_ID, {
+  tokenizer = await AutoTokenizer.from_pretrained(entry.repo);
+  model = await AutoModelForCausalLM.from_pretrained(entry.repo, {
     device: "webgpu",
-    // q4, not q4f16: headless Chromium's ANGLE/Vulkan adapter does not expose
-    // shader-f16, and an f16 build cannot run without it.
-    dtype: "q4",
+    // The dtype is chosen by the page against the adapter's feature list, not
+    // hardcoded: f16 variants need shader-f16, which headless Chromium does not
+    // expose but a desktop browser usually does (PLAN §2.11.24).
+    dtype,
     progress_callback: (p: { status?: string; file?: string; progress?: number }) => {
       if (p.status === "progress" && p.file && typeof p.progress === "number") {
         post({ type: "progress", file: p.file, pct: Math.round(p.progress) });
@@ -67,13 +74,20 @@ async function load(local: boolean): Promise<void> {
     },
   });
 
-  post({ type: "ready", source: local ? "local" : "hub", loadMs: Math.round(performance.now() - started) });
+  post({
+    type: "ready",
+    source: local ? "local" : "hub",
+    loadMs: Math.round(performance.now() - started),
+    modelKey: entry.key,
+    dtype,
+  });
 }
 
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
   if (!tokenizer || !model) {
     throw new Error("generate before ready");
   }
+  stopper.reset();
 
   const prompt = tokenizer.apply_chat_template(req.messages, {
     tools: req.tools,
@@ -83,12 +97,23 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   const inputs = tokenizer(prompt, { add_special_tokens: false });
   const started = performance.now();
+
+  // skip_prompt so the callback sees only this turn; special tokens are KEPT
+  // because the tool-call markers are exactly what the page needs to parse.
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: false,
+    callback_function: (text: string) => post({ type: "token", id: req.id, text }),
+  });
+
   const out = await model.generate({
     ...inputs,
     // Greedy: a spike whose output changes run to run cannot tell a prompt
     // problem from a sampling one.
     do_sample: false,
     max_new_tokens: req.maxNewTokens ?? 256,
+    streamer,
+    stopping_criteria: stopper,
   });
 
   // The generated ids include the prompt; slice it off so the caller parses only
@@ -100,10 +125,12 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   post({
     type: "generated",
+    id: req.id,
     text,
     prompt,
     tokens: completion.length,
     ms: Math.round(performance.now() - started),
+    stopped: stopper.interrupted,
   });
 }
 
@@ -113,10 +140,15 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
     try {
       switch (msg.type) {
         case "load":
-          await load(msg.local);
+          await load(msg.local, msg.modelKey ?? DEFAULT_MODEL_KEY, (msg.dtype ?? "q4") as Dtype);
           break;
         case "generate":
           await generate(msg);
+          break;
+        case "cancel":
+          // Fire-and-forget: interrupting when nothing is running is a no-op,
+          // which is what lets the page call this without tracking state.
+          stopper.interrupt();
           break;
       }
     } catch (err) {

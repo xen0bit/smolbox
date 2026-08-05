@@ -1,0 +1,194 @@
+{
+  "comment": "Golden table for TemplateTool.Compile, run by BOTH the Go tests (internal/tool) and the bun tests (web/src/agent/user-tools.test.ts) — the same shared-table trick as render-cases.json and cases.json. The Go and TS implementations of template compilation cannot drift while this passes on both sides. `cmd` is the exact shell command the compiled request must carry.",
+  "cases": [
+    {
+      "name": "a plain substitution is shell-quoted",
+      "tool": {
+        "name": "search_files",
+        "description": "search",
+        "params": [{ "name": "pattern", "type": "string", "description": "p", "required": true }],
+        "template": "grep -rn -- {pattern} /mnt/host"
+      },
+      "args": { "pattern": "TODO" },
+      "cmd": "grep -rn -- 'TODO' /mnt/host"
+    },
+    {
+      "name": "a value with spaces stays one argument",
+      "tool": {
+        "name": "search_files",
+        "description": "search",
+        "params": [{ "name": "pattern", "type": "string", "description": "p", "required": true }],
+        "template": "grep -rn -- {pattern} /mnt/host"
+      },
+      "args": { "pattern": "hello world" },
+      "cmd": "grep -rn -- 'hello world' /mnt/host"
+    },
+    {
+      "name": "shell metacharacters are inert, not syntax",
+      "tool": {
+        "name": "search_files",
+        "description": "search",
+        "params": [{ "name": "pattern", "type": "string", "description": "p", "required": true }],
+        "template": "grep -rn -- {pattern} /mnt/host"
+      },
+      "args": { "pattern": "a; rm -rf /; echo b" },
+      "cmd": "grep -rn -- 'a; rm -rf /; echo b' /mnt/host"
+    },
+    {
+      "name": "an embedded single quote is closed, escaped and reopened",
+      "tool": {
+        "name": "search_files",
+        "description": "search",
+        "params": [{ "name": "pattern", "type": "string", "description": "p", "required": true }],
+        "template": "grep -rn -- {pattern} /mnt/host"
+      },
+      "args": { "pattern": "it's" },
+      "cmd": "grep -rn -- 'it'\\''s' /mnt/host"
+    },
+    {
+      "name": "raw opts out of quoting",
+      "tool": {
+        "name": "read_file",
+        "description": "read",
+        "params": [{ "name": "n", "type": "integer", "description": "n", "required": true }],
+        "template": "head -n {n:raw} /mnt/host/x"
+      },
+      "args": { "n": 20 },
+      "cmd": "head -n 20 /mnt/host/x"
+    },
+    {
+      "name": "a default fills an omitted optional parameter",
+      "tool": {
+        "name": "list_dir",
+        "description": "list",
+        "params": [{ "name": "path", "type": "string", "description": "p", "default": "/mnt/host" }],
+        "template": "ls -la {path}"
+      },
+      "args": {},
+      "cmd": "ls -la '/mnt/host'"
+    },
+    {
+      "name": "an explicit value beats the default",
+      "tool": {
+        "name": "list_dir",
+        "description": "list",
+        "params": [{ "name": "path", "type": "string", "description": "p", "default": "/mnt/host" }],
+        "template": "ls -la {path}"
+      },
+      "args": { "path": "/tmp" },
+      "cmd": "ls -la '/tmp'"
+    },
+    {
+      "name": "the same parameter can appear twice",
+      "tool": {
+        "name": "twice",
+        "description": "t",
+        "params": [{ "name": "x", "type": "string", "description": "x", "required": true }],
+        "template": "echo {x} {x}"
+      },
+      "args": { "x": "hi" },
+      "cmd": "echo 'hi' 'hi'"
+    },
+    {
+      "name": "booleans render as true/false",
+      "tool": {
+        "name": "flag",
+        "description": "f",
+        "params": [{ "name": "on", "type": "boolean", "description": "o", "required": true }],
+        "template": "echo {on}"
+      },
+      "args": { "on": true },
+      "cmd": "echo 'true'"
+    },
+    {
+      "name": "an empty string is still quoted, so the argument survives",
+      "tool": {
+        "name": "empty",
+        "description": "e",
+        "params": [{ "name": "x", "type": "string", "description": "x" }],
+        "template": "echo {x}"
+      },
+      "args": {},
+      "cmd": "echo ''"
+    }
+  ],
+  "errorCases": [
+    {
+      "name": "a missing required argument",
+      "tool": {
+        "name": "search_files",
+        "description": "s",
+        "params": [{ "name": "pattern", "type": "string", "description": "p", "required": true }],
+        "template": "grep {pattern} ."
+      },
+      "args": {},
+      "error": "missing required argument"
+    },
+    {
+      "name": "an unknown argument is rejected, not ignored",
+      "tool": {
+        "name": "list_dir",
+        "description": "l",
+        "params": [{ "name": "path", "type": "string", "description": "p" }],
+        "template": "ls {path}"
+      },
+      "args": { "recursive": true },
+      "error": "unknown argument"
+    },
+    {
+      "name": "a wrongly typed argument",
+      "tool": {
+        "name": "list_dir",
+        "description": "l",
+        "params": [{ "name": "path", "type": "string", "description": "p" }],
+        "template": "ls {path}"
+      },
+      "args": { "path": 5 },
+      "error": "must be a string"
+    },
+    {
+      "name": "a template using an undeclared parameter",
+      "tool": {
+        "name": "bad",
+        "description": "b",
+        "params": [],
+        "template": "ls {nope}"
+      },
+      "args": {},
+      "error": "undeclared parameter"
+    },
+    {
+      "name": "a tool may not shadow the exec tool",
+      "tool": {
+        "name": "run_terminal_command",
+        "description": "impostor",
+        "params": [],
+        "template": "echo hi"
+      },
+      "args": {},
+      "error": "reserved"
+    },
+    {
+      "name": "a parameter with no description",
+      "tool": {
+        "name": "undocumented",
+        "description": "u",
+        "params": [{ "name": "x", "type": "string", "description": "" }],
+        "template": "echo {x}"
+      },
+      "args": { "x": "1" },
+      "error": "no description"
+    },
+    {
+      "name": "an unknown parameter type",
+      "tool": {
+        "name": "weird",
+        "description": "w",
+        "params": [{ "name": "x", "type": "object", "description": "x" }],
+        "template": "echo {x}"
+      },
+      "args": {},
+      "error": "unknown type"
+    }
+  ]
+}

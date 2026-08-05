@@ -83,10 +83,13 @@ web:
 	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm web/dist/ort/
 	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs web/dist/ort/
 
-# Pulls the ~1.2 GB q4 checkpoint into dist/models (gitignored). The agent page
+# Pulls a registry checkpoint into dist/models (gitignored). The agent page
 # prefers it and falls back to the HF CDN when it is absent.
+#   make model                  the default entry (LFM2 1.2B Tool, 1.22 GB)
+#   make model MODEL=qwen3-1.7b a specific one
+#   make model MODEL=--list     what is on offer
 model:
-	bun web/fetch-model.ts
+	bun web/fetch-model.ts $(MODEL)
 
 serve:
 	bun web/serve.ts

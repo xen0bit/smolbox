@@ -4,7 +4,7 @@ A full x86_64 Linux VM that runs anywhere WebAssembly runs — including a brows
 a folder from your machine as a read-only part of its filesystem. A small on-device LLM drives it by
 issuing terminal commands.
 
-> **Status: component 1 is complete (M0–M7), and component 2 has its first working spike (M8).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
+> **Status: component 1 is complete (M0–M7); component 2 is working (M8–M11).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
 > 108 MB) and boots to the guest agent's ready banner under wazero in ~3.2 s and **in a browser in
 > ~2.6 s**, with the read-only host mount working under wazero and in the browser via the sync FS
 > bridge (a folder picked with the File System Access API is mounted read-only at `/mnt/host`). The
@@ -95,7 +95,8 @@ resp, err := session.Exec(ctx, protocol.Request{
   directory, reading a file, searching a tree — those are commands, not more tools.
 - The model never chooses the *operation*: `op` is not in the tool's schema, and a call that sets it
   is rejected before the session sees it. A model cannot talk its own sandbox into `shutdown`.
-- A WebGPU model in the page calls it, reads the folder the user picked, and reports back. **Working
+- A WebGPU model in the page calls it, reads the folder the user picked, and reports back, through a
+  chat interface with a multi-turn loop, a model picker, and tools you can add yourself. **Working
   as of M8**: `LFM2-1.2B-Tool` on WebGPU via transformers.js, in its own worker, loading in ~4 s and
   answering in ~3.6 s end to end. The model emits its native Pythonic call syntax, which the page
   parses alongside JSON.

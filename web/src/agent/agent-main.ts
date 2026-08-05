@@ -1,74 +1,37 @@
-// The M8 spike page: a WebGPU model drives the VM through the M7 tool surface.
+// The agent page: a local model on WebGPU driving the VM through the M7 tool
+// surface, with a chat interface around it.
 //
-// Deliberately not a chat UI. One prompt in, one tool call executed against a
-// real Session, the tool result fed back, one final answer out — the same
-// prove-the-mechanism-first shape M4 used for the preopen spike. Everything
-// below the model is component 1, reused unchanged: the VM worker, Session,
-// MountHost, and callTool/renderResult from the generated tool surface.
+// Everything below the model is component 1, reused unchanged: the VM worker,
+// Session, MountHost, and callTool/renderResult from the generated tool surface.
+// The loop itself lives in conversation.ts, which knows nothing about the DOM or
+// about WebGPU — that is what lets CI drive it against FakeModelClient.
 
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
 import { getOpfsDirectoryHandle, pickDirectoryHandle } from "../mount.ts";
-import { callTool, openaiTool, toolName } from "../tool.ts";
-import type { ChatMessage, ModelRequest, ModelResponse } from "./messages.ts";
-import { type ParsedCall, parseTurn } from "./parse.ts";
+import { toolName } from "../tool.ts";
+import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
+import { dialectFor } from "./dialects/index.ts";
+import { DEFAULT_MODEL_KEY, type Dtype, modelFor, models, pickDtype } from "./models.ts";
+import { FakeModelClient, type FakeScript } from "./fake-model.ts";
+import type { ModelClient } from "./model-client.ts";
+import { WorkerModelClient } from "./model-client.ts";
+import type { ParsedCall } from "./parse.ts";
+import { ToolRegistry } from "./tool-registry.ts";
+import type { TemplateTool } from "./user-tools.ts";
 
-const MODEL_PROBE = "/models/onnx-community/LFM2-1.2B-Tool-ONNX/config.json";
+let currentModelKey = DEFAULT_MODEL_KEY;
 
-// "Output function calls as JSON" is load-bearing: without it LFM2 emits
-// Pythonic calls, which parse.ts reports rather than tries to interpret.
+const probeFor = (repo: string) => `/models/${repo}/config.json`;
+
 const SYSTEM_PROMPT = `You are smolbox, an assistant with access to a Linux sandbox.
 
-The user's folder is mounted read-only at /mnt/host. Use the ${toolName} tool to inspect it before answering. Output function calls as JSON.`;
-
-const DEFAULT_PROMPT = "What files are in /mnt/host? Use the tool to check, then tell me.";
-
-export interface ToolStep {
-  call: ParsedCall;
-  rendered: string;
-  exitCode: number;
-}
-
-export interface Transcript {
-  prompt: string;
-  rawTurn: string;
-  steps: ToolStep[];
-  finalText: string;
-  totalMs: number;
-}
-
-export interface SmolagentHandle {
-  webgpu(): Promise<{ available: boolean; adapter: boolean; info?: unknown }>;
-  loadModel(local?: boolean): Promise<{ source: string; loadMs: number }>;
-  bootVm(timeoutMs?: number): Promise<Caps>;
-  setMount(handle: DirectoryHandleLike | null, links?: Record<string, string>): void;
-  run(prompt?: string, system?: string): Promise<Transcript>;
-  /** Raw generation, no tool execution — used to probe prompt wording. */
-  rawGenerate(system: string, prompt: string): Promise<string>;
-  close(timeoutMs?: number): Promise<void>;
-}
+The user's folder is mounted read-only at /mnt/host. Use the ${toolName} tool to inspect it before answering, then answer from what the tool returned.`;
 
 const vmWorker = new Worker("/worker.js", { type: "module" });
 const session = new Session(vmWorker);
 const mount = new MountHost();
-const modelWorker = new Worker("./model-worker.js", { type: "module" });
-
-const logEl = document.getElementById("log");
-const statusEl = document.getElementById("status");
-
-function log(line: string): void {
-  console.log("[smolagent]", line);
-  if (logEl) {
-    logEl.textContent += `${line}\n`;
-  }
-}
-
-function setStatus(text: string): void {
-  if (statusEl) {
-    statusEl.textContent = text;
-  }
-}
 
 vmWorker.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as { type?: string; message?: string; sab?: SharedArrayBuffer };
@@ -81,109 +44,231 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
     case "fsreq":
       mount.serve();
       break;
-    case "error":
-      if (msg.message) {
-        log(`vm error: ${msg.message}`);
-      }
-      break;
   }
 });
 
-// The worker answers one request at a time and the page drives it in strict
-// sequence, so a single pending waiter is enough.
-let pending: { resolve(r: ModelResponse): void; reject(e: Error): void; want: ModelResponse["type"] } | null = null;
+// ---------------------------------------------------------------- DOM helpers
 
-modelWorker.addEventListener("message", (ev: MessageEvent<ModelResponse>) => {
-  const msg = ev.data;
-  switch (msg.type) {
-    case "log":
-      log(`model: ${msg.message}`);
-      return;
-    case "progress":
-      setStatus(`loading ${msg.file}: ${msg.pct}%`);
-      return;
-    case "error":
-      pending?.reject(new Error(msg.message));
-      pending = null;
-      return;
-    default:
-      if (pending && pending.want === msg.type) {
-        pending.resolve(msg);
-        pending = null;
-      }
+const el = (id: string) => document.getElementById(id);
+const logEl = el("log");
+const statusEl = el("status");
+const promptEl = el("prompt");
+const sendEl = el("send");
+const stopEl = el("stop");
+const startEl = el("start");
+const pickEl = el("pick");
+
+function setStatus(text: string): void {
+  console.log("[smolagent]", text);
+  if (statusEl) {
+    statusEl.textContent = text;
   }
-});
-
-function ask<T extends ModelResponse["type"]>(
-  req: ModelRequest,
-  want: T,
-): Promise<Extract<ModelResponse, { type: T }>> {
-  return new Promise((resolve, reject) => {
-    pending = { resolve: resolve as (r: ModelResponse) => void, reject, want };
-    modelWorker.postMessage(req);
-  });
 }
 
-async function haveLocalWeights(): Promise<boolean> {
+function bubble(cls: string, who: string): Element | null {
+  if (!logEl) {
+    return null;
+  }
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${cls}`;
+  const label = document.createElement("span");
+  label.className = "who";
+  label.textContent = who;
+  const body = document.createElement("div");
+  body.className = "body";
+  wrap.appendChild(label);
+  wrap.appendChild(body);
+  logEl.appendChild(wrap);
+  logEl.scrollTop = logEl.scrollHeight;
+  return body;
+}
+
+// ------------------------------------------------------------ the model side
+
+const params = new URLSearchParams(location.search);
+let modelClient: ModelClient = new WorkerModelClient(
+  new Worker("./model-worker.js", { type: "module" }),
+  (line) => console.log("[model]", line),
+  (file, pct) => setStatus(`loading ${file}: ${pct}%`),
+);
+
+const TOOLS_KEY = "smolbox.tools";
+const registry = new ToolRegistry();
+try {
+  const saved = localStorage.getItem(TOOLS_KEY);
+  if (saved) {
+    registry.load(JSON.parse(saved));
+  }
+} catch (err) {
+  console.warn("[smolagent] ignoring saved tools:", err);
+}
+
+function persistTools(): void {
   try {
-    return (await fetch(MODEL_PROBE, { method: "HEAD" })).ok;
+    localStorage.setItem(TOOLS_KEY, JSON.stringify(registry.snapshot()));
+  } catch {
+    // Private-mode storage failures must not take the page down.
+  }
+  convo.configure({ tools: registry.definitions() });
+  renderToolList();
+}
+
+const runner: ToolRunner = {
+  run: async (call: ParsedCall, opts) => {
+    const out = await registry.run(session, call, { maxOutput: opts.maxOutput });
+    return { text: out.text, exitCode: out.response.exit_code, request: out.request };
+  },
+};
+
+let events: AgentEvent[] = [];
+let streaming: Element | null = null;
+
+const convo = new Conversation(
+  {
+    systemPrompt: SYSTEM_PROMPT,
+    tools: registry.definitions(),
+    dialect: dialectFor(modelFor(DEFAULT_MODEL_KEY).dialect),
+    ...DEFAULTS,
+  },
+  {
+    load: (local, opts) => modelClient.load(local, opts),
+    generate: (r) => modelClient.generate(r),
+    cancel: () => modelClient.cancel(),
+  },
+  runner,
+  onEvent,
+);
+
+function onEvent(ev: AgentEvent): void {
+  events.push(ev);
+  switch (ev.kind) {
+    case "user":
+      bubble("user", "you")!.textContent = ev.text;
+      streaming = null;
+      break;
+    case "token": {
+      // Prose streams live; a tool-call block is held back until it closes,
+      // because half a call rendered as text is noise, not progress.
+      if (!streaming) {
+        streaming = bubble("assistant", "model");
+      }
+      if (streaming) {
+        const next = (streaming.textContent ?? "") + ev.text;
+        streaming.textContent = visiblePart(next);
+        logEl && (logEl.scrollTop = logEl.scrollHeight);
+      }
+      break;
+    }
+    case "assistant":
+      if (streaming) {
+        streaming.textContent = ev.text;
+      } else if (ev.text) {
+        bubble("assistant", "model")!.textContent = ev.text;
+      }
+      streaming = null;
+      break;
+    case "tool-start":
+      streaming = null;
+      break;
+    case "tool-end": {
+      const body = bubble("tool", `tool · exit ${ev.exitCode}`);
+      if (body) {
+        const cmd = document.createElement("span");
+        cmd.className = "cmd";
+        cmd.textContent = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
+        const out = document.createElement("span");
+        out.textContent = ev.rendered;
+        body.appendChild(cmd);
+        body.appendChild(out);
+      }
+      break;
+    }
+    case "elided":
+      bubble("note", "context")!.textContent =
+        `elided ${ev.messages} older message(s) to stay within the history budget (now ~${ev.chars} chars)`;
+      break;
+    case "stopped":
+      bubble("note", "stopped")!.textContent =
+        ev.reason === "iteration-cap"
+          ? "stopped: hit the tool-call limit for this turn"
+          : "stopped by you";
+      streaming = null;
+      break;
+    case "error":
+      bubble("error", "error")!.textContent = ev.message;
+      streaming = null;
+      break;
+  }
+}
+
+const OPEN = "<|tool_call_start|>";
+
+// Everything from an unclosed tool-call marker onward is withheld.
+function visiblePart(raw: string): string {
+  const open = raw.lastIndexOf(OPEN);
+  if (open === -1) {
+    return stripMarkers(raw);
+  }
+  return stripMarkers(raw.slice(0, open));
+}
+
+function stripMarkers(s: string): string {
+  return s
+    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/g, "")
+    .replace(/<\|im_(start|end)\|>/g, "")
+    .replace(/<\|(start|end)oftext\|>/g, "");
+}
+
+// -------------------------------------------------------------- page plumbing
+
+async function haveLocalWeights(repo: string): Promise<boolean> {
+  try {
+    return (await fetch(probeFor(repo), { method: "HEAD" })).ok;
   } catch {
     return false;
   }
 }
 
-async function runTranscript(prompt: string, system: string = SYSTEM_PROMPT): Promise<Transcript> {
-  const started = performance.now();
-  const messages: ChatMessage[] = [
-    { role: "system", content: system },
-    { role: "user", content: prompt },
-  ];
-  const tools = [openaiTool()];
+// The dtype is a runtime question, not a constant: f16 variants need shader-f16
+// on the adapter, which headless Chromium lacks and a desktop browser usually
+// has (PLAN §2.11.24).
+async function adapterFeatures(): Promise<ReadonlySet<string>> {
+  const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+  const adapter = (await gpu?.requestAdapter()) as { features?: Iterable<string> } | undefined;
+  return new Set(adapter?.features ? [...adapter.features] : []);
+}
 
-  log(`> ${prompt}`);
-  const first = await ask({ type: "generate", messages, tools }, "generated");
-  log(`model turn (${first.tokens} tokens, ${first.ms}ms):\n${first.text}`);
+let busy = false;
 
-  const turn = parseTurn(first.text);
-  const steps: ToolStep[] = [];
-
-  for (const call of turn.calls) {
-    if (call.name !== toolName) {
-      throw new Error(`model called an unknown tool: ${call.name}`);
-    }
-    // callTool is the M7 path, untouched: it rejects `op`, rejects unknown
-    // fields, and renders the result exactly as the mock caller asserts it.
-    const result = await callTool(session, call.args);
-    log(`tool ${JSON.stringify(call.args)} ->\n${result.text}`);
-    steps.push({ call, rendered: result.text, exitCode: result.response.exit_code });
+function setBusy(on: boolean): void {
+  busy = on;
+  if (sendEl) {
+    sendEl.disabled = on;
   }
-
-  if (steps.length === 0) {
-    return {
-      prompt,
-      rawTurn: first.text,
-      steps,
-      finalText: turn.text,
-      totalMs: Math.round(performance.now() - started),
-    };
+  if (stopEl) {
+    stopEl.disabled = !on;
   }
+}
 
-  messages.push({ role: "assistant", content: first.text });
-  for (const step of steps) {
-    messages.push({ role: "tool", content: step.rendered });
-  }
-
-  const second = await ask({ type: "generate", messages, tools }, "generated");
-  const final = parseTurn(second.text);
-  log(`model answer (${second.tokens} tokens, ${second.ms}ms):\n${final.text}`);
-
-  return {
-    prompt,
-    rawTurn: first.text,
-    steps,
-    finalText: final.text,
-    totalMs: Math.round(performance.now() - started),
-  };
+export interface SmolagentHandle {
+  webgpu(): Promise<{ available: boolean; adapter: boolean; info?: unknown }>;
+  /** Swaps in a scripted model. Used by CI, which has no GPU. */
+  useFake(scripts: FakeScript[]): void;
+  setModel(key: string): void;
+  loadModel(local?: boolean): Promise<{ source: string; loadMs: number }>;
+  bootVm(timeoutMs?: number): Promise<Caps>;
+  setMount(handle: DirectoryHandleLike | null, links?: Record<string, string>): void;
+  send(text: string): Promise<AgentEvent[]>;
+  cancel(): void;
+  configure(patch: Record<string, number>): void;
+  tools(): { name: string; source: string; enabled: boolean }[];
+  addTool(tool: TemplateTool): void;
+  enableTool(name: string, on: boolean): void;
+  setToolDefaults(d: { timeout_ms?: number; max_output?: number; cwd?: string }): void;
+  options(): Record<string, unknown>;
+  messages(): { role: string; content: string }[];
+  reset(): void;
+  close(timeoutMs?: number): Promise<void>;
 }
 
 const handle: SmolagentHandle = {
@@ -195,87 +280,288 @@ const handle: SmolagentHandle = {
     const adapter = await gpu.requestAdapter();
     return { available: true, adapter: Boolean(adapter), info: (adapter as { info?: unknown })?.info };
   },
+  useFake: (scripts: FakeScript[]) => {
+    modelClient = new FakeModelClient(scripts);
+    setStatus("model: scripted fake");
+  },
   loadModel: async (local?: boolean) => {
-    const useLocal = local ?? (await haveLocalWeights());
-    log(`loading model (${useLocal ? "local dist/models" : "hugging face hub"})…`);
-    const ready = await ask({ type: "load", local: useLocal }, "ready");
-    log(`model ready from ${ready.source} in ${ready.loadMs}ms`);
-    setStatus(`model ready (${ready.source})`);
-    return { source: ready.source, loadMs: ready.loadMs };
+    const entry = modelFor(currentModelKey);
+    const dialect = dialectFor(entry.dialect);
+    convo.configure({ dialect });
+
+    const dtype = pickDtype(entry, await adapterFeatures());
+    if (!dtype) {
+      throw new Error(
+        `${entry.label}: none of its quantizations (${entry.dtypes.join(", ")}) run on this adapter`,
+      );
+    }
+    if (!dialect.verified) {
+      bubble("note", "unverified dialect")!.textContent =
+        `${dialect.label}: ${dialect.note ?? "never run against the real model"}`;
+    }
+
+    const useLocal = local ?? (await haveLocalWeights(entry.repo));
+    setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
+    const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
+    setStatus(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
+    return ready;
+  },
+  setModel: (key: string) => {
+    currentModelKey = modelFor(key).key;
+    convo.configure({ dialect: dialectFor(modelFor(key).dialect) });
+    setStatus(`model: ${modelFor(key).label} (not loaded yet)`);
   },
   bootVm: async (timeoutMs?: number) => {
+    setStatus("booting the VM…");
     const caps = await session.boot(timeoutMs);
-    log(`vm ready (agent v${caps.version})`);
+    setStatus(`vm ready (agent v${caps.version})`);
     return caps;
   },
   setMount: (h: DirectoryHandleLike | null, links?: Record<string, string>) => {
     mount.remount(h, links);
-    log(h ? "mount: folder attached" : "mount: none");
+    setStatus(h ? "folder mounted at /mnt/host" : "no folder mounted");
   },
-  run: (prompt?: string, system?: string) => runTranscript(prompt ?? DEFAULT_PROMPT, system),
-  rawGenerate: async (system: string, prompt: string) => {
-    const r = await ask(
-      {
-        type: "generate",
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: prompt },
-        ],
-        tools: [openaiTool()],
-      },
-      "generated",
-    );
-    return r.text;
+  send: async (text: string) => {
+    events = [];
+    setBusy(true);
+    try {
+      await convo.send(text);
+    } finally {
+      setBusy(false);
+    }
+    return events;
+  },
+  cancel: () => convo.cancel(),
+  configure: (patch) => convo.configure(patch as never),
+  tools: () => registry.list().map((t) => ({ name: t.name, source: t.source, enabled: t.enabled })),
+  addTool: (tool: TemplateTool) => {
+    registry.addUserTool(tool);
+    persistTools();
+  },
+  enableTool: (name: string, on: boolean) => {
+    registry.setEnabled(name, on);
+    persistTools();
+  },
+  setToolDefaults: (d) => {
+    registry.setDefaults(d);
+    persistTools();
+  },
+  options: () => convo.options() as unknown as Record<string, unknown>,
+  messages: () => convo.messages(),
+  reset: () => {
+    convo.reset();
+    logEl?.replaceChildren();
   },
   close: (timeoutMs?: number) => session.close(timeoutMs),
 };
 (globalThis as unknown as Record<string, unknown>).__smolagent = handle;
 
-if (!crossOriginIsolated) {
-  setStatus("FAIL: cross-origin isolation required (SharedArrayBuffer). Serve with COOP/COEP headers.");
+if (params.get("model") === "fake") {
+  handle.useFake(DEMO_SCRIPTS());
 }
 
-const runButton = document.getElementById("run");
-const pickButton = document.getElementById("pick");
+if (!crossOriginIsolated) {
+  setStatus("FAIL: cross-origin isolation required. Serve with COOP/COEP headers.");
+}
 
-if (pickButton) {
-  pickButton.addEventListener("click", async () => {
-    try {
-      handle.setMount(await pickDirectoryHandle());
-    } catch (err) {
-      log(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
+// A tiny built-in script so the page is explorable without a GPU; CI injects
+// its own through useFake().
+function DEMO_SCRIPTS(): FakeScript[] {
+  return [
+    {
+      name: "demo",
+      turns: [
+        { text: `<|tool_call_start|>[${toolName}(cmd="ls -la /mnt/host")]<|tool_call_end|>` },
+        { text: "That is what the folder contains." },
+      ],
+    },
+  ];
+}
+
+// Reflect the loop's defaults into the settings inputs, and read them back.
+const optionInputs: Record<string, string> = {
+  "opt-iterations": "maxIterations",
+  "opt-maxoutput": "perCallMaxOutput",
+  "opt-history": "historyBudgetChars",
+  "opt-tokens": "maxNewTokens",
+};
+for (const [id, key] of Object.entries(optionInputs)) {
+  const input = el(id);
+  if (!input) {
+    continue;
+  }
+  input.value = String((convo.options() as unknown as Record<string, number>)[key]);
+  input.addEventListener("change", () => {
+    const n = Number(input.value);
+    if (Number.isFinite(n) && n > 0) {
+      convo.configure({ [key]: n } as never);
     }
   });
 }
 
-let running = false;
-if (runButton) {
-  runButton.addEventListener("click", async () => {
-    if (running) {
-      return;
-    }
-    running = true;
-    try {
+el("composer")?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault?.();
+    void submit();
+  }
+});
+sendEl?.addEventListener("click", (ev) => {
+  ev.preventDefault?.();
+  void submit();
+});
+stopEl?.addEventListener("click", () => handle.cancel());
+
+async function submit(): Promise<void> {
+  const text = promptEl?.value?.trim();
+  if (!text || busy) {
+    return;
+  }
+  if (promptEl) {
+    promptEl.value = "";
+  }
+  try {
+    await handle.send(text);
+    setStatus("ready");
+  } catch (err) {
+    setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+startEl?.addEventListener("click", async () => {
+  if (busy) {
+    return;
+  }
+  setBusy(true);
+  try {
+    if (params.get("model") !== "fake") {
       const gpu = await handle.webgpu();
       if (!gpu.adapter) {
-        setStatus("FAIL: no WebGPU adapter available in this browser");
+        setStatus("FAIL: no WebGPU adapter in this browser");
         return;
       }
-      if (!mount.mounted()) {
-        // Nothing picked yet: OPFS is the no-dialog fallback, same as the VM page.
-        handle.setMount(await getOpfsDirectoryHandle());
-      }
-      await handle.bootVm();
-      await handle.loadModel();
-      setStatus("running…");
-      const t = await handle.run();
-      setStatus(`done in ${t.totalMs}ms (${t.steps.length} tool call(s))`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setStatus(`error: ${message}`);
-      log(`error: ${message}`);
-    } finally {
-      running = false;
     }
-  });
+    if (!mount.mounted()) {
+      handle.setMount(await getOpfsDirectoryHandle());
+    }
+    await handle.bootVm();
+    await handle.loadModel();
+    setStatus("ready — ask something");
+  } catch (err) {
+    setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    setBusy(false);
+  }
+});
+
+pickEl?.addEventListener("click", async () => {
+  try {
+    handle.setMount(await pickDirectoryHandle());
+  } catch (err) {
+    setStatus(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+setBusy(false);
+
+// ------------------------------------------------------------------ tools UI
+
+const toolListEl = el("tool-list");
+const toolJsonEl = el("tool-json");
+const toolMsgEl = el("tool-msg");
+
+function toolMessage(text: string): void {
+  if (toolMsgEl) {
+    toolMsgEl.textContent = text;
+  }
 }
+
+function renderToolList(): void {
+  if (!toolListEl) {
+    return;
+  }
+  const rows: Element[] = [];
+  for (const t of registry.list()) {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+
+    const box = document.createElement("input");
+    box.setAttribute("type", "checkbox");
+    if (t.enabled) {
+      box.setAttribute("checked", "checked");
+    }
+    box.addEventListener("change", () => {
+      registry.setEnabled(t.name, !t.enabled);
+      persistTools();
+    });
+
+    const label = document.createElement("span");
+    label.textContent = t.name;
+
+    const src = document.createElement("span");
+    src.className = "src";
+    src.textContent = t.source === "exec" ? "built in · the exec surface" : t.source;
+
+    row.appendChild(box);
+    row.appendChild(label);
+    row.appendChild(src);
+
+    if (t.source === "user") {
+      const del = document.createElement("button");
+      del.textContent = "remove";
+      del.addEventListener("click", () => {
+        registry.removeUserTool(t.name);
+        persistTools();
+      });
+      row.appendChild(del);
+    }
+    rows.push(row);
+  }
+  toolListEl.replaceChildren(...rows);
+}
+
+el("tool-add")?.addEventListener("click", () => {
+  try {
+    const parsed = JSON.parse(toolJsonEl?.value ?? "") as TemplateTool;
+    registry.addUserTool(parsed);
+    persistTools();
+    toolMessage(`added ${parsed.name}`);
+  } catch (err) {
+    toolMessage(err instanceof Error ? err.message : String(err));
+  }
+});
+
+el("tool-export")?.addEventListener("click", () => {
+  if (toolJsonEl) {
+    toolJsonEl.value = JSON.stringify(registry.snapshot(), null, 2);
+  }
+  toolMessage("exported the whole tool state into the box");
+});
+
+el("tool-import")?.addEventListener("click", () => {
+  try {
+    registry.load(JSON.parse(toolJsonEl?.value ?? ""));
+    persistTools();
+    toolMessage("imported");
+  } catch (err) {
+    toolMessage(err instanceof Error ? err.message : String(err));
+  }
+});
+
+renderToolList();
+
+// Populate the model dropdown from the registry, marking unverified dialects
+// so an odd answer reads as "we never checked this family" rather than a bug.
+const modelSelect = el("model");
+if (modelSelect) {
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.key;
+    const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
+    opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
+    modelSelect.appendChild(opt);
+  }
+  modelSelect.value = currentModelKey;
+  modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
+}
+
+setBusy(false);

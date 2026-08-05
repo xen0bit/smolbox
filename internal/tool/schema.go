@@ -186,8 +186,21 @@ func objectSchema(t reflect.Type, title string, docs map[string]string) (*Schema
 	return s, nil
 }
 
+// nestedSchemas holds the schemas of struct types that appear as fields of
+// other structs. Descriptions are hand-written per type (they are prompt text,
+// not Go docs), so a nested struct has to be built and registered explicitly
+// rather than reflected over blindly — the same rule that makes an
+// undocumented field a hard error applies one level down.
+var nestedSchemas = map[reflect.Type]*Schema{}
+
 func fieldSchema(t reflect.Type) (*Schema, error) {
 	switch t.Kind() {
+	case reflect.Struct:
+		s, ok := nestedSchemas[t]
+		if !ok {
+			return nil, fmt.Errorf("no JSON Schema mapping for %s (register it in nestedSchemas)", t)
+		}
+		return s.embedded(), nil
 	case reflect.String:
 		return &Schema{Type: TypeSet{"string"}}, nil
 	case reflect.Bool:
@@ -217,6 +230,15 @@ func fieldSchema(t reflect.Type) (*Schema, error) {
 	default:
 		return nil, fmt.Errorf("no JSON Schema mapping for %s", t)
 	}
+}
+
+// embedded copies a schema for use as a field: the dialect and title belong to
+// a document root, not to a property inside one.
+func (s *Schema) embedded() *Schema {
+	c := *s
+	c.Dialect = ""
+	c.Title = ""
+	return &c
 }
 
 // isNilable reports whether a Go value of this type can marshal to JSON null.

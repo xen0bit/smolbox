@@ -3,49 +3,261 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>smolbox — agent spike</title>
+    <title>smolbox — agent</title>
     <style>
+      :root {
+        --fg: #1f2328;
+        --muted: #57606a;
+        --line: #d0d7de;
+        --panel: #f6f8fa;
+        --accent: #0969da;
+      }
+      * {
+        box-sizing: border-box;
+      }
       body {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        margin: 2rem auto;
-        max-width: 60rem;
-        padding: 0 1rem;
-        color: #1f2328;
+        margin: 0 auto;
+        max-width: 56rem;
+        padding: 1.5rem 1rem 2rem;
+        color: var(--fg);
+        line-height: 1.5;
       }
-      button {
-        font: inherit;
-        padding: 0.4rem 0.9rem;
-        cursor: pointer;
+      h1 {
+        font-size: 1.1rem;
+        margin: 0;
       }
-      pre {
-        background: #f6f8fa;
-        border: 1px solid #d0d7de;
-        padding: 0.75rem;
-        min-height: 2rem;
-        white-space: pre-wrap;
+      header {
+        display: flex;
+        align-items: baseline;
+        gap: 1rem;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 0.75rem;
+        margin-bottom: 1rem;
       }
       #status {
-        color: #57606a;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+        padding: 0.35rem 0.7rem;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: #fff;
+        color: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #log {
+        min-height: 18rem;
+        max-height: 60vh;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.75rem;
+        margin-bottom: 0.75rem;
+      }
+      .msg {
+        margin-bottom: 0.9rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .msg .who {
+        display: block;
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin-bottom: 0.2rem;
+      }
+      .msg.user .body {
+        border-left: 3px solid var(--accent);
+        padding-left: 0.6rem;
+      }
+      .msg.tool .body,
+      .msg.note .body,
+      .msg.error .body {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.5rem 0.6rem;
+        font-size: 0.85rem;
+      }
+      .msg.error .body {
+        border-color: #d1242f;
+        color: #d1242f;
+      }
+      .msg.note .body {
+        color: var(--muted);
+      }
+      .cmd {
+        display: block;
+        font-weight: bold;
+        margin-bottom: 0.3rem;
+      }
+      form {
+        display: flex;
+        gap: 0.5rem;
+      }
+      #prompt {
+        flex: 1;
+      }
+      #settings {
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+        font-size: 0.8rem;
+        color: var(--muted);
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid var(--line);
+      }
+      #settings label {
+        display: flex;
+        gap: 0.35rem;
+        align-items: center;
+      }
+      #settings input {
+        width: 6rem;
+        padding: 0.15rem 0.35rem;
+      }
+      #tools-panel {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.5rem 0.75rem;
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+      }
+      #tools-panel summary {
+        cursor: pointer;
+        font-weight: bold;
+      }
+      #tools-panel .hint {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      #tools-panel .block {
+        display: block;
+        margin: 0.5rem 0;
+        color: var(--muted);
+      }
+      #tools-panel textarea {
+        display: block;
+        width: 100%;
+        font: inherit;
+        font-size: 0.8rem;
+        margin-top: 0.25rem;
+        padding: 0.4rem;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--fg);
+      }
+      #tools-panel .row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .tool-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: baseline;
+        padding: 0.2rem 0;
+      }
+      .tool-row .src {
+        color: var(--muted);
+        font-size: 0.75rem;
+      }
+      #tool-msg {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6edf3;
+          --muted: #8b949e;
+          --line: #30363d;
+          --panel: #161b22;
+          --accent: #4493f8;
+        }
+        body {
+          background: #0d1117;
+        }
+        button,
+        input,
+        select {
+          background: #0d1117;
+        }
       }
     </style>
   </head>
   <body>
-    <main>
-      <h1>smolbox agent spike</h1>
-      <p id="status">idle</p>
-      <button id="run" type="button">run the transcript</button>
-      <button id="pick" type="button">choose a folder to mount at /mnt/host</button>
-      <pre id="log"></pre>
-      <p>
-        A local model on WebGPU drives the VM through the
-        <code>run_terminal_command</code> tool. One hardcoded prompt, one tool
-        call against a real session, one answer — this is the M8 spike, not a
-        chat UI. Weights load from <code>dist/models</code> when
-        <code>make model</code> has been run, and from the Hugging Face hub
-        otherwise (~1.2&nbsp;GB on first load).
+    <header>
+      <h1>smolbox agent</h1>
+      <span id="status">idle</span>
+      <span style="flex: 1"></span>
+      <select id="model" title="which checkpoint to load"></select>
+      <button id="start" type="button">start</button>
+      <button id="pick" type="button">pick folder</button>
+    </header>
+
+    <div id="log"></div>
+
+    <form id="composer">
+      <input id="prompt" type="text" placeholder="ask about the mounted folder…" autocomplete="off" />
+      <button id="send" type="submit">send</button>
+      <button id="stop" type="button" disabled>stop</button>
+    </form>
+
+    <details id="tools-panel">
+      <summary>tools</summary>
+      <p class="hint">
+        Each tool you expose is prompt text the model re-reads every turn —
+        <code>run_terminal_command</code> alone is ~2.3&nbsp;KB — so narrow tools
+        are off by default. Whether they help a small model is an open question.
       </p>
-      <p>The VM-only page is at <a href="/">/</a>.</p>
-    </main>
+      <div id="tool-list"></div>
+      <label class="block">custom tool (JSON)
+        <textarea id="tool-json" rows="7" spellcheck="false" placeholder='{
+  "name": "find_todo",
+  "description": "Find TODO comments in the folder.",
+  "params": [{"name": "path", "type": "string", "description": "Where to look", "default": "/mnt/host"}],
+  "template": "grep -rn TODO {path}"
+}'></textarea>
+      </label>
+      <div class="row">
+        <button id="tool-add" type="button">add / replace</button>
+        <button id="tool-export" type="button">export</button>
+        <button id="tool-import" type="button">import from box</button>
+        <span id="tool-msg"></span>
+      </div>
+    </details>
+
+    <div id="settings">
+      <label>max tool calls <input id="opt-iterations" type="number" min="1" max="20" /></label>
+      <label>output cap (bytes) <input id="opt-maxoutput" type="number" min="256" step="256" /></label>
+      <label>history budget (chars) <input id="opt-history" type="number" min="2000" step="1000" /></label>
+      <label>max new tokens <input id="opt-tokens" type="number" min="32" step="32" /></label>
+    </div>
+
+    <p style="font-size: 0.8rem; color: var(--muted)">
+      A local model on WebGPU drives a Linux VM through one
+      <code>run_terminal_command</code> tool. The folder you pick is mounted
+      read-only at <code>/mnt/host</code>. Weights load from
+      <code>dist/models</code> after <code>make model</code>, else from the
+      Hugging Face CDN. The VM-only page is at <a href="/">/</a>.
+    </p>
+
     <script type="module" src="./agent-main.js"></script>
   </body>
 </html>

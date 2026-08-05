@@ -1,0 +1,53 @@
+[
+  {
+    "name": "list_dir",
+    "description": "List the entries of a directory in the sandbox, one per line, with type and size.",
+    "params": [
+      {
+        "name": "path",
+        "type": "string",
+        "description": "Directory to list. Defaults to the mounted folder.",
+        "default": "/mnt/host"
+      }
+    ],
+    "template": "ls -la {path}"
+  },
+  {
+    "name": "read_file",
+    "description": "Read a file from the sandbox. Use this when you know the exact path; prefer search_files to find one.",
+    "params": [
+      {
+        "name": "path",
+        "type": "string",
+        "description": "Path of the file to read.",
+        "required": true
+      },
+      {
+        "name": "max_lines",
+        "type": "integer",
+        "description": "Stop after this many lines.",
+        "default": "200"
+      }
+    ],
+    "template": "head -n {max_lines:raw} -- {path}"
+  },
+  {
+    "name": "search_files",
+    "description": "Search the mounted folder for a text pattern, returning matching lines with their file and line number.",
+    "params": [
+      {
+        "name": "pattern",
+        "type": "string",
+        "description": "Text or basic regular expression to search for.",
+        "required": true
+      },
+      {
+        "name": "path",
+        "type": "string",
+        "description": "Directory to search. Defaults to the mounted folder.",
+        "default": "/mnt/host"
+      }
+    ],
+    "template": "grep -rn -- {pattern} {path}"
+  }
+]
