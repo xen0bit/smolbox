@@ -1054,3 +1054,92 @@ rides `make test-conformance` in the wasm job.
 9. **c2w's embedded Dockerfile needs the `--assets` workaround** (§2.11.1, §4.1). The builder image
    bakes the pinned `container2wasm@v0.8.4` checkout and every `make wasm`/`wasm-js` passes
    `--assets /assets`.
+
+---
+
+## 9. Component 2: the WebGPU agent
+
+§1–§8 built and closed out component 1 in full; PLAN.md's original scope statement (§1) explicitly
+left component 2, the on-device model, undesigned. This section opens it, in the same
+research-before-code spirit as §2: verify what the named model and library actually do before writing
+anything against them. **Status: design only — M8 below is scoped but not implemented.** No code in
+this repo changes as part of this section.
+
+### 9.1 Research notes (verified 2026-08-05)
+
+1. **Model: `onnx-community/LFM2-1.2B-Tool-ONNX`.** Liquid AI publishes a checkpoint,
+   `LiquidAI/LFM2-1.2B-Tool`, fine-tuned specifically for tool use, and `onnx-community` mirrors it
+   pre-converted for `transformers.js`. It ships several quantizations: `model.onnx` (fp32),
+   `model_fp16.onnx`, `model_q4.onnx` (q4 weights, quantized embedding — documented as the
+   WebGPU-appropriate variant), `model_q4f32.onnx` (q4 weights, fp32 embedding, for servers), and
+   `model_q8.onnx`. This is a better fit than the plain `LFM2-1.2B-ONNX` the README names, since
+   tool-calling accuracy is the entire point of component 2.
+   (<https://huggingface.co/onnx-community/LFM2-1.2B-Tool-ONNX> ·
+   <https://huggingface.co/LiquidAI/LFM2-1.2B-Tool>)
+2. **Runtime library: `@huggingface/transformers` (transformers.js v3+).** Installable with
+   `npm i @huggingface/transformers`, which works under bun like the rest of `web/`. WebGPU is enabled
+   by passing `device: 'webgpu'` (and here, `dtype: 'q4'`) to `pipeline(...)` or a raw
+   `AutoModelForCausalLM.from_pretrained(...)` call — a collaboration with ONNX Runtime Web. The actual
+   `LiquidAI/LFM2-WebGPU` Space named in README.md is itself built on transformers.js, so the library
+   choice the README implied is confirmed, not assumed.
+   (<https://huggingface.co/docs/transformers.js/guides/webgpu> ·
+   <https://github.com/huggingface/transformers.js> ·
+   <https://huggingface.co/spaces/LiquidAI/LFM2-WebGPU>)
+3. **The tool-call wire format is model-native, not OpenAI/Anthropic JSON.** LFM2 wraps tool
+   definitions in `<|tool_list_start|>...<|tool_list_end|>` and, by default, emits **Pythonic** calls
+   (`[fn_name(arg="value")]`) between `<|tool_call_start|>...<|tool_call_end|>`. Adding "Output function
+   calls as JSON" to the system prompt switches it to JSON call syntax — the form worth targeting, since
+   it lets the agent reuse the JSON shape `internal/tool` already generates (`docs/schema/*.json`)
+   instead of writing a Pythonic-call parser. Tool results are fed back as a `"tool"`-role message
+   containing the JSON-serialized result, wrapped `<|tool_response_start|>...<|tool_response_end|>`.
+   (<https://docs.liquid.ai/lfm/key-concepts/tool-use>)
+4. **The chat template probably renders the tool wrapping for us — needs a spike, not a guess.**
+   transformers.js applies the model's own Jinja chat template (via `@huggingface/jinja`), and other
+   transformers.js tool-calling examples pass a `tools` array straight into
+   `apply_chat_template(...)` rather than hand-formatting special tokens. Because
+   `LFM2-1.2B-Tool`'s `tokenizer_config.json` chat template already encodes the `<|tool_list_start|>`
+   wrapping, M8 should try passing the existing generated tool schema through `tools` first, and only
+   hand-roll the prompt if that doesn't hold up in practice.
+5. **Model weights are not part of `dist/`.** Unlike `smolbox.wasm` (built and embedded), the ONNX
+   checkpoint is fetched from the HF CDN at runtime and cached by transformers.js in the browser's
+   Cache Storage API. First load needs network access from the *page* — the sandbox's offline non-goal
+   is about the guest VM and is unaffected, but this is a real UX fact to record as a risk (§9.5), not
+   a blocker.
+6. **Browser support is broader than the mount's, but unverified for this project.** WebGPU has wider
+   cross-browser reach than the File System Access API the mount depends on (Chromium-only today), but
+   this repo hasn't measured it. M8 targets Chromium first, matching the existing COOP/COEP + picker
+   gating, and leaves cross-browser WebGPU support as an open question (§9.4) rather than a blocker.
+
+### 9.2 Decisions taken
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Model | `onnx-community/LFM2-1.2B-Tool-ONNX`, `dtype: 'q4'` | Purpose-built for tool use; q4 is the documented WebGPU-appropriate quantization |
+| Library | `@huggingface/transformers` (transformers.js v3+), `device: 'webgpu'` | Matches upstream's own `LiquidAI/LFM2-WebGPU` Space; npm-installable under bun |
+| Where inference runs | A **new dedicated Worker**, separate from the VM worker | The VM worker's `wasi.start()` blocks it for the VM's lifetime and cannot receive postMessage mid-run (§2.11.12); model inference must not share it. transformers.js calls are Promise-based, so this worker talks to the main thread over plain `postMessage` — no SAB/Atomics needed here, unlike the VM/fsbridge channels |
+| Tool schema → prompt | Pass the existing `web/src/tool.ts` `Definition`'s JSON schema through `apply_chat_template(..., { tools })`, with "Output function calls as JSON" in the system prompt | Reuses the generated, anti-drift-guarded schema instead of hand-building prompt text; falls back to manual `<|tool_list_start|>` formatting only if the template doesn't cooperate (verify in the spike) |
+| Tool execution | Existing `Session` / `tool.ts` `Call`/`renderResult` path, unchanged | Component 2 is a consumer of the proven M7 surface, not a reason to touch it |
+| M8 scope | One hardcoded prompt, one real tool call, transcript logged to console/page — **no chat UI** | Matches the M4 spike pattern: prove the mechanism before building UI or a multi-turn loop around it |
+
+### 9.3 Milestone M8
+
+| # | Deliverable | Done when |
+|---|---|---|
+| M8 | WebGPU tool-call spike: load `LFM2-1.2B-Tool-ONNX` via transformers.js in a dedicated worker, send one hardcoded prompt, get back one real `run_terminal_command` call, execute it against a live `Session`, log the full transcript | A single manual/scripted run in Chromium shows: model loads on WebGPU, emits a JSON tool call parsed without error, the call reaches a real VM session and returns real output, and the model's follow-up text (after the tool result is fed back) is logged — no chat UI required |
+
+### 9.4 Open questions for M9+ (not designed yet)
+
+- Multi-turn loop and conversation-history management.
+- Chat UI shape — what a person actually sees and how they intervene.
+- How the existing `setMount` picker flow hands off to the agent (does picking a folder start a
+  session automatically, or stay a manual step?).
+- Model-swap/versioning story — pinning a checkpoint revision, handling a model update.
+- Whether the dedicated-worker split (§9.2) holds up once inference needs to interleave with streamed
+  VM output, rather than the one-shot request/response shape M8 tests.
+
+### 9.5 Risks (component 2)
+
+10. **Model weights require a live network fetch on first load.** Component 1 is fully offline once
+    `dist/smolbox.wasm` is built; component 2 is not — the ONNX checkpoint comes from the HF CDN at
+    runtime (§9.1.5). Browser Cache Storage makes repeat loads free, but the first load in any given
+    browser profile needs the internet, and that should be surfaced in the UI, not silently assumed.
