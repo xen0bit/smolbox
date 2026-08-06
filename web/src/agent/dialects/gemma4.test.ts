@@ -32,12 +32,41 @@ describe("gemma4 call grammar", () => {
     expect(turn.calls[0]!.args).toEqual({ flag: true, off: false, env: { PATH: "/bin" } });
   });
 
+  // What onnx-community/gemma-4-E2B-it-ONNX at q4 actually emitted on WebGPU,
+  // verbatim, for "List the files in /mnt/host using the tool." This is what
+  // `verified: true` on this dialect asserts the existence of.
+  //
+  // Note the trailing <|tool_response>: it is a STOP token for this checkpoint
+  // (generation_config eos_token_id [1, 106, 50]), so the model halts the
+  // instant it starts inventing a response — and the stop token lands in the
+  // decoded text, because the worker decodes with special tokens visible.
+  test("CAPTURED: a real turn from Gemma 4 E2B ONNX at q4", () => {
+    const raw = `<|tool_call>call:run_terminal_command{cmd:<|"|>ls -l /mnt/host<|"|>}<tool_call|><|tool_response>`;
+    const turn = parseTurn(raw);
+    expect(turn.calls).toEqual([
+      { name: "run_terminal_command", args: { cmd: "ls -l /mnt/host" } },
+    ]);
+    // Only a call, so no prose — and no leaked stop token in it either.
+    expect(turn.text).toBe("");
+  });
+
+  // The turn after the tool result came back: prose, then the end-of-turn
+  // marker. Kept because the marker leaking into a user-visible answer is the
+  // exact failure the scaffolding list prevents.
+  test("CAPTURED: the answer turn, ending in its own turn marker", () => {
+    const raw =
+      "The contents of `hello.txt` are:\n\n```\nhello from the mount\n```<turn|>";
+    const turn = parseTurn(raw);
+    expect(turn.calls).toEqual([]);
+    expect(turn.text).toBe("The contents of `hello.txt` are:\n\n```\nhello from the mount\n```");
+  });
+
   // RENDERED: these are what the checkpoint's own chat_template.jinja emits for
-  // the given arguments, taken verbatim from a round trip through it. They are
-  // not a captured model turn — that is still owed, and is why this dialect is
-  // unverified — but they do pin the grammar to the template rather than to a
-  // reading of it. Note nested keys come out BARE: the tool-call path passes
-  // escape_keys=False all the way down, unlike a tool declaration.
+  // the given arguments, taken verbatim from a round trip through it. They pin
+  // the grammar to the template rather than to a reading of it, and cover value
+  // types the captured turns above happen not to use. Note nested keys come out
+  // BARE: the tool-call path passes escape_keys=False all the way down, unlike a
+  // tool declaration.
   test("RENDERED: the template's own output for every value type", () => {
     const cases: [string, Record<string, unknown>][] = [
       [

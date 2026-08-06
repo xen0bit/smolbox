@@ -3,8 +3,9 @@
 // of which revision is current, so the thing that downloads weights and the
 // thing that loads them cannot disagree.
 //
-//   bun web/fetch-model.ts              # the default entry
-//   bun web/fetch-model.ts qwen3-1.7b   # a specific one
+//   bun web/fetch-model.ts                        # the default entry
+//   bun web/fetch-model.ts qwen3-1.7b             # a specific one
+//   bun web/fetch-model.ts gemma4-e2b-onnx --dtype q4   # a non-default build
 //   bun web/fetch-model.ts --list
 //
 // transformers.js resolves a local model as <localModelPath>/<repo>/<file>, so
@@ -15,6 +16,7 @@ import path from "node:path";
 
 import {
   DEFAULT_MODEL_KEY,
+  type Dtype,
   OPTIONAL_FILES,
   REQUIRED_FILES,
   SAFETENSORS_EXTRA_FILES,
@@ -41,7 +43,10 @@ if (args.includes("--list")) {
   process.exit(0);
 }
 
-const entry = modelFor(args[0] ?? DEFAULT_MODEL_KEY);
+// The key is the first bare argument: `--dtype q4` may come before or after it.
+const flagValues = new Set(args.filter((a, i) => args[i - 1]?.startsWith("--")));
+const key = args.find((a) => !a.startsWith("--") && !flagValues.has(a));
+const entry = modelFor(key ?? DEFAULT_MODEL_KEY);
 if (entry.local) {
   // No ONNX build of these exists on the hub and the source weights are gated,
   // so there is nothing here to download (PLAN §11.1.5). Say which command does
@@ -50,13 +55,24 @@ if (entry.local) {
   say(`  run: make antares-onnx ANTARES=${entry.repo.split("/").pop()?.replace("-ONNX", "")}`);
   process.exit(1);
 }
-// The first candidate dtype is what a headless run will use; f16 variants are a
-// runtime choice the page makes against the adapter, not something to download
-// speculatively. A safetensors repo has no variants at all — the quantization is
-// baked in — so the dtype is only along for the log line.
-const dtype = entry.dtypes[0]!;
+// The first candidate dtype is the one the page prefers, so it is the default
+// to pull. `--dtype` exists because "preferred" is a property of the adapter,
+// not of this machine: an entry can lead with q4f16 and be downloaded here as
+// q4, where no browser exposes shader-f16 (PLAN §10.14). A safetensors repo has
+// no variants at all — the quantization is baked in — so the dtype is only along
+// for the log line.
+const dtypeArg = args[args.indexOf("--dtype") + 1];
+if (args.includes("--dtype") && !dtypeArg) {
+  say("--dtype needs a value");
+  process.exit(1);
+}
+if (dtypeArg && !entry.dtypes.includes(dtypeArg as Dtype)) {
+  say(`${entry.key} has no ${dtypeArg} build (it lists: ${entry.dtypes.join(", ")})`);
+  process.exit(1);
+}
+const dtype = (dtypeArg as Dtype | undefined) ?? entry.dtypes[0]!;
 const layout = entry.weights ?? "onnx";
-const weights = weightFiles(dtype, layout);
+const weights = weightFiles(dtype, layout, entry.components);
 const extras = layout === "safetensors" ? SAFETENSORS_EXTRA_FILES : [];
 
 const outRoot = path.join("dist", "models", entry.repo);
@@ -69,6 +85,41 @@ async function sizeOf(p: string): Promise<number | null> {
   }
 }
 
+/**
+ * Fetch, retrying what is worth retrying.
+ *
+ * The hub returns 504s and drops connections under load, and this downloads
+ * multiple gigabytes across a dozen requests — a single transient failure
+ * throwing away the whole pull is the wrong trade. 404 and 403 are answers, not
+ * failures, so they come straight back: an absent optional file must not cost
+ * three retries and twelve seconds.
+ */
+async function fetchWithRetry(url: string, init: RequestInit, what: string): Promise<Response> {
+  const attempts = 4;
+  for (let attempt = 1; ; attempt++) {
+    let res: Response | undefined;
+    let err: unknown;
+    try {
+      res = await fetch(url, init);
+    } catch (e) {
+      err = e;
+    }
+    if (res && (res.ok || res.status === 404 || res.status === 403)) {
+      return res;
+    }
+    if (attempt === attempts) {
+      if (res) {
+        return res;
+      }
+      throw err;
+    }
+    const waitMs = 1000 * 2 ** (attempt - 1);
+    const why = res ? `${res.status} ${res.statusText}` : String(err);
+    say(`  retry ${what} in ${waitMs / 1000}s (${why})`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
 async function fetchFile(rel: string, optional: boolean): Promise<number> {
   const dest = path.join(outRoot, rel);
   const url = `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${rel}`;
@@ -76,7 +127,7 @@ async function fetchFile(rel: string, optional: boolean): Promise<number> {
   // Bun drops content-length on the HEAD (it negotiates a compressed transfer),
   // so the authoritative size is HF's own x-linked-size, which it exposes via
   // access-control-expose-headers for exactly this.
-  const head = await fetch(url, { method: "HEAD", redirect: "follow" });
+  const head = await fetchWithRetry(url, { method: "HEAD", redirect: "follow" }, `HEAD ${rel}`);
   if (!head.ok) {
     if (optional && (head.status === 404 || head.status === 403)) {
       return 0;
@@ -95,7 +146,7 @@ async function fetchFile(rel: string, optional: boolean): Promise<number> {
   }
 
   await mkdir(path.dirname(dest), { recursive: true });
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetchWithRetry(url, { redirect: "follow" }, `GET ${rel}`);
   if (!res.ok || !res.body) {
     if (optional) {
       return 0;

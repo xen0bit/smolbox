@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   AGENT_WORKING_TOKENS,
   CHARS_PER_TOKEN_ESTIMATE,
+  MAX_EXTERNAL_DATA_SHARDS,
   PREFILL_LOGITS_BUDGET_BYTES,
   models,
   maxPromptChars,
@@ -35,10 +36,11 @@ describe("model registry", () => {
 // PREFILL_LOGITS_BUDGET_BYTES for the measurement behind the number.
 describe("prefill ceiling", () => {
   test("a prompt at the ceiling fits the logits budget, and one token more does not", () => {
-    // Only the engines that pay for a logits download. The Gemma kernel backend
-    // samples on the GPU and never maps one back, so the budget is not its
-    // constraint and asserting it would be asserting a cost it does not have.
-    for (const m of models.filter((e) => e.backend !== "gemma4-kernels")) {
+    // Only the exports that pay for a logits download. The Gemma kernel backend
+    // samples on the GPU and never maps one back, and Gemma 4's ONNX export
+    // materializes one position; the budget is not their constraint and
+    // asserting it would be asserting a cost they do not have.
+    for (const m of models.filter((e) => e.prefillLogits !== "last")) {
       const bytes = (n: number) => n * m.vocabSize * 4;
       const limit = maxPromptTokens(m);
       expect(bytes(limit), `${m.key} at its ceiling`).toBeLessThanOrEqual(PREFILL_LOGITS_BUDGET_BYTES);
@@ -59,13 +61,20 @@ describe("prefill ceiling", () => {
     }
   });
 
-  // The whole reason the ceiling is backend-aware: 262 144 entries under the
-  // logits budget would be ~1500 tokens, which is not a usable agent prompt.
-  test("the kernel backend is not charged for a logits download it never makes", () => {
-    const gemma = modelFor("gemma4-e2b");
-    expect(gemma.vocabSize).toBe(262_144);
-    expect(maxPromptTokens(gemma)).toBe(AGENT_WORKING_TOKENS);
-    expect(maxPromptTokens({ ...gemma, backend: "transformers" })).toBeLessThan(2000);
+  // The whole reason the ceiling asks what a prefill materializes: 262 144
+  // entries per token under the logits budget is ~1400 tokens, which is not a
+  // usable agent prompt. Both Gemma 4 builds avoid it for different reasons —
+  // the kernel engine never downloads logits, the ONNX export only produces the
+  // last position — and neither difference is visible from the checkpoint.
+  test("a model that materializes one position is not charged for the whole sequence", () => {
+    for (const key of ["gemma4-e2b", "gemma4-e2b-onnx"]) {
+      const gemma = modelFor(key);
+      expect(gemma.vocabSize, key).toBe(262_144);
+      expect(gemma.prefillLogits, key).toBe("last");
+      expect(maxPromptTokens(gemma), key).toBe(AGENT_WORKING_TOKENS);
+      // What the same entry would get if it did pay full-sequence cost.
+      expect(maxPromptTokens({ ...gemma, prefillLogits: "sequence" }), key).toBeLessThan(2000);
+    }
   });
 
   test("a bigger vocabulary buys a shorter prompt", () => {
@@ -112,7 +121,31 @@ describe("weightFiles", () => {
   });
 
   test("the external data blob sits beside its own weights file", () => {
-    expect(weightFiles("q8").optional).toEqual(["onnx/model_quantized.onnx_data"]);
+    expect(weightFiles("q8").optional[0]).toBe("onnx/model_quantized.onnx_data");
+  });
+
+  // An export too big for one protobuf spills into .onnx_data, and one too big
+  // for that keeps numbering. The fetcher probes rather than being told how many
+  // there are, so the only thing to pin is that it probes far enough.
+  test("shards are probed past the largest export in the registry", () => {
+    const { optional } = weightFiles("fp32");
+    expect(optional).toContain("onnx/model.onnx_data_4");
+    expect(optional.length).toBe(MAX_EXTERNAL_DATA_SHARDS);
+    // Gemma 4's fp32 decoder has 5 (`.onnx_data` plus `_data_1..4`).
+    expect(MAX_EXTERNAL_DATA_SHARDS).toBeGreaterThanOrEqual(5);
+  });
+
+  // Multi-component exports: one dtype suffix, applied per graph, each with its
+  // own external data. A single wrong name here is a 404 after a 3.6 GB pull.
+  test("a multi-component export names every graph", () => {
+    const gemma = modelFor("gemma4-e2b-onnx");
+    const { required, optional } = weightFiles("q4", "onnx", gemma.components);
+    expect(required).toEqual([
+      "onnx/embed_tokens_q4.onnx",
+      "onnx/decoder_model_merged_q4.onnx",
+    ]);
+    expect(optional).toContain("onnx/embed_tokens_q4.onnx_data");
+    expect(optional).toContain("onnx/decoder_model_merged_q4.onnx_data");
   });
 });
 

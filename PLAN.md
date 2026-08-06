@@ -1639,7 +1639,7 @@ GPU (RTX 4070 Ti SUPER, 16 GB), headless Chromium with the WebGPU launch flags.
   them anyway, indistinguishable from LFM2. They are now in an optgroup of their own
   ("not chat models — see /scan/") and selecting one says so before any weights are fetched.
 
-### 10.12 Gemma 4: the ONNX path, surveyed and not taken
+### 10.12 Gemma 4: the ONNX path, surveyed and deferred (later taken — see §10.15)
 
 The reference given was `webml-community/gemma-4-webgpu-kernels`, which turns out **not** to be a
 path this project should follow: it is a static Space carrying a hand-written WebGPU engine (147
@@ -1647,8 +1647,10 @@ path this project should follow: it is a static Space carrying a hand-written We
 `google/gemma-4-E2B-it-qat-mobile-transformers` — safetensors, no ONNX. Adopting it would mean a
 second inference backend.
 
-**This section records the alternative, which was surveyed first and then not taken** — §10.13 is
-what shipped. Kept because the obstacles below are real and three of them had to be solved anyway.
+**This section records the alternative, which was surveyed first and deferred** — §10.13 shipped
+first. It was then built too (§10.15), once §10.14 established that the kernel build cannot run on
+this machine at all; the four obstacles below are exactly what it had to get through, and the
+survey's risk ordering turned out to be wrong in an instructive way.
 
 The ONNX path is available: `onnx-community/gemma-4-E2B-it-ONNX` exists, and transformers.js 4.2.0
 already knows `gemma4`/`gemma4_text`, so no custom kernels are needed for it. Four things stand in
@@ -1824,6 +1826,73 @@ carve-out is plausible, but it stays a hypothesis here rather than a finding.
   and ANV do advertise the feature.
 - A newer Chrome is worth one cheap retry if this ever gets picked up again — if
   the exclusion is version-pinned, a later Dawn may lift it.
+
+### 10.15 Gemma 4 on ONNX: the first Gemma turn anyone here has seen (2026-08-06)
+
+§10.13 shipped a Gemma 4 that loads and cannot generate; §10.14 showed no browser on this machine
+can fix that. So the path §10.12 deferred got built, and it **works** — this is the first Gemma 4
+output this project has produced.
+
+**Measured, five turns against the real model on WebGPU** (`SMOLBOX_MODEL=gemma4-e2b-onnx make
+test-e2e-agent`, RTX 4070 Ti SUPER, q4):
+
+| turn | ask | tool call it chose | result |
+|---|---|---|---|
+| 1 | list the files | `ls -l /mnt/host` | named all three, spotted that `link.txt` is a symlink |
+| 2 | show hello.txt | `cat /mnt/host/hello.txt` | quoted the contents |
+| 3 | how many lines | `wc -l /mnt/host/hello.txt` | "**1** line" |
+| 4 | kernel version | `uname -a` | quoted it back |
+| 5 | summarize | (none — correctly) | summarized all four turns |
+
+Load: **3.65 GB in 7.4 s**. Turns: 15–33 s, and 96 s for the summary. History grew to 2399 chars over
+19 messages with no device error — the §10.10 failure mode did not reappear, which is the point of
+the ceiling below.
+
+**The survey's risk ordering was wrong, and usefully so.** Obstacles 1 and 2 (the dialect, the
+structured history) were the ones called riskiest, and they cost nothing here — both had already been
+built for the kernel path, and the ONNX repo's `chat_template.jinja` is a *different, older* revision
+of the template that renders the same call grammar and the same structured history. Verified by
+rendering it, not assumed. What actually took the work was obstacles 3 and 4, both filed as lesser:
+
+- **Obstacle 3, the multi-component export, was the real one.** `weightFiles()` assumed one
+  `model.onnx`. This checkpoint is four graphs (`embed_tokens`, `decoder_model_merged`, plus vision
+  and audio encoders a text-only load never touches), and the big ones spill across up to five
+  external-data shards. Two additions: `ModelEntry.components`, and shard *probing* rather than a
+  hardcoded count — the count is published in the repo config, but a number copied into the registry
+  would rot silently against a pinned revision, whereas a 404 on `.onnx_data_3` is self-describing.
+  Loading it through `AutoModelForCausalLM` against a config whose architecture is
+  `Gemma4ForConditionalGeneration` puts transformers.js on its text-only path, so only two of the
+  four graphs are ever built — which is why 3.6 GB is the cost rather than 5.5 GB.
+- **Obstacle 4 dissolved on inspection, and the check was worth making.** The survey feared 262 144
+  logits per token would cap the prompt at ~1500. The export takes `num_logits_to_keep`, and
+  transformers.js passes 1, so a prefill materializes **one** row rather than one per token. Read out
+  of the graph before assuming. `ModelEntry.prefillLogits: "last"` now says so, and replaces the
+  `backend === "gemma4-kernels"` special case in `maxPromptTokens` — the question was never which
+  engine, it was what a forward pass materializes, and two entries answer it differently for
+  different reasons.
+
+**Two things only a real run could have found:**
+
+- **Greedy decoding breaks it in a way that looks like success.** Run at the worker's default
+  (`do_sample: false`), Gemma 4 makes the *first* tool call perfectly and then, when the result comes
+  back, emits nothing but `<eos>`. The entry now carries the checkpoint's own
+  `generation_config.json` values (sample, temperature 1.0, top-k 64, top-p 0.95) — the vendor's
+  numbers, not tuning. A single-turn test would have passed and shipped a model that cannot hold a
+  conversation.
+- **Stop tokens land in the visible text.** `eos_token_id` is `[1, 106, 50]` — `<eos>`, `<turn|>` and
+  `<|tool_response>` — so the model halts the moment it starts inventing a tool response, which is
+  exactly right. But the worker decodes with special tokens *visible* (the only way the call markers
+  survive), so the stop token is part of the completion. The dialect's scaffolding list now strips
+  the tool-response pair too.
+
+**The dialect is now `verified: true`**, off this run, with two `CAPTURED:` cases in
+`gemma4.test.ts` — the tool call and the answer turn, verbatim. The kernel entry shares the grammar
+and still has not emitted a token anywhere, and its note says so rather than borrowing this
+verification.
+
+Also fixed here, found by the run: `fetch-model.ts` had no retries, and a 3.65 GB pull died on a
+single transient 504 from the hub on an *optional* file. It now retries 5xx and network failures with
+backoff, while 404 and 403 return immediately — an absent optional file must not cost four attempts.
 
 ---
 

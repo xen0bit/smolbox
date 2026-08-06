@@ -94,6 +94,8 @@ web:
 #   make model                  the default entry (LFM2 1.2B Tool, 1.22 GB)
 #   make model MODEL=qwen3-1.7b a specific one
 #   make model MODEL=--list     what is on offer
+#   make model MODEL="gemma4-e2b-onnx --dtype q4"   a build other than the
+#     entry's preferred one, for an adapter that cannot run the preferred one
 model:
 	bun web/fetch-model.ts $(MODEL)
 

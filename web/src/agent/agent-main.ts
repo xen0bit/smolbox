@@ -495,10 +495,17 @@ const handle: SmolagentHandle = {
     // unsupported adapter.
     const missing = (entry.requiresFeatures ?? []).filter((f) => !features.has(f));
     if (missing.length > 0) {
+      // Naming a working alternative matters more than naming the cause:
+      // shader-f16 is missing on every browser on some perfectly good GPUs
+      // (PLAN §10.14), and "try a desktop browser" is advice that does not work
+      // there. The ONNX build of the same model has no such requirement.
+      const alternative = models.find(
+        (m) => m.key !== entry.key && m.dialect === entry.dialect && (m.requiresFeatures ?? []).length === 0,
+      );
       throw new Error(
         `${entry.label} needs the WebGPU feature${missing.length > 1 ? "s" : ""} ` +
           `${missing.join(", ")}, which this adapter does not expose. ` +
-          `Headless Chromium never does; a desktop browser on a recent GPU usually will.`,
+          (alternative ? `Try "${alternative.label}", which runs on any WebGPU adapter.` : ""),
       );
     }
     const dtype = pickDtype(entry, features);

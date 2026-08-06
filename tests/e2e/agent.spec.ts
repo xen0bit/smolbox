@@ -16,10 +16,17 @@ import { installMount, walkFixture, type FixtureNode } from "./harness.ts";
 
 const enabled = process.env.SMOLBOX_WEBGPU === "1";
 const mountDir = fileURLToPath(new URL("../../testdata/mount", import.meta.url));
+// Which registry entry to drive. The default is what `make model` pulls; any
+// other key needs its own `make model MODEL=<key>` first. This is how a new
+// entry gets taken through the same loop as the ones already trusted, rather
+// than being trusted because its unit tests pass.
+const modelKey = process.env.SMOLBOX_MODEL;
 
 interface AgentEvent {
   kind: string;
   text?: string;
+  raw?: string;
+  message?: string;
   rendered?: string;
   exitCode?: number;
   call?: { name: string; args: Record<string, unknown> };
@@ -28,6 +35,7 @@ interface AgentEvent {
 type AgentGlobal = {
   __smolagent?: {
     webgpu(): Promise<{ available: boolean; adapter: boolean }>;
+    setModel(key: string): void;
     loadModel(local?: boolean): Promise<{ source: string; loadMs: number }>;
     bootVm(timeoutMs?: number): Promise<{ version: string }>;
     send(text: string): Promise<AgentEvent[]>;
@@ -57,8 +65,12 @@ test("a real model on WebGPU drives the VM and answers from what it read", async
   await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.bootVm());
 
   try {
+    if (modelKey) {
+      await page.evaluate((key) => (globalThis as AgentGlobal).__smolagent!.setModel(key), modelKey);
+    }
     const ready = await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.loadModel());
     expect(ready.source).toBe("local");
+    console.log(`loaded ${modelKey ?? "the default entry"} in ${(ready.loadMs / 1000).toFixed(1)}s`);
 
     const events = await page.evaluate(() =>
       (globalThis as AgentGlobal).__smolagent!.send(
@@ -66,9 +78,18 @@ test("a real model on WebGPU drives the VM and answers from what it read", async
       ),
     );
 
+    // Printed whether or not the run passes. When a model makes no call, what it
+    // said instead IS the finding — a dialect whose markers do not match, a
+    // refusal, an empty completion and a loop that hung all fail the assertion
+    // below identically and are different bugs. Only the raw text separates them.
+    console.log(
+      `\n--- events ---\n${events
+        .map((e) => `${e.kind}: ${JSON.stringify(e.raw ?? e.text ?? e.message ?? e.call ?? "").slice(0, 600)}`)
+        .join("\n")}\n`,
+    );
+
     const toolEnds = events.filter((e) => e.kind === "tool-end");
-    expect(toolEnds.length, `model made no tool call. events: ${JSON.stringify(events.map((e) => e.kind))}`)
-      .toBeGreaterThan(0);
+    expect(toolEnds.length, "model made no tool call — see the events above").toBeGreaterThan(0);
 
     const step = toolEnds[0]!;
     expect(step.call!.name).toBe("run_terminal_command");
