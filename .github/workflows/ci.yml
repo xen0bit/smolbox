@@ -108,6 +108,15 @@ jobs:
       - name: E2E (boot + browser conformance table)
         run: make test-e2e
 
+      # Firefox is the browser with no showDirectoryPicker, so it is the only
+      # place the <input webkitdirectory> mount fallback is exercised for real.
+      # It rides this job because the wasm artifact is already built here.
+      - name: Install Firefox
+        run: bunx --bun playwright install --with-deps firefox
+
+      - name: E2E (cross-browser folder mount, Firefox)
+        run: make test-e2e-firefox
+
       - name: Upload Playwright results
         if: failure()
         uses: actions/upload-artifact@v4

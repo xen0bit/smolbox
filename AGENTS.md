@@ -55,6 +55,7 @@ pure and drive it with `FakeModelClient`.
 | `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
+| `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
@@ -124,6 +125,21 @@ and the handle itself live in `MountHost` on the main thread** — the worker ca
 postMessage mid-run, so worker-side cache invalidation on `remount()` is impossible without an epoch
 dance. `remount()` is a main-thread-only cache clear; the VM boots with an empty mount until the
 page calls `setMount(handle, links)`. (PLAN §4.4.)
+
+### Folder picking is cross-browser; the handle is the interface
+Only Chromium has `showDirectoryPicker()`, so `pickDirectoryHandle()` falls back to
+`<input type="file" webkitdirectory>` — supported by every current engine despite the prefix — and
+`web/src/mount-tree.ts` rebuilds the flat `FileList` (each entry carries `webkitRelativePath`) into
+the same structural `DirectoryHandleLike` the bridge already consumes. Nothing below the provider
+knows which one ran. Keep it that way: the handle shape in `fsbridge/main-host.ts` is the seam, so a
+new source of directories is a new provider, never a change to `MountHost`.
+
+Two limits are inherent to the fallback and are not bugs: the tree is enumerated at pick time
+(contents stay lazy — a `File` is a `Blob` over the real file), and a file input cannot report empty
+directories or symlinks, so the virtual-link table has nothing to fill it. That is why the Firefox
+spec expects `hello.txt\nsub\n` where the OPFS one expects `link.txt` too. The builder is pure and
+unit-tested (`mount-tree.test.ts`, including a pass through `MountHost.dispatch`); the DOM half is
+covered only by `make test-e2e-firefox`, which is the sole suite that runs outside Chromium.
 
 ### The bridge's virtual symlink table
 The File System Access API has no symlink concept, so `MountHost` keeps a path→target table checked
@@ -320,6 +336,11 @@ real transcript, never by reading a vendor doc — that is the M8 lesson encoded
 - `tests/e2e/harness.ts` `installMount(page, fixture, hook)` is shared by the VM page and the agent
   page, so both mount through the identical bridge and virtual-symlink path. Take the hook name as a
   parameter rather than forking it.
+- `tests/e2e/mount-picker.spec.ts` is the only spec that runs in **Firefox**
+  (`playwright.firefox.config.ts`, `make test-e2e-firefox`) — it is where the no-`showDirectoryPicker`
+  path is real. It drives the page's own pick button through Playwright's `filechooser` event with a
+  directory path, so the mount comes from the real dialog rather than a test hook. It rides the
+  existing browser-e2e CI job, which already has the wasm artifact.
 - `tests/e2e/emscripten.spec.ts` (M6) drives the `/js/` page through `bootJs()` and needs `dist/js`,
   not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
   WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.

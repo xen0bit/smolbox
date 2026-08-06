@@ -17,6 +17,12 @@ declare const crossOriginIsolated: boolean;
 declare const document: {
   getElementById(id: string): Element | null;
   createElement(tag: string): Element;
+  /** The folder-picker fallback parks its hidden <input> here. */
+  body: Element;
+};
+
+declare const window: {
+  addEventListener(type: "focus", listener: () => void, options?: { once?: boolean }): void;
 };
 
 interface Element {
@@ -34,7 +40,19 @@ interface Element {
   removeAttribute(name: string): void;
   /** Only used to trigger the JSON download on a synthesised anchor. */
   click(): void;
-  addEventListener(type: "click" | "keydown" | "change" | "input", listener: (ev: KeyboardEventLike) => void): void;
+  addEventListener(
+    type: "click" | "keydown" | "change" | "input" | "cancel",
+    listener: (ev: KeyboardEventLike) => void,
+  ): void;
+  remove(): void;
+}
+
+/**
+ * The subset of <input type="file" webkitdirectory> the cross-browser folder
+ * picker uses. `files` is a FileList, which is array-like rather than an array.
+ */
+interface FileInputLike extends Element {
+  readonly files: ArrayLike<import("./mount-tree").PickedFile> | null;
 }
 
 /** Only the fields the agent page reads off a key event. */

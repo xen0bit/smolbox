@@ -8,7 +8,7 @@ import { MountHost, DirectoryHandleLike } from "./fsbridge/main-host.ts";
 import type { Caps, Request, Response } from "./protocol.ts";
 import { OpExec } from "./protocol.ts";
 import { Session } from "./session.ts";
-import { getOpfsDirectoryHandle, pickDirectoryHandle } from "./mount.ts";
+import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "./mount.ts";
 
 export interface SmolboxHandle {
   boot(timeoutMs?: number): Promise<Caps>;
@@ -86,7 +86,11 @@ if (pickButton) {
       const picked = await pickDirectoryHandle();
       handle.setMount(picked);
     } catch (err) {
-      setStatus(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
+      setStatus(
+        isPickCancelled(err)
+          ? "mount unchanged (no folder chosen)"
+          : `pick failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   });
 }

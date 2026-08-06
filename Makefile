@@ -10,7 +10,8 @@ C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
 .PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model \
-        test test-integration test-web test-e2e test-e2e-js test-e2e-agent test-conformance lint clean
+        test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
+        test-conformance lint clean
 
 # c2w runs as root in the container, so everything it writes to dist/ lands
 # root-owned — and then a later `mkdir dist/js` fails with EPERM for the user who
@@ -137,6 +138,11 @@ test-web:
 
 test-e2e: web
 	bunx --bun playwright test --config tests/e2e/playwright.config.ts
+
+# The cross-browser mount: Firefox has no showDirectoryPicker, so this is the
+# only suite that exercises the <input webkitdirectory> fallback for real.
+test-e2e-firefox: web
+	bunx --bun playwright test --config tests/e2e/playwright.firefox.config.ts
 
 test-e2e-js: web
 	@test -d "$(DIST)/js" || { echo "error: $(DIST)/js missing; run 'make wasm-js' first (M6)" >&2; exit 1; }

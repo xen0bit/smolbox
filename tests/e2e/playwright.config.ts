@@ -2,10 +2,12 @@ import { defineConfig, devices } from "@playwright/test";
 
 // The WASI browser suite. emscripten.spec.ts needs dist/js, which `make wasm`
 // does not produce, so it runs from playwright.emscripten.config.ts instead;
-// agent.spec.ts needs a GPU and dist/models and runs from playwright.agent.config.ts.
+// agent.spec.ts needs a GPU and dist/models and runs from playwright.agent.config.ts;
+// mount-picker.spec.ts asserts the no-showDirectoryPicker path and only means
+// anything in Firefox, so it runs from playwright.firefox.config.ts.
 export default defineConfig({
   testDir: ".",
-  testIgnore: ["**/emscripten.spec.ts", "**/agent.spec.ts"],
+  testIgnore: ["**/emscripten.spec.ts", "**/agent.spec.ts", "**/mount-picker.spec.ts"],
   timeout: 5 * 60 * 1000,
   fullyParallel: false,
   workers: 1,

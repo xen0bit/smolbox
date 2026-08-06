@@ -21,7 +21,8 @@
 1. **A full x86_64 Linux VM running in portable WebAssembly**, which treats a dynamically mounted
    host directory as a read-only part of its filesystem. It must run under **wazero** (local
    debugging, Go integration tests) and in a **browser**, where the mounted directory comes from the
-   File System Access API (`showDirectoryPicker`).
+   File System Access API (`showDirectoryPicker`), or, where that does not exist, an equivalent
+   handle rebuilt from an `<input type="file" webkitdirectory>` pick (§4.4).
 2. **A small LLM on WebGPU** that performs terminal tool calls into the VM.
 
 This plan builds **component 1 in full** and designs the exec API so component 2 drops in later.
@@ -413,6 +414,8 @@ in-memory only.
   <https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle>
   → **A picked directory can never be read synchronously. A blocking bridge is mandatory.**
 - Availability: Chromium-only (Chrome/Edge/Opera); not Firefox, not Safari. Secure context required.
+  The picker has a cross-browser substitute (`<input type="file" webkitdirectory>`, §4.4), but it
+  hands back `File` objects, which are just as async — the bridge is mandatory either way.
 - **The bridge is free.** `xterm-pty` "relies on SharedArrayBuffer and Atomics" and requires
   `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp`.
   <https://github.com/mame/xterm-pty> — so the page is cross-origin isolated regardless, and the
@@ -949,12 +952,20 @@ worker thread (wasm, may block)        main thread (holds the DirectoryHandle)
 Playwright cannot drive `showDirectoryPicker()`, but `navigator.storage.getDirectory()` (OPFS)
 returns the same interface — so E2E tests populate an OPFS tree (walked from `testdata/mount` on the
 Node side, so the bytes match the wazero mount) and mount that, exercising the identical code path
-with no native dialog.
+with no native dialog. The `<input webkitdirectory>` picker *can* be driven (Playwright's
+`filechooser` event takes a directory path), which is what lets the Firefox suite mount
+`testdata/mount` through the real dialog instead of a hook.
 
-**Browser support.** Chromium-only for the picker. Firefox and Safari get a clearly-labelled degraded
-path (drag-and-drop a folder, or OPFS) behind the same provider interface. The page must check
-`crossOriginIsolated === true` at startup and fail with a readable message rather than a cryptic
-`Atomics` error.
+**Browser support.** `showDirectoryPicker()` is Chromium-only, but folder mounting is not: browsers
+without it pick through `<input type="file" webkitdirectory>` (supported by every current engine
+despite the prefix), and `web/src/mount-tree.ts` rebuilds the flat `FileList` — whose entries carry
+`webkitRelativePath` — into the same structural directory handle the bridge already consumes. Both
+paths sit behind `pickDirectoryHandle()`, so `MountHost`, the worker, and the guest see no
+difference. Two things the fallback cannot do: the tree is enumerated at pick time rather than
+lazily (file *contents* are still lazy — a `File` is a `Blob` over the real file), and it cannot
+report empty directories or symlinks. `tests/e2e/mount-picker.spec.ts` runs that path in Firefox
+against a real VM (`make test-e2e-firefox`). The page must check `crossOriginIsolated === true` at
+startup and fail with a readable message rather than a cryptic `Atomics` error.
 
 ### 4.5 Tool-call surface for the future LLM (M7 — done)
 

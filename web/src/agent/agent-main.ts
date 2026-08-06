@@ -9,7 +9,7 @@
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
-import { getOpfsDirectoryHandle, pickDirectoryHandle } from "../mount.ts";
+import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "../mount.ts";
 import { toolName } from "../tool.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { dialectFor } from "./dialects/index.ts";
@@ -457,7 +457,11 @@ pickEl?.addEventListener("click", async () => {
   try {
     handle.setMount(await pickDirectoryHandle());
   } catch (err) {
-    setStatus(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
+    setStatus(
+      isPickCancelled(err)
+        ? "mount unchanged (no folder chosen)"
+        : `pick failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 });
 
