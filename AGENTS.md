@@ -289,6 +289,23 @@ every build-time check (they all run under Python), loads on the page, and then 
 standalone file as a fallback when the tokenizer has no inline template, which covers repos built
 before that.
 
+### The prompt budget is a GPU allocation, not a preference
+Every ONNX export here emits **full-sequence** logits (`[batch, sequence_length, vocab_size]`), so a
+prefill of N tokens allocates `N × vocab_size × 4` bytes that onnxruntime-web must map back to the
+CPU. The agent loop re-prefills the whole conversation every iteration, so a chat grows into that
+allocation one tool result at a time — and when it fails, the WebGPU device is **poisoned**: every
+later run returns "invalid due to a previous error" and the session is over, not just the turn.
+Measured with LFM2.5 2.6B at q4 on a 16 GB adapter: 16 k chars of history fine, 24 k fatal. LFM2 1.2B
+never showed it only because its vocabulary is half the size (PLAN §10.10).
+
+So `ModelEntry.vocabSize` is load-bearing: `maxPromptChars()` divides
+`PREFILL_LOGITS_BUDGET_BYTES` by it, and selecting a model sets `promptBudgetChars` from that. Adding
+a registry entry **means reading `vocab_size` out of its config.json** — `models.test.ts` fails an
+entry without one. Do not restore a flat default shared across checkpoints; that is the bug.
+`promptBudgetChars` counts the serialised tool schema as well, because the chat template puts it in
+every prompt. The worker's exact token check (`prompt-too-long`, which the loop elides to and retries
+once) is the guarantee; the character budget is only the guardrail in front of it.
+
 ### The agent loop: budgets belong to the request, not to the arguments
 `Conversation` caps output per call, but it passes the budget to the `ToolRunner` — it must never
 write `max_output` into the model's argument object. Template tools declare their own parameters and

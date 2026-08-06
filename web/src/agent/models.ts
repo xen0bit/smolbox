@@ -11,6 +11,17 @@
 
 import type { DialectName } from "./dialects/index.ts";
 
+/**
+ * Characters per token, near enough for a budget.
+ *
+ * The loop counts characters rather than tokens because the tokenizer lives in
+ * the model worker and a synchronous, deterministic number is worth more to a
+ * guardrail than an exact one. Roughly 4 for these vocabularies; it lives here
+ * rather than in the loop because it is a property of the tokenizers this
+ * registry pins, and the prefill ceiling below is its other consumer.
+ */
+export const CHARS_PER_TOKEN_ESTIMATE = 4;
+
 /** Quantizations, in the order transformers.js names them. */
 export type Dtype = "q4" | "q4f16" | "fp16" | "q8" | "fp32";
 
@@ -48,6 +59,14 @@ export interface ModelEntry {
   repo: string;
   /** Pinned commit sha. A moving `main` would make M8's findings unreproducible. */
   revision: string;
+  /**
+   * The checkpoint's vocabulary size, straight from its config.json.
+   *
+   * This is not trivia: every export in this registry emits full-sequence
+   * logits, so it is the multiplier in the prefill allocation that decides how
+   * long a prompt the adapter can take. See {@link PREFILL_LOGITS_BUDGET_BYTES}.
+   */
+  vocabSize: number;
   /**
    * Candidate quantizations, best first. The page picks the first one the
    * adapter can actually run: f16 variants need the `shader-f16` feature, which
@@ -87,6 +106,7 @@ export const models: ModelEntry[] = [
     label: "LFM2 1.2B Tool",
     repo: "onnx-community/LFM2-1.2B-Tool-ONNX",
     revision: "1992998ab37ef9db120f1589181db465e0f037ad",
+    vocabSize: 65_536,
     // q4 first deliberately: it is the variant M8 measured and the only one
     // that runs headless, which is where the opt-in GPU suite runs.
     dtypes: ["q4", "q4f16"],
@@ -102,6 +122,9 @@ export const models: ModelEntry[] = [
     // one itself, so it is the same provenance as the weights it converts.
     repo: "LiquidAI/LFM2.5-2.6B-ONNX",
     revision: "66826372fd4fa166f53be0371c9315745c07cace",
+    // Twice LFM2's vocabulary, which is the whole reason this entry needs a
+    // tighter prompt budget than the one that came before it.
+    vocabSize: 128_000,
     // q4 first, as for the 1.2B: it is the variant `make model` pulls and the
     // only one that runs headless. q4f16 is smaller (1.53 GB) but splits its
     // weights across two .onnx_data shards, which only the hub path handles.
@@ -126,6 +149,7 @@ export const models: ModelEntry[] = [
     label: "Qwen2.5 0.5B Instruct",
     repo: "onnx-community/Qwen2.5-0.5B-Instruct",
     revision: "cc5cc01a65cc3ff17bdb73a7de33d879f62599b0",
+    vocabSize: 151_936,
     dtypes: ["q4", "q4f16"],
     approxBytes: 786_200_000,
     contextTokens: 32_768,
@@ -137,9 +161,12 @@ export const models: ModelEntry[] = [
     label: "Qwen3 1.7B",
     repo: "onnx-community/Qwen3-1.7B-ONNX",
     revision: "cc6a06a21d614e9b8e92a6adfab1074d4e7d2438",
+    // The largest vocabulary here, so the tightest prompt budget.
+    vocabSize: 151_936,
     dtypes: ["q4", "q4f16"],
     approxBytes: 2_147_200_000,
-    contextTokens: 32_768,
+    // 40960 at the pinned revision, not the 32768 this entry claimed.
+    contextTokens: 40_960,
     dialect: "hermes",
     note: "Emits <think> blocks. 2.1 GB at q4 — check adapter limits before loading.",
   },
@@ -151,6 +178,7 @@ export const models: ModelEntry[] = [
     // makes a locally-built artifact reproducible.
     repo: "fdtn-ai/antares-1b-ONNX",
     revision: "10417eb35641b32e7141157db19c76eb545193b6",
+    vocabSize: 100_352,
     // fp16 only, and that is a measured decision rather than an omission.
     // Antares' RL-tuned weights are quantization-hostile: this repo's quantizer
     // scores 0.943 logit correlation on the Granite base model it came from —
@@ -170,6 +198,7 @@ export const models: ModelEntry[] = [
     label: "Antares 350M (does not follow the protocol)",
     repo: "fdtn-ai/antares-350m-ONNX",
     revision: "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
+    vocabSize: 100_352,
     dtypes: ["fp16"],
     approxBytes: 911_780_067,
     contextTokens: 32_768,
@@ -187,6 +216,61 @@ export const models: ModelEntry[] = [
 ];
 
 export const DEFAULT_MODEL_KEY = "lfm2-1.2b-tool";
+
+// ------------------------------------------------------- the prefill ceiling
+//
+// Every ONNX export in this registry declares its logits output as
+// `[batch_size, sequence_length, vocab_size]` — the FULL sequence, not just the
+// last position. onnxruntime-web has to map that tensor back to the CPU to
+// sample from it, so one prefill of N tokens allocates
+//
+//     N * vocab_size * 4 bytes
+//
+// of host-visible memory, and a chat that grows by a tool result each round
+// walks straight into it. Measured on a 16 GB adapter with LFM2.5 2.6B at q4
+// (vocab 128000): ~16 k chars of history prefills fine, ~24 k dies inside Dawn
+// with "Failed to allocate memory for buffer mapping", after which every later
+// run fails with "invalid due to a previous error" — the device is poisoned and
+// the chat is over. That is the bug this budget exists to prevent.
+//
+// It is also why LFM2 1.2B never showed it: same loop, same budgets, half the
+// vocabulary, so half the allocation.
+//
+// 1.5 GiB is chosen against that measurement, not from a spec: the 2.15 GB
+// prefill worked, the 3.07 GB one did not, and the survivor is not a target to
+// aim at. Decode is unaffected — it prefills one token at a time.
+export const PREFILL_LOGITS_BUDGET_BYTES = 1.5 * 1024 ** 3;
+
+/** Logits come back as float32. */
+const BYTES_PER_LOGIT = 4;
+
+/**
+ * How many prompt tokens this checkpoint can prefill inside the budget.
+ *
+ * Clamped by the model's own context window, because a budget that permitted
+ * more tokens than the checkpoint has positions for would be a lie.
+ */
+export function maxPromptTokens(
+  entry: ModelEntry,
+  budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
+): number {
+  return Math.min(entry.contextTokens, Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT)));
+}
+
+/**
+ * The same ceiling in characters, for the loop's character-counted budgets.
+ *
+ * The loop counts characters because the tokenizer lives in the worker and a
+ * synchronous, deterministic number is worth more there than an exact one
+ * (see conversation.ts). The conversion is therefore an estimate, and the exact
+ * check still happens in the worker, which does have the tokenizer.
+ */
+export function maxPromptChars(
+  entry: ModelEntry,
+  budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
+): number {
+  return maxPromptTokens(entry, budgetBytes) * CHARS_PER_TOKEN_ESTIMATE;
+}
 
 export function modelFor(key: string): ModelEntry {
   const entry = models.find((m) => m.key === key);

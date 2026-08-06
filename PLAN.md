@@ -1537,6 +1537,61 @@ All three are **done**; M9 and M10's done-when conditions are met the same way (
   same transcript as M8 (~9.5 s including load), now through the dialect registry, the multi-turn
   loop and the tool registry. The budget is visible in the request it sends: `max_output: 4096`.
 
+### 10.10 The prefill ceiling: why a long chat killed the GPU (2026-08-06)
+
+Reported as "LFM2.5 throws a JavaScript error and the chat breaks after a few tool calls with larger
+responses". It is not a JavaScript bug; it is an allocation the loop had no idea it was making.
+
+**The mechanism.** Every ONNX export in the registry declares its logits output as
+`[batch_size, sequence_length, vocab_size]` — the **full** sequence, not just the last position.
+onnxruntime-web has to map that tensor back to the CPU to sample from it, so one prefill of N tokens
+allocates `N × vocab_size × 4` bytes of host-visible memory. Because the agent loop re-prefills the
+entire conversation on every iteration, and every tool result makes the conversation longer, a chat
+walks into that allocation from below, one tool call at a time.
+
+**Measured** on this machine (RTX 4070 Ti SUPER, 16 GB; LFM2.5 2.6B at q4, vocab 128 000), by
+sending a single filler message of a known size and growing it:
+
+| history | prefill logits | result |
+|---|---|---|
+| 16 261 chars | ~2.15 GB | fine |
+| 24 261 chars | ~3.07 GB | `Failed to allocate memory for buffer mapping` (Dawn) |
+
+The failure is **not recoverable in place**: after it, every run on that `InferenceSession` returns
+`[Invalid Buffer] is invalid due to a previous error`. The device is poisoned, so the *next* message
+fails too, and the one after that. That is the "chat breaks" half of the report.
+
+**Why LFM2 1.2B never showed it.** Same loop, same budgets, **half the vocabulary** (65 536), so half
+the allocation — its 24 000-char prompts landed at ~1.57 GB and survived. The bug was latent in the
+flat default from M9 and only became reachable when M10 added a checkpoint with a 128 000-entry
+vocabulary. Qwen3's 151 936 would have been worse.
+
+**The fix, in four parts.** The first two prevent it and the second two mean no future adapter can
+reproduce it:
+
+1. `ModelEntry.vocabSize` and `maxPromptTokens()` / `maxPromptChars()` (`models.ts`) turn the
+   allocation into arithmetic: `PREFILL_LOGITS_BUDGET_BYTES` (1.5 GiB, chosen against the
+   measurement above — the 2.15 GB prefill worked and is not a target to aim at) divided by
+   `vocab_size × 4`. Selecting a model sets the loop's prompt budget from its own ceiling, exactly as
+   it already set `max_new_tokens`. The flat 24 000 default is gone.
+2. `promptBudgetChars` (was `historyBudgetChars`) now counts the **serialised tool schema** too.
+   That was never counted and is ~2.3 KB of prompt on every turn for `run_terminal_command` alone —
+   a user with several template tools enabled was well over a ceiling the loop believed it was under.
+3. The model worker checks the **real** token count from the real tokenizer before running, and
+   refuses with `prompt-too-long` and the ceiling it measured. The loop elides to that number and
+   retries the turn once. The char budget is a guardrail; this is the guarantee.
+4. A run that fails anyway is treated as a device loss: the worker disposes the session and rebuilds
+   it on the next request, and the loop turns *any* generate failure into a visible `error` event
+   instead of a rejection out of `send()`. Previously that rejection left a user message with no
+   reply and nothing on screen saying why.
+
+**Verified** against the real model: five prompts, nine tool calls, `dmesg` and `ls -laR /etc` among
+them, elision holding the prompt at ~12 000 chars — zero device errors, where the same script
+previously died on the third prompt. Regression coverage is in `models.test.ts` (the arithmetic, and
+that LFM2.5's ceiling is below the default that used to crash it) and `conversation.test.ts` (failure
+becomes an event, the refusal-and-retry, the tool schema counting against the budget) — all GPU-free,
+all in CI.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

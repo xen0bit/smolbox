@@ -7,8 +7,9 @@
 // can actually reach (PLAN §10.2).
 
 import type { ChatMessage } from "./messages.ts";
-import type { ModelClient } from "./model-client.ts";
+import { ModelError, type ModelClient } from "./model-client.ts";
 import type { Dialect } from "./dialects/index.ts";
+import { CHARS_PER_TOKEN_ESTIMATE } from "./models.ts";
 import { type ParsedCall, ToolCallParseError } from "./parse.ts";
 
 export interface ToolRunner {
@@ -53,15 +54,21 @@ export interface ConversationOptions {
   /** Ceiling for Request.max_output on every call the model makes. */
   perCallMaxOutput: number;
   maxNewTokens: number;
-  /** Approximate history budget, in characters. See noteOnChars below. */
-  historyBudgetChars: number;
+  /**
+   * Approximate ceiling for the WHOLE prompt, in characters: system turn,
+   * history, and the serialised tool schema together.
+   *
+   * It covers the tool schema because that is prompt text too (see
+   * overheadChars), and the thing it is protecting — the prefill allocation in
+   * models.ts — does not care which part of the prompt the tokens came from.
+   */
+  promptBudgetChars: number;
 }
 
 // Budgets are counted in characters, not tokens: the tokenizer lives in the
 // worker and a synchronous, deterministic number is worth more here than an
-// exact one. Roughly 4 chars/token for this vocabulary — the budget is a
-// guardrail against a 1 MiB cat, not an accountant.
-export const CHARS_PER_TOKEN_ESTIMATE = 4;
+// exact one. The budget is a guardrail against a 1 MiB cat, not an accountant.
+export { CHARS_PER_TOKEN_ESTIMATE } from "./models.ts";
 
 export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dialect"> = {
   maxIterations: 5,
@@ -70,13 +77,22 @@ export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dia
   // in the rendered result is what tells it so.
   perCallMaxOutput: 4096,
   maxNewTokens: 512,
-  historyBudgetChars: 24_000,
+  // A floor, not a recommendation: the page replaces this with the selected
+  // checkpoint's own prefill ceiling (models.ts maxPromptChars) as soon as a
+  // model is chosen. 24_000 was the old flat default and is what let LFM2.5
+  // prefill itself to death, so it is deliberately no longer the largest number
+  // any model runs with.
+  promptBudgetChars: 16_000,
 };
 
 export class Conversation {
   private history: ChatMessage[] = [];
   private cancelled = false;
   private running = false;
+  // Serialising the tool schema on every elide() would be O(schema) per call
+  // for a value that changes only when the registry does; the identity of the
+  // array is enough to notice that.
+  private toolsCache: { tools: unknown[]; chars: number } | null = null;
 
   constructor(
     private opts: ConversationOptions,
@@ -118,14 +134,10 @@ export class Conversation {
 
     try {
       for (let i = 0; i < this.opts.maxIterations; i++) {
-        this.elide();
-
-        const result = await this.model.generate({
-          messages: this.messages(),
-          tools: this.opts.tools,
-          maxNewTokens: this.opts.maxNewTokens,
-          onToken: (t) => this.emit({ kind: "token", text: t }),
-        });
+        const result = await this.generateWithRetry();
+        if (!result) {
+          return;
+        }
 
         if (this.cancelled || result.stopped) {
           this.history.push({ role: "assistant", content: result.text });
@@ -195,18 +207,64 @@ export class Conversation {
     }
   }
 
+  /**
+   * One generation, elided into budget first, retried once if that was not
+   * enough. Returns undefined when the turn is over — the error is already on
+   * the chat log by then.
+   *
+   * A failed generate used to propagate straight out of send(), which left the
+   * user turn in the history with no reply and no visible reason, so the next
+   * message rebuilt the same oversized prompt and failed the same way: the chat
+   * was dead with nothing on screen to say so. Every failure now ends the turn
+   * as a visible event instead.
+   *
+   * The retry is only for `prompt-too-long`, which the worker raises *before*
+   * running the model — nothing is damaged, and the worker tells us the real
+   * ceiling it measured with the real tokenizer, so the second attempt is
+   * informed rather than hopeful. Anything else ends the turn.
+   */
+  private async generateWithRetry(): Promise<Awaited<ReturnType<ModelClient["generate"]>> | undefined> {
+    for (let attempt = 0; ; attempt++) {
+      this.elide();
+      try {
+        return await this.model.generate({
+          messages: this.messages(),
+          tools: this.opts.tools,
+          maxNewTokens: this.opts.maxNewTokens,
+          onToken: (t) => this.emit({ kind: "token", text: t }),
+        });
+      } catch (err) {
+        const retryable = err instanceof ModelError && err.code === "prompt-too-long" && attempt === 0;
+        if (retryable) {
+          const limit = (err as ModelError).limitTokens;
+          if (limit && limit > 0) {
+            this.opts = {
+              ...this.opts,
+              promptBudgetChars: Math.max(1000, limit * CHARS_PER_TOKEN_ESTIMATE - this.overheadChars()),
+            };
+          } else {
+            this.opts = { ...this.opts, promptBudgetChars: Math.max(1000, this.opts.promptBudgetChars >> 1) };
+          }
+          continue;
+        }
+        this.emit({ kind: "error", message: err instanceof Error ? err.message : String(err) });
+        return undefined;
+      }
+    }
+  }
+
   // Oldest tool outputs go first, and only their bodies: the command and its
   // exit code stay, because "I ran this and it worked" keeps its value long
   // after the bytes stop being useful. Only once no tool output is left does
   // this start dropping whole turns.
   private elide(): void {
     let total = this.charCount();
-    if (total <= this.opts.historyBudgetChars) {
+    if (total <= this.opts.promptBudgetChars) {
       return;
     }
 
     let elided = 0;
-    const freed = () => this.opts.historyBudgetChars;
+    const freed = () => this.opts.promptBudgetChars;
 
     for (const msg of this.history) {
       if (total <= freed()) {
@@ -233,7 +291,31 @@ export class Conversation {
   }
 
   private charCount(): number {
-    return this.messages().reduce((n, m) => n + m.content.length, 0);
+    return this.overheadChars() + this.messages().reduce((n, m) => n + m.content.length, 0);
+  }
+
+  /**
+   * Prompt text the messages do not contain.
+   *
+   * The chat template serialises the tool schema into the system turn, so it is
+   * on the wire every single turn and none of it was being counted:
+   * run_terminal_command alone is ~2.3 KB, and a user who enables several
+   * template tools can add ten times that to a prompt the budget still believes
+   * is empty. Counting it is what makes promptBudgetChars mean "the prompt",
+   * which is what the prefill ceiling in models.ts is actually about.
+   */
+  private overheadChars(): number {
+    if (this.toolsCache?.tools !== this.opts.tools) {
+      let chars = 0;
+      try {
+        chars = JSON.stringify(this.opts.tools)?.length ?? 0;
+      } catch {
+        // A tool definition that will not serialise cannot be prompted with
+        // either; let the model client be the one to complain about it.
+      }
+      this.toolsCache = { tools: this.opts.tools, chars };
+    }
+    return this.toolsCache.chars;
   }
 }
 

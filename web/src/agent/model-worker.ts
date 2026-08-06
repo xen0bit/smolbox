@@ -16,7 +16,7 @@ import {
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
 
-import { type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
+import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
 import {
   CHAT_TEMPLATE_FILE,
   DEFAULT_MODEL_KEY,
@@ -24,8 +24,20 @@ import {
   LOCAL_MODEL_PATH,
   type ModelEntry,
   chatTemplateUrl,
+  maxPromptTokens,
   modelFor,
 } from "./models.ts";
+
+/** A failure the page can act on. See ModelErrorCode. */
+class WorkerError extends Error {
+  constructor(
+    message: string,
+    readonly code: ModelErrorCode,
+    readonly limitTokens?: number,
+  ) {
+    super(message);
+  }
+}
 
 // onnxruntime-web otherwise fetches its wasm from jsdelivr at runtime. Serving
 // it from our own origin pins it to the installed version and keeps the page
@@ -47,6 +59,9 @@ let model: PreTrainedModel | null = null;
 // Remembered from the load so generate() can apply the checkpoint's own
 // sampling settings without the page having to pass them on every turn.
 let loaded: ModelEntry | null = null;
+// The other half of that memory: enough to rebuild the session verbatim if the
+// device dies under it. See handleRunFailure.
+let lastLoad: { local: boolean; dtype: Dtype } | null = null;
 // Set only when the repo keeps its chat template in a standalone file that the
 // tokenizer did not pick up. See loadChatTemplate.
 let chatTemplate: string | null = null;
@@ -62,6 +77,7 @@ function post(msg: ModelResponse): void {
 async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<void> {
   const entry = modelFor(modelKey);
   loaded = entry;
+  lastLoad = { local, dtype };
   // A locally-built checkpoint has no hub copy to fall back to, so failing here
   // with the build command beats a 404 from deep inside transformers.js.
   if (entry.local && !local) {
@@ -144,6 +160,11 @@ async function loadChatTemplate(entry: ModelEntry, local: boolean): Promise<stri
 
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
   if (!tokenizer || !model) {
+    // Either nothing was ever loaded — an error — or a device loss dropped the
+    // session and this is the request that pays for rebuilding it.
+    await reload();
+  }
+  if (!tokenizer || !model) {
     throw new Error("generate before ready");
   }
   stopper.reset();
@@ -158,6 +179,25 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   }) as string;
 
   const inputs = tokenizer(prompt, { add_special_tokens: false });
+
+  // The exact check the loop can only estimate. Every export in the registry
+  // emits full-sequence logits, so prefilling N tokens allocates
+  // N * vocab_size * 4 bytes of mappable memory; past the adapter's reach, Dawn
+  // fails the allocation and every later run on that device returns "invalid
+  // due to a previous error". Refusing here costs a turn. Not refusing costs
+  // the session (PLAN §10.10), so this is a guard and not a warning.
+  const promptTokens = (inputs.input_ids as { dims: number[] }).dims.at(-1) ?? 0;
+  const limit = loaded ? maxPromptTokens(loaded) : Infinity;
+  if (promptTokens > limit) {
+    throw new WorkerError(
+      `prompt is ${promptTokens} tokens; ${loaded?.label ?? "this model"} can prefill at most ${limit} ` +
+        `(its ${loaded?.vocabSize}-entry vocabulary makes a longer one exceed what the GPU can map). ` +
+        `Shorten the conversation or lower the prompt budget.`,
+      "prompt-too-long",
+      limit,
+    );
+  }
+
   const started = performance.now();
 
   // skip_prompt so the callback sees only this turn; special tokens are KEPT
@@ -174,19 +214,23 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   // in the reference safetensors model as much as in the converted one
   // (PLAN §11.10). An entry that needs sampling declares it in the registry.
   const sampling = loaded?.generation ?? { do_sample: false };
-  const out = await model.generate({
-    ...inputs,
-    ...sampling,
-    max_new_tokens: req.maxNewTokens ?? sampling.max_new_tokens ?? 256,
-    streamer,
-    stopping_criteria: stopper,
-  });
+  let out: unknown;
+  try {
+    out = await model.generate({
+      ...inputs,
+      ...sampling,
+      max_new_tokens: req.maxNewTokens ?? sampling.max_new_tokens ?? 256,
+      streamer,
+      stopping_criteria: stopper,
+    });
+  } catch (err) {
+    throw await handleRunFailure(err);
+  }
 
   // The generated ids include the prompt; slice it off so the caller parses only
   // this turn. Special tokens are KEPT — the tool-call markers are what we parse.
-  const promptLen = (inputs.input_ids as { dims: number[] }).dims.at(-1) ?? 0;
   const sequence = (out as { tolist(): number[][] }).tolist()[0] ?? [];
-  const completion = sequence.slice(promptLen);
+  const completion = sequence.slice(promptTokens);
   const text = tokenizer.decode(completion, { skip_special_tokens: false });
 
   post({
@@ -198,6 +242,55 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     ms: Math.round(performance.now() - started),
     stopped: stopper.interrupted,
   });
+}
+
+/**
+ * Turns a failed OrtRun into something the session can come back from.
+ *
+ * onnxruntime-web does not lose the device politely: once a WebGPU allocation
+ * fails, the buffers built on it are invalid and *every* later run on the same
+ * InferenceSession fails with "invalid due to a previous error", so the model
+ * object is scrap even though nothing about it looks broken. Dropping it here
+ * is what turns a dead page into one failed turn — reload() rebuilds the
+ * session, and with it the device, on the next request.
+ *
+ * The guard above should mean this is never reached from a prompt this worker
+ * accepted. It stays because "should" is doing a lot of work in that sentence:
+ * the ceiling is sized for the logits allocation, and a caller on a smaller
+ * adapter, or one already sharing the GPU with something else, can still run out.
+ */
+async function handleRunFailure(err: unknown): Promise<Error> {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!looksLikeDeviceLoss(message)) {
+    return err instanceof Error ? err : new Error(message);
+  }
+  const dead = model;
+  model = null;
+  tokenizer = null;
+  try {
+    await dead?.dispose();
+  } catch {
+    // Disposing a session whose device already died can itself throw. The
+    // point was to stop referencing it, and that has happened.
+  }
+  return new WorkerError(
+    `the GPU rejected this run and the inference session did not survive it: ${message}\n` +
+      `The model will be reloaded on the next message; the conversation so far is kept.`,
+    "device-lost",
+  );
+}
+
+function looksLikeDeviceLoss(message: string): boolean {
+  return /previous error|device (is )?lost|failed to allocate|mapAsync|OrtRun/i.test(message);
+}
+
+/** Rebuilds the session the last load() described, after a device loss. */
+async function reload(): Promise<void> {
+  if (!loaded || !lastLoad) {
+    throw new Error("generate before ready");
+  }
+  post({ type: "log", message: `reloading ${loaded.label} after a device error` });
+  await load(lastLoad.local, loaded.key, lastLoad.dtype);
 }
 
 scope.addEventListener("message", (ev: { data: ModelRequest }) => {
@@ -218,7 +311,11 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
           break;
       }
     } catch (err) {
-      post({ type: "error", message: describeError(err) });
+      post({
+        type: "error",
+        message: err instanceof WorkerError ? err.message : describeError(err),
+        ...(err instanceof WorkerError ? { code: err.code, limitTokens: err.limitTokens } : {}),
+      });
     }
   })();
 });

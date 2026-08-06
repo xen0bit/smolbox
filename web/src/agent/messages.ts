@@ -38,7 +38,21 @@ export type ModelResponse =
       /** True when generation was cut short by cancel() rather than by EOS. */
       stopped: boolean;
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; code?: ModelErrorCode; limitTokens?: number };
+
+/**
+ * Why a model request failed, when the page can do something about it.
+ *
+ * Untyped failures stay untyped — most of them are one-offs a caller cannot
+ * act on. These two exist because the loop reacts differently to each:
+ *
+ *  - `prompt-too-long`: refused before the model ran, so nothing is damaged.
+ *    The loop elides to the reported ceiling and tries the turn again.
+ *  - `device-lost`: the WebGPU device errored mid-run. Everything afterwards
+ *    fails with "invalid due to a previous error" until the session is rebuilt,
+ *    so the worker drops the model and reloads it on the next request.
+ */
+export type ModelErrorCode = "prompt-too-long" | "device-lost";
 
 /**
  * Renders a thrown value for the `error` message above, message first.
