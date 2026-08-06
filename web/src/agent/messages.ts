@@ -39,3 +39,22 @@ export type ModelResponse =
       stopped: boolean;
     }
   | { type: "error"; message: string };
+
+/**
+ * Renders a thrown value for the `error` message above, message first.
+ *
+ * `err.stack` alone is not enough, and which half goes missing depends on the
+ * engine: V8 starts the stack with "Error: <message>", SpiderMonkey does not.
+ * So on Firefox a bare stack reaches the page as five anonymous frames with no
+ * statement of what went wrong — which is exactly how a missing chat template
+ * presented before this existed.
+ */
+export function describeError(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return String(err);
+  }
+  if (!err.stack) {
+    return err.message;
+  }
+  return err.stack.includes(err.message) ? err.stack : `${err.message}\n${err.stack}`;
+}

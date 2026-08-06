@@ -26,12 +26,19 @@ export type Dtype = "q4" | "q4f16" | "fp16" | "q8" | "fp32";
  * `frequency_penalty` is deliberately absent. Antares specifies 0.3, and
  * transformers.js has no additive frequency penalty — only a multiplicative
  * `repetition_penalty`, which is a different function. Recording the gap beats
- * substituting a lookalike.
+ * substituting a lookalike. `repetition_penalty` itself is here because LFM2.5
+ * asks for exactly that function, at 1.1 — no substitution involved.
+ *
+ * Every field is spread straight into `model.generate()`, so a name that
+ * transformers.js does not implement would be silently ignored. Only add one
+ * after checking it exists in its GenerationConfig.
  */
 export interface GenerationDefaults {
   do_sample: boolean;
   temperature?: number;
   top_p?: number;
+  top_k?: number;
+  repetition_penalty?: number;
   max_new_tokens?: number;
 }
 
@@ -87,6 +94,32 @@ export const models: ModelEntry[] = [
     contextTokens: 128_000,
     dialect: "lfm2",
     note: "Purpose-built for tool use. The only entry verified end to end (M8).",
+  },
+  {
+    key: "lfm2.5-2.6b",
+    label: "LFM2.5 2.6B",
+    // Liquid's own ONNX build, not onnx-community's: the vendor publishes this
+    // one itself, so it is the same provenance as the weights it converts.
+    repo: "LiquidAI/LFM2.5-2.6B-ONNX",
+    revision: "66826372fd4fa166f53be0371c9315745c07cace",
+    // q4 first, as for the 1.2B: it is the variant `make model` pulls and the
+    // only one that runs headless. q4f16 is smaller (1.53 GB) but splits its
+    // weights across two .onnx_data shards, which only the hub path handles.
+    dtypes: ["q4", "q4f16"],
+    approxBytes: 1_854_562_304,
+    contextTokens: 128_000,
+    dialect: "lfm2.5",
+    // The card's numbers, not this project's guesses. The token budget is ours:
+    // the model reasons before every answer, so the loop's 512 default would
+    // routinely stop generation mid-thought and never reach the answer.
+    generation: {
+      do_sample: true,
+      temperature: 0.1,
+      top_k: 50,
+      repetition_penalty: 1.1,
+      max_new_tokens: 2048,
+    },
+    note: "Agentic post-training, 128k context. Reasons before every answer, so a turn takes longer and its <think> block is hidden.",
   },
   {
     key: "qwen2.5-0.5b-instruct",
@@ -181,10 +214,35 @@ export function pickDtype(entry: ModelEntry, adapterFeatures: ReadonlySet<string
 // standalone .jinja for others.
 export const REQUIRED_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json"];
 
+/**
+ * Where the dev server mirrors `dist/models`. The worker sets
+ * `env.localModelPath` from this, so the path the fetcher writes to and the
+ * paths the page reads from stay one decision.
+ */
+export const LOCAL_MODEL_PATH = "/models/";
+
+/**
+ * The chat template, when a repo keeps it out of tokenizer_config.json.
+ *
+ * transformers.js only reads an inline `chat_template` — the standalone file is
+ * loaded by Processor (multimodal) and never by AutoTokenizer, so a repo that
+ * ships only this one makes apply_chat_template throw. Newer HF exports prefer
+ * the standalone file, which is why the locally-built Antares has it and the
+ * two LFM2 repos do not.
+ */
+export const CHAT_TEMPLATE_FILE = "chat_template.jinja";
+
+/** Where to read {@link CHAT_TEMPLATE_FILE} from, mirroring how weights load. */
+export function chatTemplateUrl(entry: ModelEntry, local: boolean): string {
+  return local
+    ? `${LOCAL_MODEL_PATH}${entry.repo}/${CHAT_TEMPLATE_FILE}`
+    : `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${CHAT_TEMPLATE_FILE}`;
+}
+
 export const OPTIONAL_FILES = [
   "generation_config.json",
   "special_tokens_map.json",
-  "chat_template.jinja",
+  CHAT_TEMPLATE_FILE,
   "added_tokens.json",
   "vocab.json",
   "merges.txt",

@@ -280,6 +280,15 @@ wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.
 `make web` copies **every** variant. A missing one surfaces as "no available backend found", not a
 404. (PLAN §2.11.25-26.)
 
+A third trap, and the one that bites conversions rather than downloads: **transformers.js reads a
+chat template only from `chat_template` inside `tokenizer_config.json`.** The standalone
+`chat_template.jinja` is loaded by `Processor`, on the multimodal path, and by nothing else — while
+Python `transformers` prefers the standalone file. So a checkpoint that ships only the file passes
+every build-time check (they all run under Python), loads on the page, and then throws inside
+`apply_chat_template` on the first turn. `make antares-onnx` writes both, and the worker fetches the
+standalone file as a fallback when the tokenizer has no inline template, which covers repos built
+before that.
+
 ### The agent loop: budgets belong to the request, not to the arguments
 `Conversation` caps output per call, but it passes the budget to the `ToolRunner` — it must never
 write `max_output` into the model's argument object. Template tools declare their own parameters and
@@ -299,9 +308,14 @@ definition format is defined in Go (`internal/tool/template.go`) and its schema 
 template-only session safe. Exposure is opt-in — a definition is ~0.5–2.3 KB of prompt on every turn.
 
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. Only `lfm2` is verified;
-`hermes` and `llama` are marked unverified and say so in the UI. Promote a dialect by capturing a
-real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5` and
+`antares` are verified; `hermes` and `llama` are marked unverified and say so in the UI. Promote a
+dialect by capturing a real transcript, never by reading a vendor doc — that is the M8 lesson
+encoded as a type. `lfm2.5` shares LFM2's verified call markers but is its own entry because the
+checkpoint always reasons first: its chat template ends the generation prompt with a bare `<think>`
+(confirmed by rendering the real tokenizer's template), so completions open inside the scratchpad
+and the dialect has to drop it. Its transcript fixture is still outstanding — the `test.todo` at the
+end of `lfm25.test.ts` says how to take it.
 
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require

@@ -13,7 +13,7 @@ import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "..
 import { toolName } from "../tool.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { dialectFor } from "./dialects/index.ts";
-import { DEFAULT_MODEL_KEY, type Dtype, modelFor, models, pickDtype } from "./models.ts";
+import { DEFAULT_MODEL_KEY, type Dtype, type ModelEntry, modelFor, models, pickDtype } from "./models.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
@@ -238,6 +238,23 @@ async function adapterFeatures(): Promise<ReadonlySet<string>> {
   return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
+// The loop passes maxNewTokens on every generate, so it wins over whatever the
+// registry entry declares — which is right for a knob the user can turn, and
+// wrong as a default: a reasoning model that thinks before it answers needs a
+// bigger budget than 512 or it stops mid-thought every turn. Selecting a model
+// moves the knob to that checkpoint's number; changing it afterwards still wins.
+function applyTokenBudget(entry: ModelEntry): void {
+  const want = entry.generation?.max_new_tokens;
+  if (!want) {
+    return;
+  }
+  convo.configure({ maxNewTokens: want });
+  const input = el("opt-tokens");
+  if (input) {
+    input.value = String(want);
+  }
+}
+
 let busy = false;
 
 function setBusy(on: boolean): void {
@@ -307,9 +324,11 @@ const handle: SmolagentHandle = {
     return ready;
   },
   setModel: (key: string) => {
-    currentModelKey = modelFor(key).key;
-    convo.configure({ dialect: dialectFor(modelFor(key).dialect) });
-    setStatus(`model: ${modelFor(key).label} (not loaded yet)`);
+    const entry = modelFor(key);
+    currentModelKey = entry.key;
+    convo.configure({ dialect: dialectFor(entry.dialect) });
+    applyTokenBudget(entry);
+    setStatus(`model: ${entry.label} (not loaded yet)`);
   },
   bootVm: async (timeoutMs?: number) => {
     setStatus("booting the VM…");

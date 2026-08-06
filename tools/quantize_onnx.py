@@ -258,3 +258,48 @@ def assemble(*, source: Path, granite: Path, onnx_raw: Path, out: Path) -> None:
             "chat_template.jinja lost its <think> prefill — the generation prompt would "
             "no longer match what Antares was trained to continue (PLAN §11.9)."
         )
+
+    _inline_chat_template(out, template)
+
+
+def _inline_chat_template(out: Path, template: Path) -> None:
+    """Copy the standalone template into tokenizer_config.json as well.
+
+    The file is kept — Python transformers prefers it, and it is the byte-exact
+    artifact the check above guards. But it cannot be the only copy, because the
+    runtime this build exists to serve does not read it: transformers.js'
+    AutoTokenizer takes `chat_template` from tokenizer_config.json and nowhere
+    else, and loads chat_template.jinja only through Processor, on the
+    multimodal path.
+
+    That asymmetry is why this was not caught at build time. Every check in this
+    pipeline runs under Python transformers, which does read the file, so a
+    build whose template the browser cannot see passes parity, passes
+    verify_onnx.py, loads on the page — and then throws inside
+    apply_chat_template on the first turn, with a stack that points at the
+    tokenizer rather than at the conversion that produced it.
+
+    Writing both keeps the two runtimes reading the same template, which is the
+    only property that matters here.
+    """
+    if not template.exists():
+        return
+
+    config_path = out / "tokenizer_config.json"
+    if not config_path.exists():
+        raise RuntimeError(
+            f"{config_path.name} is missing, so the chat template has nowhere to live that "
+            "transformers.js will look — the build would load and then fail on its first turn."
+        )
+
+    text = template.read_text()
+    config = json.loads(config_path.read_text())
+    config["chat_template"] = text
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+    # Read back rather than trust the write: this is the one property the
+    # browser depends on and the one nothing downstream of here re-checks.
+    written = json.loads(config_path.read_text()).get("chat_template")
+    if written != text:
+        raise RuntimeError(f"chat_template did not survive the round trip into {config_path.name}")
+    log(f"inlined chat_template into tokenizer_config.json ({len(text)} chars)")

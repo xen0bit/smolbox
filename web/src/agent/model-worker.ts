@@ -16,8 +16,16 @@ import {
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
 
-import type { ModelRequest, ModelResponse } from "./messages.ts";
-import { DEFAULT_MODEL_KEY, type Dtype, type ModelEntry, modelFor } from "./models.ts";
+import { type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
+import {
+  CHAT_TEMPLATE_FILE,
+  DEFAULT_MODEL_KEY,
+  type Dtype,
+  LOCAL_MODEL_PATH,
+  type ModelEntry,
+  chatTemplateUrl,
+  modelFor,
+} from "./models.ts";
 
 // onnxruntime-web otherwise fetches its wasm from jsdelivr at runtime. Serving
 // it from our own origin pins it to the installed version and keeps the page
@@ -39,6 +47,9 @@ let model: PreTrainedModel | null = null;
 // Remembered from the load so generate() can apply the checkpoint's own
 // sampling settings without the page having to pass them on every turn.
 let loaded: ModelEntry | null = null;
+// Set only when the repo keeps its chat template in a standalone file that the
+// tokenizer did not pick up. See loadChatTemplate.
+let chatTemplate: string | null = null;
 
 // One generation at a time, so one criteria object is enough. It is reset
 // before each run rather than recreated, because generate() holds the reference.
@@ -64,7 +75,7 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   env.allowLocalModels = local;
   env.allowRemoteModels = !local;
   if (local) {
-    env.localModelPath = "/models/";
+    env.localModelPath = LOCAL_MODEL_PATH;
     // Cache Storage cannot take a 1.2 GB entry (it fails the put with an opaque
     // "Unexpected internal error"), and caching a file already served from local
     // disk buys nothing anyway.
@@ -72,9 +83,13 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   }
 
   const started = performance.now();
-  tokenizer = await AutoTokenizer.from_pretrained(entry.repo);
+  // The revision is passed so the hub path honours the pin the registry exists
+  // to hold; it is ignored for a local load, where the path carries no revision.
+  tokenizer = await AutoTokenizer.from_pretrained(entry.repo, { revision: entry.revision });
+  chatTemplate = await loadChatTemplate(entry, local);
   model = await AutoModelForCausalLM.from_pretrained(entry.repo, {
     device: "webgpu",
+    revision: entry.revision,
     // The dtype is chosen by the page against the adapter's feature list, not
     // hardcoded: f16 variants need shader-f16, which headless Chromium does not
     // expose but a desktop browser usually does (PLAN §2.11.24).
@@ -95,6 +110,38 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   });
 }
 
+/**
+ * Reads the standalone chat_template.jinja, for repos that have no inline one.
+ *
+ * transformers.js' AutoTokenizer only ever reads `chat_template` out of
+ * tokenizer_config.json: the standalone file is loaded by Processor, on the
+ * multimodal path, and by nothing else. A repo that keeps its template only in
+ * that file therefore loads fine and then throws inside apply_chat_template on
+ * the first turn — which is what the locally-built Antares did on the scan page,
+ * because `make antares-onnx` copies the file across verbatim and the Python
+ * side of the conversion reads it (Python transformers does load it).
+ *
+ * Absence is not an error: the two LFM2 repos inline their templates and never
+ * reach this, and a repo with neither will fail in apply_chat_template with a
+ * message that says so, which is the right place for it.
+ */
+async function loadChatTemplate(entry: ModelEntry, local: boolean): Promise<string | null> {
+  if ((tokenizer as { chat_template?: unknown } | null)?.chat_template) {
+    return null;
+  }
+  try {
+    const res = await fetch(chatTemplateUrl(entry, local));
+    if (!res.ok) {
+      return null;
+    }
+    const text = await res.text();
+    post({ type: "log", message: `chat template: ${CHAT_TEMPLATE_FILE} (${text.length} chars)` });
+    return text;
+  } catch {
+    return null;
+  }
+}
+
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
   if (!tokenizer || !model) {
     throw new Error("generate before ready");
@@ -105,6 +152,9 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     tools: req.tools,
     tokenize: false,
     add_generation_prompt: true,
+    // Only set when the tokenizer had none of its own, so a repo that inlines
+    // its template keeps using the one transformers.js already parsed.
+    ...(chatTemplate ? { chat_template: chatTemplate } : {}),
   }) as string;
 
   const inputs = tokenizer(prompt, { add_special_tokens: false });
@@ -168,7 +218,7 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
           break;
       }
     } catch (err) {
-      post({ type: "error", message: err instanceof Error ? (err.stack ?? err.message) : String(err) });
+      post({ type: "error", message: describeError(err) });
     }
   })();
 });
