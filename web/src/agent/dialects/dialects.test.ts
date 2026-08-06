@@ -16,6 +16,29 @@ import { hermes } from "./hermes.ts";
 import { llama } from "./llama.ts";
 
 describe("hermes dialect (Qwen-style)", () => {
+  // What onnx-community/Qwen2.5-0.5B-Instruct at q4 actually emitted on WebGPU,
+  // verbatim including the trailing <|im_end|>, for
+  // "Use the tool to run `cat /mnt/host/hello.txt` and tell me the contents."
+  // This is what `verified: true` on this dialect asserts the existence of.
+  test("CAPTURED: a real turn from Qwen2.5 0.5B Instruct at q4", () => {
+    const raw =
+      '<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "cat /mnt/host/hello.txt", "timeout_ms": 500}}\n</tool_call><|im_end|>';
+    const turn = hermes.parseTurn(raw);
+    expect(turn.calls).toEqual([
+      { name: "run_terminal_command", args: { cmd: "cat /mnt/host/hello.txt", timeout_ms: 500 } },
+    ]);
+    // The turn was only a call, so there is no prose and the marker is gone.
+    expect(turn.text).toBe("");
+  });
+
+  // The same model, same session, inventing a tool that does not exist. Kept
+  // because it is the failure the registry has to report as correctable rather
+  // than as a parse error: the syntax was fine, the name was not.
+  test("CAPTURED: a hallucinated tool name parses cleanly and fails later", () => {
+    const turn = hermes.parseTurn('<tool_call>\n{"name": "ls", "arguments": {}}\n</tool_call><|im_end|>');
+    expect(turn.calls).toEqual([{ name: "ls", args: {} }]);
+  });
+
   test("a single <tool_call> block", () => {
     const turn = hermes.parseTurn(
       '<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "ls /mnt/host"}}\n</tool_call>',

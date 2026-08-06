@@ -154,7 +154,13 @@ export const models: ModelEntry[] = [
     approxBytes: 786_200_000,
     contextTokens: 32_768,
     dialect: "hermes",
-    note: "Smallest entry, quickest to download. Dialect unverified.",
+    // Measured 2026-08-06: it emits well-formed <tool_call> JSON — which is what
+    // promoted the hermes dialect — but at 0.5B it routinely names a tool that
+    // does not exist (`ls`, `find`) instead of the one it was given, then
+    // apologises for having no tools. Useful for exercising the page, not for
+    // driving the VM. Kept because "we tried the small one" belongs where
+    // someone will look for it.
+    note: "Verifies the dialect, not the workflow: it emits correct call syntax but usually invents a tool name instead of using the one it has.",
   },
   {
     key: "qwen3-1.7b",
@@ -163,12 +169,29 @@ export const models: ModelEntry[] = [
     revision: "cc6a06a21d614e9b8e92a6adfab1074d4e7d2438",
     // The largest vocabulary here, so the tightest prompt budget.
     vocabSize: 151_936,
-    dtypes: ["q4", "q4f16"],
-    approxBytes: 2_147_200_000,
+    // ONE candidate, and the only entry here that offers no non-f16 path. Both
+    // alternatives were measured on a 16 GB RTX 4070 Ti SUPER and both fail
+    // before a single token, because this checkpoint publishes every variant as
+    // one undivided .onnx:
+    //
+    //   q4 (2.147 GB) — transformers.js reads a weight file into a single
+    //     Uint8Array before onnxruntime sees it: "RangeError: Array buffer
+    //     allocation failed" out of readResponse.
+    //   q8 (1.742 GB, model_quantized.onnx) — reads fine, then onnxruntime
+    //     cannot build a session inside the wasm heap: "Can't create a session.
+    //     ERROR_CODE: 6, std::bad_alloc".
+    //
+    // Listing either would be offering a choice that cannot work. q4f16
+    // (1.43 GB) does, so it is the entry — and because it needs `shader-f16`,
+    // which headless Chromium does not expose (PLAN §2.11.24), pickDtype
+    // returns undefined there and the page says so instead of failing deep
+    // inside ORT. That is the honest shape of this checkpoint in a browser.
+    dtypes: ["q4f16"],
+    approxBytes: 1_430_000_000,
     // 40960 at the pinned revision, not the 32768 this entry claimed.
     contextTokens: 40_960,
     dialect: "hermes",
-    note: "Emits <think> blocks. 2.1 GB at q4 — check adapter limits before loading.",
+    note: "Emits <think> blocks. Needs shader-f16: its other builds are single files too large for the wasm heap, so there is no fallback.",
   },
   {
     key: "antares-1b",
@@ -334,10 +357,28 @@ export const OPTIONAL_FILES = [
   "quantize_config.json",
 ];
 
+/**
+ * The file suffix transformers.js gives each quantization.
+ *
+ * Mirrors its DEFAULT_DTYPE_SUFFIX_MAPPING, and is not the identity: `q8` reads
+ * `model_quantized.onnx` and `fp32` reads a bare `model.onnx`. Deriving the name
+ * as `model_${dtype}.onnx` — which this did — happens to be right for exactly
+ * the three dtypes the registry used, and would have 404'd the moment a fourth
+ * was added. The loader and the fetcher must name the same file.
+ */
+const DTYPE_SUFFIX: Record<Dtype, string> = {
+  fp32: "",
+  fp16: "_fp16",
+  q8: "_quantized",
+  q4: "_q4",
+  q4f16: "_q4f16",
+};
+
 /** The weight files for one quantization; the `_data` blob may not exist. */
 export function weightFiles(dtype: Dtype): { required: string[]; optional: string[] } {
+  const stem = `onnx/model${DTYPE_SUFFIX[dtype]}`;
   return {
-    required: [`onnx/model_${dtype}.onnx`],
-    optional: [`onnx/model_${dtype}.onnx_data`],
+    required: [`${stem}.onnx`],
+    optional: [`${stem}.onnx_data`],
   };
 }

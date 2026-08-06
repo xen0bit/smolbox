@@ -388,15 +388,64 @@ function setInput(id: string, value: number): void {
   }
 }
 
+/**
+ * Says out loud when the selected entry is not a chat model.
+ *
+ * Antares is trained for one job, with a fixed termination protocol, and the
+ * registry has always known that (`task: "localize"`). The chat dropdown listed
+ * it anyway with nothing to distinguish it from LFM2 — which is precisely the
+ * "confident nonsense" the registry comment warns about, offered as though it
+ * were a supported choice. The scan page is where it belongs and is one link
+ * away, so say so before the weights are fetched rather than after.
+ */
+function noteModelChoice(entry: ModelEntry): void {
+  if (entry.task !== "localize") {
+    return;
+  }
+  const body = bubble("note", "not a chat model");
+  if (body) {
+    body.textContent =
+      `${entry.label} is trained for vulnerability localization, not conversation — it expects one ` +
+      `task and a fixed way of finishing it. The scan page at /scan/ is built around that protocol. ` +
+      `Loading it here will produce fluent answers that mean very little.`;
+  }
+}
+
 let busy = false;
+// Two separate readiness facts, because they fail for different reasons and the
+// composer should say which one is missing rather than accepting a message and
+// answering it with "generate before ready".
+let vmReady = false;
+let modelReady = false;
 
 function setBusy(on: boolean): void {
   busy = on;
+  refreshControls();
+}
+
+function refreshControls(): void {
+  const ready = vmReady && modelReady;
   if (sendEl) {
-    sendEl.disabled = on;
+    sendEl.disabled = busy || !ready;
   }
   if (stopEl) {
-    stopEl.disabled = !on;
+    stopEl.disabled = !busy;
+  }
+  if (startEl) {
+    startEl.disabled = busy;
+    startEl.textContent = ready ? "reload model" : "start";
+  }
+  if (promptEl) {
+    promptEl.setAttribute(
+      "placeholder",
+      busy
+        ? "working…"
+        : ready
+          ? "ask about the mounted folder…"
+          : vmReady
+            ? "press start to load the model"
+            : "press start to boot the VM and load a model",
+    );
   }
 }
 
@@ -453,6 +502,8 @@ const handle: SmolagentHandle = {
     const useLocal = local ?? (await haveLocalWeights(entry.repo));
     setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
     const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
+    modelReady = true;
+    refreshControls();
     setStatus(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     return ready;
   },
@@ -461,11 +512,18 @@ const handle: SmolagentHandle = {
     currentModelKey = entry.key;
     convo.configure({ dialect: dialectFor(entry.dialect) });
     applyModelBudgets(entry);
-    setStatus(`model: ${entry.label} (not loaded yet)`);
+    // The weights in the worker are still the previous model's, and answering
+    // with them under a new dialect would be the worst of both.
+    modelReady = false;
+    refreshControls();
+    noteModelChoice(entry);
+    setStatus(`model: ${entry.label} — press start to load it`);
   },
   bootVm: async (timeoutMs?: number) => {
     setStatus("booting the VM…");
     const caps = await session.boot(timeoutMs);
+    vmReady = true;
+    refreshControls();
     setStatus(`vm ready (agent v${caps.version})`);
     return caps;
   },
@@ -613,7 +671,15 @@ startEl?.addEventListener("click", async () => {
     await handle.loadModel();
     setStatus("ready — ask something");
   } catch (err) {
-    setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
+    // Loading a 2 GB checkpoint fails for reasons the user can act on — no
+    // adapter, no weights, a quantization this GPU cannot run — so the reason
+    // goes in the log next to the question it will not be answering.
+    const message = err instanceof Error ? err.message : String(err);
+    const body = bubble("error", "error");
+    if (body) {
+      body.textContent = message;
+    }
+    setStatus(`error: ${message}`);
   } finally {
     setBusy(false);
   }
@@ -719,17 +785,33 @@ el("tool-import")?.addEventListener("click", () => {
 
 renderToolList();
 
-// Populate the model dropdown from the registry, marking unverified dialects
-// so an odd answer reads as "we never checked this family" rather than a bug.
+// Populate the model dropdown from the registry, marking unverified dialects so
+// an odd answer reads as "we never checked this family" rather than a bug, and
+// keeping the task-specific checkpoints in a group of their own so they are not
+// presented as chat models that happen to be further down the list.
 const modelSelect = el("model");
 if (modelSelect) {
-  for (const m of models) {
+  const option = (m: ModelEntry) => {
     const opt = document.createElement("option");
     opt.value = m.key;
     const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
     opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
-    modelSelect.appendChild(opt);
+    return opt;
+  };
+
+  for (const m of models.filter((e) => e.task !== "localize")) {
+    modelSelect.appendChild(option(m));
   }
+  const special = models.filter((e) => e.task === "localize");
+  if (special.length > 0) {
+    const group = document.createElement("optgroup");
+    group.setAttribute("label", "not chat models — see /scan/");
+    for (const m of special) {
+      group.appendChild(option(m));
+    }
+    modelSelect.appendChild(group);
+  }
+
   modelSelect.value = currentModelKey;
   modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
 }

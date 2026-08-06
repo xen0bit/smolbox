@@ -1592,6 +1592,83 @@ that LFM2.5's ceiling is below the default that used to crash it) and `conversat
 becomes an event, the refusal-and-retry, the tool schema counting against the budget) — all GPU-free,
 all in CI.
 
+### 10.11 Every chat model through its paces (2026-08-06, this machine)
+
+Each registry entry driven through the same four prompts on `/agent/` against a real VM and a real
+GPU (RTX 4070 Ti SUPER, 16 GB), headless Chromium with the WebGPU launch flags.
+
+| entry | dtype | load | tool calls | errors | verdict |
+|---|---|---|---|---|---|
+| LFM2 1.2B Tool | q4 | 4.2 s | 2/4 prompts | 0 | works; still the reference |
+| LFM2.5 2.6B | q4 | 3.9 s | 3/4 prompts | 0 | works, and reasons well |
+| Qwen2.5 0.5B Instruct | q4 | 4.6 s | 0/4 prompts | 3 | syntax right, model too small |
+| Qwen3 1.7B | — | — | — | — | cannot load here (no `shader-f16`) |
+
+- **`hermes` is now verified.** Qwen2.5 emitted
+  `<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "cat /mnt/host/hello.txt",
+  "timeout_ms": 500}}\n</tool_call><|im_end|>` — textbook, parsed correctly, reached the guest. The
+  transcript is checked in as a `CAPTURED:` case in `dialects.test.ts`, which is what the flag
+  asserts the existence of. Its `<think>` path is **not** covered: Qwen2.5 does not reason and Qwen3
+  could not be run, so that half stays implemented-from-template.
+- **A verified dialect is not a working agent.** At 0.5B, Qwen2.5 emits *correct syntax naming a tool
+  that does not exist* — `{"name": "ls"}`, `{"name": "find"}` — then apologises for having no tools.
+  The registry reports it as correctable ("no tool named ls is available (available:
+  run_terminal_command)") and the model never takes the correction. Worth stating plainly in the
+  note: the entry verifies the parser, not the workflow.
+- **Qwen3 1.7B has exactly one browser-viable build, and it needs `shader-f16`.** Every variant is
+  published as a single undivided `.onnx`: q4 (2.147 GB) dies in transformers.js before onnxruntime
+  sees it (`RangeError: Array buffer allocation failed` out of `readResponse`, which reads a weight
+  file into one `Uint8Array`); q8 (1.742 GB, `model_quantized.onnx`) reads fine and then cannot build
+  a session inside the wasm heap (`ERROR_CODE: 6, std::bad_alloc`). Only q4f16 (1.43 GB) works. The
+  entry now lists q4f16 alone, so `pickDtype` returns undefined on an adapter without the feature and
+  the page says so in 1.5 s instead of downloading 2.1 GB and failing nine frames deep. Headless
+  Chromium does **not** expose `shader-f16` even on a real NVIDIA adapter (confirmed here: vendor
+  `nvidia`, architecture `lovelace`, `shader-f16: false` at every `powerPreference`), so this entry
+  is unverifiable in this environment by construction — PLAN §2.11.24 again.
+- **`weightFiles()` did not name the files transformers.js asks for.** It derived
+  `onnx/model_${dtype}.onnx`, which is right for exactly the three dtypes the registry happened to
+  use and wrong for the two it did not: `q8` is `model_quantized.onnx` and `fp32` is a bare
+  `model.onnx`. Found by trying to add a q8 fallback. Now mirrors
+  `DEFAULT_DTYPE_SUFFIX_MAPPING` with a drift test, in the same spirit as every other
+  two-runtimes-one-definition gate here.
+- **Antares was being offered as a chat model.** Both entries are `task: "localize"` and the registry
+  has always said loading one in a chat box produces confident nonsense — and the dropdown listed
+  them anyway, indistinguishable from LFM2. They are now in an optgroup of their own
+  ("not chat models — see /scan/") and selecting one says so before any weights are fetched.
+
+### 10.12 Open: Gemma 4 (requested 2026-08-06, not started)
+
+The reference given was `webml-community/gemma-4-webgpu-kernels`, which turns out **not** to be a
+path this project should follow: it is a static Space carrying a hand-written WebGPU engine (147
+`.wgsl` references, its own `createComputePipeline` calls) driving
+`google/gemma-4-E2B-it-qat-mobile-transformers` — safetensors, no ONNX. Adopting it would mean a
+second inference backend.
+
+The viable path is the ordinary one: `onnx-community/gemma-4-E2B-it-ONNX` exists, and
+transformers.js 4.2.0 already knows `gemma4`/`gemma4_text`, so no custom kernels are needed. Four
+things stand in the way, in order of risk:
+
+1. **A genuinely new dialect.** Gemma 4's grammar is neither JSON nor Pythonic:
+   `<|tool_call>call:NAME{arg:value}<tool_call|>`, with asymmetric markers, a custom quote token
+   `<|"|>`, and tool declarations rendered as `<|tool>declaration:NAME{…}<tool|>`. `extractBlocks`
+   handles the markers; the body parser is new work. The template also has an `enable_thinking`
+   path, so `ThinkStyle` applies.
+2. **The tool-result role does not line up.** The template resolves a response's function name from
+   `tool_call_id` on the assistant message's structured `tool_calls`. Our history is flat
+   `{role: "tool", content}` with raw assistant text, so results may render as `unknown` or be
+   dropped entirely. **Measure this first** — it decides whether the rest is worth doing.
+3. **The export is multi-component.** `embed_tokens` + `decoder_model_merged` (+ vision and audio
+   encoders — the checkpoint is `any-to-any`), not one `model_*.onnx`. `weightFiles()` cannot express
+   that shape at all, so `make model` needs to change before the page can load anything locally.
+4. **`vocab_size` is 262 144** — double Qwen3, the largest here by a wide margin. Under
+   `PREFILL_LOGITS_BUDGET_BYTES` that is ~1536 prompt tokens (~6 KB), of which
+   `run_terminal_command`'s schema alone is ~600. Check whether this export emits full-sequence
+   logits (§10.10) before assuming the ceiling binds; if it does, the agent loop may not have room to
+   work with.
+
+Already handled: the repo ships no inline `chat_template`, only the standalone `.jinja` — the trap in
+§2.11.26, which the worker's `loadChatTemplate` fallback already covers.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

@@ -103,7 +103,23 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // to hold; it is ignored for a local load, where the path carries no revision.
   tokenizer = await AutoTokenizer.from_pretrained(entry.repo, { revision: entry.revision });
   chatTemplate = await loadChatTemplate(entry, local);
-  model = await AutoModelForCausalLM.from_pretrained(entry.repo, {
+  try {
+    model = await loadWeights(entry, dtype);
+  } catch (err) {
+    throw describeLoadFailure(err, entry, dtype);
+  }
+
+  post({
+    type: "ready",
+    source: local ? "local" : "hub",
+    loadMs: Math.round(performance.now() - started),
+    modelKey: entry.key,
+    dtype,
+  });
+}
+
+function loadWeights(entry: ModelEntry, dtype: Dtype): Promise<PreTrainedModel> {
+  return AutoModelForCausalLM.from_pretrained(entry.repo, {
     device: "webgpu",
     revision: entry.revision,
     // The dtype is chosen by the page against the adapter's feature list, not
@@ -115,15 +131,32 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
         post({ type: "progress", file: p.file, pct: Math.round(p.progress) });
       }
     },
-  });
+  }) as Promise<PreTrainedModel>;
+}
 
-  post({
-    type: "ready",
-    source: local ? "local" : "hub",
-    loadMs: Math.round(performance.now() - started),
-    modelKey: entry.key,
-    dtype,
-  });
+/**
+ * Turns a failed weight load into something a reader can act on.
+ *
+ * transformers.js reads a weight file into a single Uint8Array before
+ * onnxruntime sees any of it, so a checkpoint published as one large .onnx with
+ * no external data blob fails in `readResponse` with a bare
+ * "RangeError: Array buffer allocation failed" — nine frames deep, naming
+ * neither the model nor the file nor the size. Qwen3 1.7B's q4 build (2.147 GB
+ * in one file) does exactly this. The registry now prefers its q4f16 build for
+ * that reason; this message is for the next checkpoint that does it.
+ */
+function describeLoadFailure(err: unknown, entry: ModelEntry, dtype: Dtype): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!/allocation failed|out of memory|bad_alloc|Array buffer/i.test(message)) {
+    return err instanceof Error ? err : new Error(message);
+  }
+  const others = entry.dtypes.filter((d) => d !== dtype);
+  return new Error(
+    `${entry.label} at ${dtype} could not be allocated (${message}). Its weights are read into one ` +
+      `buffer before onnxruntime sees them, so a single-file checkpoint this large cannot be loaded ` +
+      `in a browser at all` +
+      (others.length > 0 ? `; a smaller quantization (${others.join(", ")}) may fit.` : "."),
+  );
 }
 
 /**

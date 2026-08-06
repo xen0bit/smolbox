@@ -339,15 +339,34 @@ model writes both tags — Qwen3) and `prompt-opened` (the template ends the pro
 `<think>`, so the completion starts inside the block — LFM2.5, Antares). The localize page joins the
 two channels back together, because there the deliberation *is* the content it displays.
 
+### A registry entry must name a build that actually loads
+Two failures live here and neither is visible from a model card. transformers.js reads a weight file
+into **one `Uint8Array`** before onnxruntime sees it, so a checkpoint published as a single large
+`.onnx` with no external data blob dies in `readResponse`; and a file that does read can still fail
+`std::bad_alloc` when ORT builds the session inside the wasm heap. Qwen3 1.7B hits both (q4 at
+2.147 GB, q8 at 1.742 GB) and is therefore listed with **q4f16 only** — `pickDtype` returning
+undefined and the page saying so beats a 2 GB download that fails nine frames deep. Do not add a
+dtype back "for headless" without loading it.
+
+`weightFiles()` mirrors transformers.js' `DEFAULT_DTYPE_SUFFIX_MAPPING` and is **not** the identity:
+`q8` is `model_quantized.onnx`, `fp32` is a bare `model.onnx`. The fetcher and the loader must name
+the same file; `models.test.ts` guards it.
+
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5` and
-`antares` are verified; `hermes` and `llama` are marked unverified and say so in the UI. Promote a
-dialect by capturing a real transcript, never by reading a vendor doc — that is the M8 lesson
-encoded as a type. `lfm2.5` shares LFM2's verified call markers but is its own entry because the
-checkpoint always reasons first: its chat template ends the generation prompt with a bare `<think>`
-(confirmed by rendering the real tokenizer's template), so completions open inside the scratchpad
-and the dialect has to drop it. Its transcript fixture is still outstanding — the `test.todo` at the
-end of `lfm25.test.ts` says how to take it.
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `antares`
+and `hermes` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
+capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+`hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
+`dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
+and Qwen3 will not load without `shader-f16`. `lfm2.5` shares LFM2's verified call markers but is its
+own entry because the checkpoint always reasons first: its chat template ends the generation prompt
+with a bare `<think>`, so completions open inside the scratchpad and the dialect splits it off. Its
+transcript fixture is still outstanding — the `test.todo` at the end of `lfm25.test.ts` says how to
+take it.
+
+**Verified is about the parser, not the model.** Qwen2.5 0.5B emits flawless `<tool_call>` JSON
+naming tools that do not exist, and never takes the correction; that is what promoted `hermes` and it
+is still not a usable agent. Say which of the two a registry note is talking about.
 
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
