@@ -71,8 +71,12 @@ if (entry.local) {
 // q4, where no browser exposes shader-f16 (PLAN §10.14). A safetensors repo has
 // no variants at all — the quantization is baked in — so the dtype is only along
 // for the log line.
-const dtypeArg = args[args.indexOf("--dtype") + 1];
-if (args.includes("--dtype") && !dtypeArg) {
+// Read the flag's value only when the flag is there: indexOf returns -1 when it
+// is absent, and args[-1 + 1] is the key itself — which then failed every
+// explicit `make model MODEL=<key>` with "no <key> build".
+const dtypeIndex = args.indexOf("--dtype");
+const dtypeArg = dtypeIndex === -1 ? undefined : args[dtypeIndex + 1];
+if (dtypeIndex !== -1 && !dtypeArg) {
   say("--dtype needs a value");
   process.exit(1);
 }
