@@ -4,6 +4,9 @@ const distRoot = new URL("./dist/", import.meta.url);
 // Model weights are served straight out of dist/models rather than copied into
 // web/dist: the q4 checkpoint is ~1.2 GB and duplicating it per bundle is silly.
 const modelRoot = new URL("../dist/models/", import.meta.url);
+// The Gemma kernel engine, served from dist for the same reason as the weights:
+// it is downloaded by `make gemma-kernels`, not committed (see fetch-kernels.ts).
+const kernelRoot = new URL("../dist/kernels/", import.meta.url);
 const port = Number(Bun.env.PORT ?? 8080);
 
 const isolationHeaders = {
@@ -26,16 +29,63 @@ serve({
       return new Response("forbidden", { status: 403, headers: isolationHeaders });
     }
 
-    const modelPrefix = "/models/";
-    const root = pathname.startsWith(modelPrefix) ? modelRoot : distRoot;
-    const rel = pathname.startsWith(modelPrefix) ? pathname.slice(modelPrefix.length) : "." + pathname;
+    const mounts: [string, URL][] = [
+      ["/models/", modelRoot],
+      ["/kernels/", kernelRoot],
+    ];
+    const mount = mounts.find(([prefix]) => pathname.startsWith(prefix));
+    const root = mount ? mount[1] : distRoot;
+    const rel = mount ? pathname.slice(mount[0].length) : "." + pathname;
 
     const file = Bun.file(new URL(rel, root));
     if (!(await file.exists())) {
       return new Response("not found: " + pathname, { status: 404, headers: isolationHeaders });
     }
-    return new Response(file, { headers: isolationHeaders });
+    return serveFile(file, request.headers.get("range"));
   },
 });
+
+/**
+ * Serves a file, honouring a single `Range` header.
+ *
+ * Range support is not a nicety here. The Gemma kernel engine reads
+ * model.safetensors in 256 KB chunks so it can stream a 2.5 GB checkpoint onto
+ * the GPU without holding it in memory, and it caches those chunks in IndexedDB.
+ * Against a server that ignores Range it gets the WHOLE file back for every
+ * chunk request and dies allocating a 2.5 GB Uint8Array — which is exactly what
+ * happened, and looks like an out-of-memory bug in the engine rather than a
+ * missing feature here. The HF CDN supports ranges, so the Space never saw it.
+ *
+ * One range only: that is all any client here asks for, and a multipart
+ * response would be a lot of machinery for no caller.
+ */
+async function serveFile(file: Bun.BunFile, range: string | null): Promise<Response> {
+  const size = file.size;
+  const headers: Record<string, string> = { ...isolationHeaders, "Accept-Ranges": "bytes" };
+
+  const m = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
+  if (!m) {
+    return new Response(file, { headers });
+  }
+
+  // `bytes=-N` means the last N bytes; `bytes=N-` means from N to the end.
+  const [, rawStart, rawEnd] = m;
+  const suffix = rawStart === "";
+  let start = suffix ? Math.max(0, size - Number(rawEnd || 0)) : Number(rawStart);
+  let end = suffix || rawEnd === "" ? size - 1 : Number(rawEnd);
+  end = Math.min(end, size - 1);
+
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+    return new Response("range not satisfiable", {
+      status: 416,
+      headers: { ...headers, "Content-Range": `bytes */${size}` },
+    });
+  }
+
+  return new Response(file.slice(start, end + 1), {
+    status: 206,
+    headers: { ...headers, "Content-Range": `bytes ${start}-${end}/${size}` },
+  });
+}
 
 console.log(`smolbox dev server (cross-origin isolated): http://localhost:${port}`);

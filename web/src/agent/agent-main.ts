@@ -488,7 +488,20 @@ const handle: SmolagentHandle = {
     const dialect = dialectFor(entry.dialect);
     convo.configure({ dialect });
 
-    const dtype = pickDtype(entry, await adapterFeatures());
+    const features = await adapterFeatures();
+    // Checked before anything is fetched. The kernel backend would otherwise
+    // stream 2.5 GB onto the GPU and fail on the first forward pass with "No
+    // supported WebGPU variant", which reads as a bug rather than as an
+    // unsupported adapter.
+    const missing = (entry.requiresFeatures ?? []).filter((f) => !features.has(f));
+    if (missing.length > 0) {
+      throw new Error(
+        `${entry.label} needs the WebGPU feature${missing.length > 1 ? "s" : ""} ` +
+          `${missing.join(", ")}, which this adapter does not expose. ` +
+          `Headless Chromium never does; a desktop browser on a recent GPU usually will.`,
+      );
+    }
+    const dtype = pickDtype(entry, features);
     if (!dtype) {
       throw new Error(
         `${entry.label}: none of its quantizations (${entry.dtypes.join(", ")}) run on this adapter`,

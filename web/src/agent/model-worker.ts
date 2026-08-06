@@ -16,6 +16,7 @@ import {
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
 
+import { GemmaKernelEngine } from "./gemma-kernels.ts";
 import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
 import {
   CHAT_TEMPLATE_FILE,
@@ -56,6 +57,13 @@ const scope = globalThis as unknown as {
 
 let tokenizer: PreTrainedTokenizer | null = null;
 let model: PreTrainedModel | null = null;
+// The other engine. Exactly one of `model` and `kernels` is ever set; which one
+// is decided by the registry entry's backend, and nothing above this worker
+// knows the difference.
+let kernels: GemmaKernelEngine | null = null;
+// The kernel path has no InterruptableStoppingCriteria to hand to a library —
+// it is our own loop — so cancellation is a flag it polls.
+let cancelRequested = false;
 // Remembered from the load so generate() can apply the checkpoint's own
 // sampling settings without the page having to pass them on every turn.
 let loaded: ModelEntry | null = null;
@@ -101,12 +109,28 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   const started = performance.now();
   // The revision is passed so the hub path honours the pin the registry exists
   // to hold; it is ignored for a local load, where the path carries no revision.
+  //
+  // The tokenizer is loaded the same way for BOTH backends. The kernel engine
+  // has one of its own, but it renders the chat template with `tools: null` and
+  // decodes with skip_special_tokens — neither of which this project can use, so
+  // the prompt and the decode come from here regardless of what runs the
+  // forward pass. See gemma-kernels.ts.
   tokenizer = await AutoTokenizer.from_pretrained(entry.repo, { revision: entry.revision });
   chatTemplate = await loadChatTemplate(entry, local);
-  try {
-    model = await loadWeights(entry, dtype);
-  } catch (err) {
-    throw describeLoadFailure(err, entry, dtype);
+
+  if (entry.backend === "gemma4-kernels") {
+    kernels = await GemmaKernelEngine.load(entry.repo, entry.revision, local, LOCAL_MODEL_PATH, (p) => {
+      if (typeof p.fraction === "number") {
+        post({ type: "progress", file: p.message ?? "weights", pct: Math.round(p.fraction * 100) });
+      }
+    });
+    post({ type: "log", message: `gemma kernels on ${kernels.info()}` });
+  } else {
+    try {
+      model = await loadWeights(entry, dtype);
+    } catch (err) {
+      throw describeLoadFailure(err, entry, dtype);
+    }
   }
 
   post({
@@ -192,15 +216,16 @@ async function loadChatTemplate(entry: ModelEntry, local: boolean): Promise<stri
 }
 
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
-  if (!tokenizer || !model) {
+  if (!tokenizer || !(model || kernels)) {
     // Either nothing was ever loaded — an error — or a device loss dropped the
     // session and this is the request that pays for rebuilding it.
     await reload();
   }
-  if (!tokenizer || !model) {
+  if (!tokenizer || !(model || kernels)) {
     throw new Error("generate before ready");
   }
   stopper.reset();
+  cancelRequested = false;
 
   const prompt = tokenizer.apply_chat_template(req.messages, {
     tools: req.tools,
@@ -232,6 +257,12 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   }
 
   const started = performance.now();
+  const maxNewTokens = req.maxNewTokens ?? loaded?.generation?.max_new_tokens ?? 256;
+
+  if (kernels) {
+    await generateWithKernels(req, prompt, inputs, maxNewTokens, started);
+    return;
+  }
 
   // skip_prompt so the callback sees only this turn; special tokens are KEPT
   // because the tool-call markers are exactly what the page needs to parse.
@@ -249,7 +280,7 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   const sampling = loaded?.generation ?? { do_sample: false };
   let out: unknown;
   try {
-    out = await model.generate({
+    out = await model!.generate({
       ...inputs,
       ...sampling,
       max_new_tokens: req.maxNewTokens ?? sampling.max_new_tokens ?? 256,
@@ -278,6 +309,58 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 }
 
 /**
+ * The kernel backend's half of generate().
+ *
+ * Everything before this point — the chat template with its tool schema, the
+ * tokenizer, the prefill guard — is shared, because those are properties of the
+ * checkpoint rather than of the engine. Only the forward pass differs.
+ *
+ * Decoding is incremental and deliberately keeps special tokens: the engine's
+ * own generate() drops them, and they are exactly what the dialect parses.
+ * Decoding the whole completion each step and taking the new suffix is what its
+ * generate() does too — it is quadratic in the token count and irrelevant at
+ * these lengths.
+ */
+async function generateWithKernels(
+  req: Extract<ModelRequest, { type: "generate" }>,
+  prompt: string,
+  inputs: unknown,
+  maxNewTokens: number,
+  started: number,
+): Promise<void> {
+  const tok = tokenizer!;
+  const engine = kernels!;
+  const promptIds = ((inputs as { input_ids: { tolist(): number[][] } }).input_ids.tolist()[0] ?? []).map(
+    Number,
+  );
+
+  const produced: number[] = [];
+  let emitted = "";
+  try {
+    for await (const id of engine.stream(promptIds, maxNewTokens, () => cancelRequested)) {
+      produced.push(id);
+      const text = tok.decode(produced, { skip_special_tokens: false });
+      if (text.startsWith(emitted)) {
+        post({ type: "token", id: req.id, text: text.slice(emitted.length) });
+      }
+      emitted = text;
+    }
+  } catch (err) {
+    throw await handleRunFailure(err);
+  }
+
+  post({
+    type: "generated",
+    id: req.id,
+    text: emitted,
+    prompt,
+    tokens: produced.length,
+    ms: Math.round(performance.now() - started),
+    stopped: cancelRequested,
+  });
+}
+
+/**
  * Turns a failed OrtRun into something the session can come back from.
  *
  * onnxruntime-web does not lose the device politely: once a WebGPU allocation
@@ -298,8 +381,11 @@ async function handleRunFailure(err: unknown): Promise<Error> {
     return err instanceof Error ? err : new Error(message);
   }
   const dead = model;
+  const deadKernels = kernels;
   model = null;
+  kernels = null;
   tokenizer = null;
+  deadKernels?.dispose();
   try {
     await dead?.dispose();
   } catch {
@@ -339,8 +425,10 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
           break;
         case "cancel":
           // Fire-and-forget: interrupting when nothing is running is a no-op,
-          // which is what lets the page call this without tracking state.
+          // which is what lets the page call this without tracking state. Both
+          // engines are told, because only one of them is listening.
           stopper.interrupt();
+          cancelRequested = true;
           break;
       }
     } catch (err) {

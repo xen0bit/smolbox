@@ -53,6 +53,27 @@ export interface GenerationDefaults {
   max_new_tokens?: number;
 }
 
+/**
+ * Which engine runs this checkpoint.
+ *
+ * `transformers` is onnxruntime-web through transformers.js — the path every
+ * entry took until Gemma 4. `gemma4-kernels` is the hand-written WebGPU engine
+ * from the webml-community/gemma-4-webgpu-kernels Space, which reads safetensors
+ * directly and carries its own WGSL. They share nothing but the ModelClient
+ * interface, which is the point: the loop, the dialects and the UI cannot tell
+ * them apart.
+ */
+export type Backend = "transformers" | "gemma4-kernels";
+
+/**
+ * How the weights are laid out in the repo, for the fetcher.
+ *
+ * `onnx` is `onnx/model_<dtype>.onnx` plus its optional external data blob.
+ * `safetensors` is a plain `model.safetensors` at the root, with the
+ * quantization baked into the checkpoint rather than chosen at load time.
+ */
+export type WeightLayout = "onnx" | "safetensors";
+
 export interface ModelEntry {
   key: string;
   label: string;
@@ -88,6 +109,23 @@ export interface ModelEntry {
   local?: boolean;
   /** Sampling this checkpoint needs. Absent means the page's defaults are fine. */
   generation?: GenerationDefaults;
+  /** Which engine runs it. Absent means transformers.js, as everything did. */
+  backend?: Backend;
+  /**
+   * WebGPU adapter features the engine needs, beyond the dtype question.
+   *
+   * `dtypes` answers "which file do we load"; this answers "can this engine run
+   * here at all". They are separate because an engine can have no file choice
+   * and still have hard requirements — the Gemma kernels select their WGSL
+   * variants against the device, and every variant of its dense GEMV is guarded
+   * on `shader-f16` because the checkpoint's tensors are f16. Without it the
+   * load succeeds, the weights stream onto the GPU, and the FIRST forward pass
+   * fails with "No supported WebGPU variant". Declaring it turns 2.5 GB and
+   * seven seconds into an immediate, accurate refusal.
+   */
+  requiresFeatures?: string[];
+  /** How its weights are laid out in the repo. Absent means the ONNX layout. */
+  weights?: WeightLayout;
   /**
    * The task this model is for, when it is not general chat.
    *
@@ -236,6 +274,36 @@ export const models: ModelEntry[] = [
     // verified; its behaviour is not usable.
     note: "Converts and runs, but never emits a tool call. Kept for comparison — use 1B.",
   },
+  {
+    key: "gemma4-e2b",
+    label: "Gemma 4 E2B (QAT mobile, WebGPU kernels)",
+    // The checkpoint the kernel engine is built for: safetensors, no ONNX
+    // anywhere, and none needed — this backend reads the tensors itself.
+    repo: "google/gemma-4-E2B-it-qat-mobile-transformers",
+    revision: "dd693ff40353f057ca5f07e945ad867f4afbf2ec",
+    // The largest vocabulary in the registry by a wide margin, and the reason
+    // the prefill ceiling has to be backend-aware: on the transformers path this
+    // alone would cap a prompt at ~1500 tokens. This backend samples on the GPU
+    // (its own argmax kernels) and never downloads a logits tensor, so that
+    // ceiling does not apply to it. See maxPromptTokens.
+    vocabSize: 262_144,
+    // Quantization is baked into the checkpoint (QAT), not chosen at load time.
+    // The single entry exists because pickDtype is shared; the kernel engine
+    // ignores it and selects f32 or f16 kernel variants against the adapter.
+    dtypes: ["q4"],
+    approxBytes: 2_458_111_846,
+    contextTokens: 131_072,
+    dialect: "gemma4",
+    backend: "gemma4-kernels",
+    weights: "safetensors",
+    // Measured, not assumed: every variant of com.xenova.gemma4.DenseGemv is
+    // guarded on shader-f16 (the checkpoint's tensors are f16), so on an adapter
+    // without it the model loads happily and then has no kernel to run.
+    // Headless Chromium does not expose it even on a real NVIDIA adapter, which
+    // is why this entry cannot be exercised by the opt-in GPU suite.
+    requiresFeatures: ["shader-f16"],
+    note: "Runs on the webml-community WebGPU kernels rather than onnxruntime. Needs `make gemma-kernels` for the engine and `make model MODEL=gemma4-e2b` for the weights.",
+  },
 ];
 
 export const DEFAULT_MODEL_KEY = "lfm2-1.2b-tool";
@@ -268,6 +336,19 @@ export const PREFILL_LOGITS_BUDGET_BYTES = 1.5 * 1024 ** 3;
 const BYTES_PER_LOGIT = 4;
 
 /**
+ * A working ceiling for the chat loop, independent of any engine limit.
+ *
+ * The logits budget above is a hard constraint — past it the device dies. This
+ * one is judgement: an engine with no such constraint and a 131 072-token
+ * context would let the history grow until every turn re-prefills a novel, and
+ * "correct but takes a minute" is its own kind of broken. 8192 tokens is under
+ * every entry's existing ceiling, so it changes nothing for the ONNX models and
+ * only bounds the ones that would otherwise be unbounded. The settings panel
+ * can raise it.
+ */
+export const AGENT_WORKING_TOKENS = 8192;
+
+/**
  * How many prompt tokens this checkpoint can prefill inside the budget.
  *
  * Clamped by the model's own context window, because a budget that permitted
@@ -277,7 +358,20 @@ export function maxPromptTokens(
   entry: ModelEntry,
   budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
 ): number {
-  return Math.min(entry.contextTokens, Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT)));
+  // The ceiling is a property of the ENGINE, not of the checkpoint. It exists
+  // because the ONNX exports emit full-sequence logits that onnxruntime maps
+  // back to the CPU. The Gemma kernel engine samples on the GPU with its own
+  // argmax kernels and never downloads a logits tensor at all, so applying the
+  // same arithmetic to it would cap a 262 144-vocabulary model at ~1500 tokens
+  // for a cost it does not pay.
+  if (entry.backend === "gemma4-kernels") {
+    return Math.min(entry.contextTokens, AGENT_WORKING_TOKENS);
+  }
+  return Math.min(
+    entry.contextTokens,
+    AGENT_WORKING_TOKENS,
+    Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT)),
+  );
 }
 
 /**
@@ -374,11 +468,32 @@ const DTYPE_SUFFIX: Record<Dtype, string> = {
   q4f16: "_q4f16",
 };
 
-/** The weight files for one quantization; the `_data` blob may not exist. */
-export function weightFiles(dtype: Dtype): { required: string[]; optional: string[] } {
+/**
+ * The weight files for one quantization; the `_data` blob may not exist.
+ *
+ * `safetensors` repos ignore the dtype entirely: the quantization is baked into
+ * the checkpoint, so there is one file and no variant to choose.
+ */
+export function weightFiles(
+  dtype: Dtype,
+  layout: WeightLayout = "onnx",
+): { required: string[]; optional: string[] } {
+  if (layout === "safetensors") {
+    return { required: ["model.safetensors"], optional: [] };
+  }
   const stem = `onnx/model${DTYPE_SUFFIX[dtype]}`;
   return {
     required: [`${stem}.onnx`],
     optional: [`${stem}.onnx_data`],
   };
 }
+
+/**
+ * Files the Gemma kernel engine reads that the ONNX path does not ask for.
+ *
+ * It needs `config.json` to build its kernel plan and `generation_config.json`
+ * for the EOS ids (it falls back to a hardcoded pair without one), on top of the
+ * tokenizer files everything needs. Taken from the bundle's own resource reads,
+ * not guessed.
+ */
+export const SAFETENSORS_EXTRA_FILES = ["config.json", "generation_config.json"];

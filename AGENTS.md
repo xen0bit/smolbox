@@ -58,6 +58,7 @@ pure and drive it with `FakeModelClient`.
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
+| `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
@@ -338,6 +339,30 @@ first-person deliberation as the reply. `splitThinking` knows three shapes: `non
 model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
 `<think>`, so the completion starts inside the block — LFM2.5, Antares). The localize page joins the
 two channels back together, because there the deliberation *is* the content it displays.
+
+### There are two inference engines now, and only one interface
+`ModelEntry.backend` picks between them. `transformers` is onnxruntime-web through
+transformers.js; `gemma4-kernels` is the webml-community WebGPU engine, which reads safetensors
+itself and carries its own WGSL. They meet at `ModelClient` and nowhere else — the loop, the
+dialects, the tool registry and the UI cannot tell them apart, and it should stay that way.
+
+The kernel engine is **downloaded, not vendored**: its Space declares no license, so
+`make gemma-kernels` pulls a pinned revision into gitignored `dist/kernels/` and the worker imports
+it dynamically (`gemma-kernels.ts`). Do not commit it, and do not turn that dynamic import into a
+static one — `make web` must work on a checkout that has never run the fetch.
+
+Two of its own behaviours are deliberately bypassed and both would silently break tool calling if
+restored: its `encodePrompt` renders the chat template with `tools: null`, and its `generate()`
+decodes with `skip_special_tokens: true`, which eats the very markers the dialect parses. So the
+prompt and the decode come from the transformers.js tokenizer the worker already loads, and only the
+forward pass comes from the engine, via its `_model` / `_generationState` / `_eosTokenIds`
+accessors. The prefix-cache logic around it is ours and is unit-tested
+(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16` and cannot run headless at all
+(PLAN §10.13).
+
+**`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
+256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
+allocating 2.5 GB. That looks like a bug in the engine and is not.
 
 ### A registry entry must name a build that actually loads
 Two failures live here and neither is visible from a model card. transformers.js reads a weight file

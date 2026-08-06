@@ -1636,7 +1636,7 @@ GPU (RTX 4070 Ti SUPER, 16 GB), headless Chromium with the WebGPU launch flags.
   them anyway, indistinguishable from LFM2. They are now in an optgroup of their own
   ("not chat models — see /scan/") and selecting one says so before any weights are fetched.
 
-### 10.12 Open: Gemma 4 (requested 2026-08-06, not started)
+### 10.12 Gemma 4: the ONNX path, surveyed and not taken
 
 The reference given was `webml-community/gemma-4-webgpu-kernels`, which turns out **not** to be a
 path this project should follow: it is a static Space carrying a hand-written WebGPU engine (147
@@ -1644,9 +1644,12 @@ path this project should follow: it is a static Space carrying a hand-written We
 `google/gemma-4-E2B-it-qat-mobile-transformers` — safetensors, no ONNX. Adopting it would mean a
 second inference backend.
 
-The viable path is the ordinary one: `onnx-community/gemma-4-E2B-it-ONNX` exists, and
-transformers.js 4.2.0 already knows `gemma4`/`gemma4_text`, so no custom kernels are needed. Four
-things stand in the way, in order of risk:
+**This section records the alternative, which was surveyed first and then not taken** — §10.13 is
+what shipped. Kept because the obstacles below are real and three of them had to be solved anyway.
+
+The ONNX path is available: `onnx-community/gemma-4-E2B-it-ONNX` exists, and transformers.js 4.2.0
+already knows `gemma4`/`gemma4_text`, so no custom kernels are needed for it. Four things stand in
+the way, in order of risk:
 
 1. **A genuinely new dialect.** Gemma 4's grammar is neither JSON nor Pythonic:
    `<|tool_call>call:NAME{arg:value}<tool_call|>`, with asymmetric markers, a custom quote token
@@ -1668,6 +1671,80 @@ things stand in the way, in order of risk:
 
 Already handled: the repo ships no inline `chat_template`, only the standalone `.jinja` — the trap in
 §2.11.26, which the worker's `loadChatTemplate` fallback already covers.
+
+### 10.13 Gemma 4 on the WebGPU kernel backend (2026-08-06)
+
+Built at the maintainer's call for the *kernel* engine rather than the ONNX path
+of §10.12 — "I definitely want Gemma4 to use the optimized kernel backend, it's WAY faster."
+It is a second inference engine sitting behind `ModelClient`, which is the first
+time this project has had one, and everything above that interface — the loop,
+the dialects, the tool registry, the UI — is untouched.
+
+**What the engine is.** `webml-community/gemma-4-webgpu-kernels` is a static Space
+carrying one ~540 KB ES module with its own WGSL kernels, its own safetensors
+reader and its own tokenizer. It is **downloaded, not vendored**: the Space
+declares no license, so `make gemma-kernels` pulls a pinned revision
+(`158f16ae`) into gitignored `dist/kernels/` and the page imports it at runtime.
+`web/serve.ts` serves it at `/kernels/`, exactly as it serves weights at
+`/models/`. If the licensing is ever clarified this becomes a one-line change.
+
+**Two things the engine does that smolbox cannot use**, which is why
+`gemma-kernels.ts` exists rather than a three-line call to its `generate()`:
+
+1. Its `encodePrompt` hardcodes `tools: null` when rendering the chat template.
+   smolbox's entire prompt *is* the generated tool schema (§9.2), so tools could
+   never reach the model.
+2. Its `generate()` decodes with `skip_special_tokens: true`, which strips
+   `<|tool_call>` and `<tool_call|>` — precisely what the dialect parses.
+
+So the prompt is built and the output decoded with the transformers.js tokenizer
+the worker already loads, and only the forward pass comes from the engine,
+through the `_model` / `_generationState` / `_eosTokenIds` accessors it exposes.
+The prefix-cache bookkeeping is reimplemented faithfully and is worth more here
+than in a chat app: the agent loop re-sends the whole history on every tool round
+trip, and within a turn each prompt strictly extends the last, so only the new
+tokens are prefilled.
+
+**Three real bugs were found on the way, all now fixed:**
+
+- **The dev server had no `Range` support.** The engine reads
+  `model.safetensors` in 256 KB chunks so a 2.5 GB checkpoint never has to be
+  held in memory. Against a server that ignores `Range` it got the *whole file*
+  back for every chunk and died allocating a 2.5 GB `Uint8Array` — which reads as
+  an out-of-memory bug in the engine rather than a missing feature in
+  `web/serve.ts`. The HF CDN supports ranges, so the Space never saw it.
+- **The prefill ceiling had to become backend-aware.** §10.10's arithmetic is
+  about a logits tensor onnxruntime maps back to the CPU. This engine samples on
+  the GPU with its own argmax kernels and never downloads one, so charging its
+  262 144-entry vocabulary the same cost would have capped its prompt at ~1500
+  tokens for something it does not pay. A new `AGENT_WORKING_TOKENS` (8192) is
+  the loop's own ceiling — under every existing entry's limit, so a no-op for
+  them, and the only thing bounding an engine that would otherwise be unbounded.
+- **A flat tool history renders to nothing.** See §10.12 obstacle 2, now
+  confirmed and handled by `Dialect.historyStyle` (commit `adbe064`).
+
+**Status: implemented, loads, and cannot be run here.** Measured: the engine
+imports, the tokenizer and standalone chat template load, 2.46 GB of weights
+stream onto the GPU in **7.4 s**, and the first forward pass then fails with
+`No supported WebGPU variant for com.xenova.gemma4.DenseGemv`. The reason is
+exact and in the bundle's own guards: every variant is gated on `shader-f16`
+(`tensorDtypes.aT != "float16" or device.features.has("shader-f16")`), because
+the QAT checkpoint's tensors are f16. Headless Chromium exposes no `shader-f16`
+on **any** adapter or behind **any** flag — four combinations were tried
+(`--use-angle=vulkan --enable-features=Vulkan`, `--enable-unsafe-webgpu`,
+`VulkanFromANGLE`, `--enable-dawn-features=allow_unsafe_apis`); the real NVIDIA
+adapter reports 18 features and f16 is not among them, and `--enable-unsafe-webgpu`
+alone drops to the fallback adapter. PLAN §2.11.24 again, and the same wall Qwen3
+hit in §10.11.
+
+So the entry declares `requiresFeatures: ["shader-f16"]` and the page refuses
+**before fetching anything** — 2.5 GB and 7.4 s became an instant, accurate
+message. On a desktop browser with a recent GPU this should run; that has not
+been observed here and the dialect stays `verified: false` until a transcript
+exists. What *is* tested in CI is the half this project wrote:
+`gemma-kernels.test.ts` covers the prefix-cache reuse, the reset rules,
+cancellation and the token budget against a fake engine, and
+`gemma4.test.ts` pins the call grammar to the checkpoint's own rendered template.
 
 ---
 

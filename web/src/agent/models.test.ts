@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  AGENT_WORKING_TOKENS,
   CHARS_PER_TOKEN_ESTIMATE,
   PREFILL_LOGITS_BUDGET_BYTES,
   models,
@@ -34,18 +35,37 @@ describe("model registry", () => {
 // PREFILL_LOGITS_BUDGET_BYTES for the measurement behind the number.
 describe("prefill ceiling", () => {
   test("a prompt at the ceiling fits the logits budget, and one token more does not", () => {
-    for (const m of models) {
+    // Only the engines that pay for a logits download. The Gemma kernel backend
+    // samples on the GPU and never maps one back, so the budget is not its
+    // constraint and asserting it would be asserting a cost it does not have.
+    for (const m of models.filter((e) => e.backend !== "gemma4-kernels")) {
       const bytes = (n: number) => n * m.vocabSize * 4;
       const limit = maxPromptTokens(m);
       expect(bytes(limit), `${m.key} at its ceiling`).toBeLessThanOrEqual(PREFILL_LOGITS_BUDGET_BYTES);
-      // Unless the model's own context window is the binding constraint, the
-      // budget is what stops it — one token more must not fit.
-      if (limit < m.contextTokens) {
+      // Unless something else is the binding constraint — the model's own
+      // context window, or the loop's working budget — the logits budget is
+      // what stops it, and one token more must not fit.
+      if (limit < Math.min(m.contextTokens, AGENT_WORKING_TOKENS)) {
         expect(bytes(limit + 1), `${m.key} one token past its ceiling`).toBeGreaterThan(
           PREFILL_LOGITS_BUDGET_BYTES,
         );
       }
     }
+  });
+
+  test("no entry may exceed the loop's working budget, whatever its engine", () => {
+    for (const m of models) {
+      expect(maxPromptTokens(m), `${m.key}`).toBeLessThanOrEqual(AGENT_WORKING_TOKENS);
+    }
+  });
+
+  // The whole reason the ceiling is backend-aware: 262 144 entries under the
+  // logits budget would be ~1500 tokens, which is not a usable agent prompt.
+  test("the kernel backend is not charged for a logits download it never makes", () => {
+    const gemma = modelFor("gemma4-e2b");
+    expect(gemma.vocabSize).toBe(262_144);
+    expect(maxPromptTokens(gemma)).toBe(AGENT_WORKING_TOKENS);
+    expect(maxPromptTokens({ ...gemma, backend: "transformers" })).toBeLessThan(2000);
   });
 
   test("a bigger vocabulary buys a shorter prompt", () => {
