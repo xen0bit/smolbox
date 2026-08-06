@@ -354,8 +354,8 @@ async function haveLocalWeights(repo: string): Promise<boolean> {
 }
 
 // The dtype is a runtime question, not a constant: f16 variants need shader-f16
-// on the adapter, which headless Chromium lacks and a desktop browser usually
-// has (PLAN §2.11.24).
+// on the adapter, which varies by GPU and platform far more than by browser —
+// no browser on this machine has it, Windows and macOS do (PLAN §2.11.24, §10.14).
 async function adapterFeatures(): Promise<ReadonlySet<string>> {
   const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
   const adapter = (await gpu?.requestAdapter()) as { features?: Iterable<string> } | undefined;
@@ -495,10 +495,17 @@ const handle: SmolagentHandle = {
     // unsupported adapter.
     const missing = (entry.requiresFeatures ?? []).filter((f) => !features.has(f));
     if (missing.length > 0) {
+      // Naming a working alternative matters more than naming the cause:
+      // shader-f16 is missing on every browser on some perfectly good GPUs
+      // (PLAN §10.14), and "try a desktop browser" is advice that does not work
+      // there. The ONNX build of the same model has no such requirement.
+      const alternative = models.find(
+        (m) => m.key !== entry.key && m.dialect === entry.dialect && (m.requiresFeatures ?? []).length === 0,
+      );
       throw new Error(
         `${entry.label} needs the WebGPU feature${missing.length > 1 ? "s" : ""} ` +
           `${missing.join(", ")}, which this adapter does not expose. ` +
-          `Headless Chromium never does; a desktop browser on a recent GPU usually will.`,
+          (alternative ? `Try "${alternative.label}", which runs on any WebGPU adapter.` : ""),
       );
     }
     const dtype = pickDtype(entry, features);

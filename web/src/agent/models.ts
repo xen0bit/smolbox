@@ -91,8 +91,8 @@ export interface ModelEntry {
   /**
    * Candidate quantizations, best first. The page picks the first one the
    * adapter can actually run: f16 variants need the `shader-f16` feature, which
-   * headless Chromium does not expose (PLAN §2.11.24) but a desktop browser
-   * usually does.
+   * no browser on this machine exposes (PLAN §2.11.24, §10.14) but other GPUs
+   * and platforms do.
    */
   dtypes: Dtype[];
   approxBytes: number;
@@ -111,6 +111,31 @@ export interface ModelEntry {
   generation?: GenerationDefaults;
   /** Which engine runs it. Absent means transformers.js, as everything did. */
   backend?: Backend;
+  /**
+   * The ONNX files that make up one model. Absent means a single `model.onnx`.
+   *
+   * Most exports here are one graph. Multimodal checkpoints are exported as
+   * several: Gemma 4 ships `embed_tokens` (the per-layer embeddings, which for
+   * this architecture are most of the weights) and `decoder_model_merged`,
+   * plus vision and audio encoders that a text-only load never touches.
+   * transformers.js picks the sessions itself from the config — this list exists
+   * so the *fetcher* knows what to pull, since it cannot ask the library.
+   *
+   * Order matters only for readable logs.
+   */
+  components?: string[];
+  /**
+   * How much of the logits tensor a prefill produces.
+   *
+   * `"sequence"` (the default) is the `[batch, sequence_length, vocab_size]`
+   * shape that PREFILL_LOGITS_BUDGET_BYTES exists to bound. `"last"` means the
+   * export only ever materializes the final position — either because the graph
+   * takes `num_logits_to_keep` (Gemma 4's does) or because the engine samples on
+   * the GPU and never downloads one at all. Charging those the full-sequence
+   * cost would cap a 262 144-vocabulary model at ~1400 prompt tokens for memory
+   * it never allocates.
+   */
+  prefillLogits?: "sequence" | "last";
   /**
    * WebGPU adapter features the engine needs, beyond the dtype question.
    *
@@ -221,9 +246,9 @@ export const models: ModelEntry[] = [
     //
     // Listing either would be offering a choice that cannot work. q4f16
     // (1.43 GB) does, so it is the entry — and because it needs `shader-f16`,
-    // which headless Chromium does not expose (PLAN §2.11.24), pickDtype
-    // returns undefined there and the page says so instead of failing deep
-    // inside ORT. That is the honest shape of this checkpoint in a browser.
+    // which no browser on this machine exposes (PLAN §2.11.24, §10.14),
+    // pickDtype returns undefined here and the page says so instead of failing
+    // deep inside ORT. That is the honest shape of this checkpoint in a browser.
     dtypes: ["q4f16"],
     approxBytes: 1_430_000_000,
     // 40960 at the pinned revision, not the 32768 this entry claimed.
@@ -282,11 +307,12 @@ export const models: ModelEntry[] = [
     repo: "google/gemma-4-E2B-it-qat-mobile-transformers",
     revision: "dd693ff40353f057ca5f07e945ad867f4afbf2ec",
     // The largest vocabulary in the registry by a wide margin, and the reason
-    // the prefill ceiling has to be backend-aware: on the transformers path this
-    // alone would cap a prompt at ~1500 tokens. This backend samples on the GPU
-    // (its own argmax kernels) and never downloads a logits tensor, so that
-    // ceiling does not apply to it. See maxPromptTokens.
+    // the prefill ceiling has to know what a forward pass materializes: charged
+    // the full-sequence cost this alone would cap a prompt at ~1400 tokens. This
+    // backend samples on the GPU (its own argmax kernels) and never downloads a
+    // logits tensor, so it declares `prefillLogits: "last"`. See maxPromptTokens.
     vocabSize: 262_144,
+    prefillLogits: "last",
     // Quantization is baked into the checkpoint (QAT), not chosen at load time.
     // The single entry exists because pickDtype is shared; the kernel engine
     // ignores it and selects f32 or f16 kernel variants against the adapter.
@@ -299,10 +325,54 @@ export const models: ModelEntry[] = [
     // Measured, not assumed: every variant of com.xenova.gemma4.DenseGemv is
     // guarded on shader-f16 (the checkpoint's tensors are f16), so on an adapter
     // without it the model loads happily and then has no kernel to run.
-    // Headless Chromium does not expose it even on a real NVIDIA adapter, which
-    // is why this entry cannot be exercised by the opt-in GPU suite.
+    // No browser on this machine exposes it, on any adapter, which is why this
+    // entry cannot be exercised here at all — not by the opt-in GPU suite and
+    // not by hand. Verifying it needs different hardware (D3D12, Metal, or a
+    // Mesa-driven GPU), not a different browser: PLAN §10.14.
     requiresFeatures: ["shader-f16"],
     note: "Runs on the webml-community WebGPU kernels rather than onnxruntime. Needs `make gemma-kernels` for the engine and `make model MODEL=gemma4-e2b` for the weights.",
+  },
+  {
+    key: "gemma4-e2b-onnx",
+    label: "Gemma 4 E2B (ONNX)",
+    // The same model as gemma4-e2b, on the engine everything else here uses.
+    // Two entries rather than one because they are genuinely different builds
+    // with different requirements: this one runs wherever WebGPU does, the
+    // kernel one is faster and needs shader-f16 (PLAN §10.14).
+    repo: "onnx-community/gemma-4-E2B-it-ONNX",
+    revision: "9f4bef82ea6e296bc69f8a2f5939f73af81b07a6",
+    vocabSize: 262_144,
+    // The export takes `num_logits_to_keep` and transformers.js passes 1, so a
+    // prefill materializes one row of 262 144 logits rather than one per token.
+    // Verified in the graph, not assumed from the architecture.
+    prefillLogits: "last",
+    // The checkpoint is `any-to-any`, so it is exported as four graphs. Loading
+    // it through AutoModelForCausalLM against a config whose architecture is
+    // `Gemma4ForConditionalGeneration` puts transformers.js on its text-only
+    // path, which builds exactly two sessions: embed_tokens and
+    // decoder_model_merged. The vision and audio encoders are never fetched.
+    components: ["embed_tokens", "decoder_model_merged"],
+    dtypes: ["q4f16", "q4"],
+    // q4: 1.86 GB of decoder + 1.76 GB of embeddings. The embeddings are that
+    // large because this architecture keeps per-layer embeddings for all 35
+    // layers over a 262 144-token vocabulary — for E2B they outweigh the decoder.
+    approxBytes: 3_628_000_000,
+    contextTokens: 131_072,
+    dialect: "gemma4",
+    // The checkpoint's own generation_config.json, not tuning: do_sample true,
+    // temperature 1.0, top_k 64, top_p 0.95. It matters here — run greedily,
+    // this model answers the FIRST turn correctly and then emits nothing but
+    // <eos> once the tool result comes back (measured). Its stop set is already
+    // right in the same file: [1, 106, 50] is <eos>, <turn|> and <|tool_response>,
+    // so generation halts the moment it starts inventing a tool response.
+    generation: {
+      do_sample: true,
+      temperature: 1.0,
+      top_k: 64,
+      top_p: 0.95,
+      max_new_tokens: 2048,
+    },
+    note: "Same model as the kernel build, on onnxruntime — slower, but it does not need shader-f16. Large: ~3.6 GB at q4.",
   },
 ];
 
@@ -358,13 +428,15 @@ export function maxPromptTokens(
   entry: ModelEntry,
   budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
 ): number {
-  // The ceiling is a property of the ENGINE, not of the checkpoint. It exists
-  // because the ONNX exports emit full-sequence logits that onnxruntime maps
-  // back to the CPU. The Gemma kernel engine samples on the GPU with its own
-  // argmax kernels and never downloads a logits tensor at all, so applying the
-  // same arithmetic to it would cap a 262 144-vocabulary model at ~1500 tokens
-  // for a cost it does not pay.
-  if (entry.backend === "gemma4-kernels") {
+  // The ceiling is a property of what the forward pass MATERIALIZES, not of the
+  // checkpoint. Most exports here emit full-sequence logits that onnxruntime
+  // maps back to the CPU; two do not. The Gemma kernel engine samples on the GPU
+  // with its own argmax kernels and never downloads a logits tensor, and Gemma
+  // 4's ONNX export takes `num_logits_to_keep`, which transformers.js sets to 1
+  // so only the final position is ever produced. Applying the arithmetic to
+  // either would cap a 262 144-vocabulary model at ~1400 tokens for memory it
+  // does not allocate.
+  if (entry.prefillLogits === "last") {
     return Math.min(entry.contextTokens, AGENT_WORKING_TOKENS);
   }
   return Math.min(
@@ -469,23 +541,52 @@ const DTYPE_SUFFIX: Record<Dtype, string> = {
 };
 
 /**
- * The weight files for one quantization; the `_data` blob may not exist.
+ * How many external-data shards to look for per component.
+ *
+ * A graph too large for one protobuf spills its tensors into `.onnx_data`, and
+ * one too large for *that* keeps going: `.onnx_data_1`, `.onnx_data_2`, and so
+ * on. The count is a property of the export, published in the repo's
+ * `transformers.js_config.use_external_data_format` — but the fetcher would then
+ * have to read a config to know what to fetch, and the registry would carry a
+ * number that silently rots against a pinned revision. Probing instead is
+ * self-describing: shards are optional files, and a 404 means there are no more.
+ *
+ * 8 is a ceiling, not an expectation. The largest here is Gemma 4's fp32 decoder
+ * at 5. A `weightFiles` test pins that so a future export that needs more fails
+ * loudly rather than downloading a model with a hole in it.
+ */
+export const MAX_EXTERNAL_DATA_SHARDS = 8;
+
+/**
+ * The weight files for one quantization; every `_data` shard is optional.
  *
  * `safetensors` repos ignore the dtype entirely: the quantization is baked into
  * the checkpoint, so there is one file and no variant to choose.
+ *
+ * `components` names the ONNX graphs a model is split across, for the exports
+ * that are not a single `model.onnx`. Each gets the dtype suffix — Gemma 4's q4
+ * build is `embed_tokens_q4.onnx` plus `decoder_model_merged_q4.onnx`, each with
+ * their own external data.
  */
 export function weightFiles(
   dtype: Dtype,
   layout: WeightLayout = "onnx",
+  components: readonly string[] = ["model"],
 ): { required: string[]; optional: string[] } {
   if (layout === "safetensors") {
     return { required: ["model.safetensors"], optional: [] };
   }
-  const stem = `onnx/model${DTYPE_SUFFIX[dtype]}`;
-  return {
-    required: [`${stem}.onnx`],
-    optional: [`${stem}.onnx_data`],
-  };
+  const required: string[] = [];
+  const optional: string[] = [];
+  for (const component of components) {
+    const stem = `onnx/${component}${DTYPE_SUFFIX[dtype]}`;
+    required.push(`${stem}.onnx`);
+    optional.push(`${stem}.onnx_data`);
+    for (let shard = 1; shard < MAX_EXTERNAL_DATA_SHARDS; shard++) {
+      optional.push(`${stem}.onnx_data_${shard}`);
+    }
+  }
+  return { required, optional };
 }
 
 /**

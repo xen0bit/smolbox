@@ -357,8 +357,9 @@ decodes with `skip_special_tokens: true`, which eats the very markers the dialec
 prompt and the decode come from the transformers.js tokenizer the worker already loads, and only the
 forward pass comes from the engine, via its `_model` / `_generationState` / `_eosTokenIds`
 accessors. The prefix-cache logic around it is ours and is unit-tested
-(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16` and cannot run headless at all
-(PLAN §10.13).
+(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16`, which **no browser on this
+machine exposes**, so they cannot be run here at all (PLAN §10.13, and §10.14 for why it is not a
+headless artifact).
 
 **`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
@@ -377,13 +378,34 @@ dtype back "for headless" without loading it.
 `q8` is `model_quantized.onnx`, `fp32` is a bare `model.onnx`. The fetcher and the loader must name
 the same file; `models.test.ts` guards it.
 
+**Not every export is one file.** `ModelEntry.components` names the graphs a multimodal checkpoint is
+split across — Gemma 4 is `embed_tokens` + `decoder_model_merged`, and loading it through
+`AutoModelForCausalLM` against a `…ForConditionalGeneration` architecture is what puts transformers.js
+on its text-only path so the vision and audio encoders are never fetched. Each graph carries its own
+external data, which spills across numbered shards (`.onnx_data`, `.onnx_data_1`, …). The fetcher
+**probes** for shards rather than being told how many: the count is published in the repo config, but
+copying it into the registry would rot silently against a pinned revision, and a 404 is
+self-describing. `MAX_EXTERNAL_DATA_SHARDS` bounds the probe.
+
+### Ask what a prefill materializes, not which engine it runs on
+`ModelEntry.prefillLogits` decides whether `PREFILL_LOGITS_BUDGET_BYTES` applies. Default
+`"sequence"` — the `[batch, sequence_length, vocab_size]` output §10.10 exists to bound. `"last"`
+means only the final position is ever produced, and two entries claim it for unrelated reasons: the
+kernel engine samples on the GPU and never downloads logits, and Gemma 4's ONNX export takes
+`num_logits_to_keep` (transformers.js passes 1). This was a `backend ===` check and should not have
+been — the engine was never the question. Read the graph before assuming: 262 144 logits per token
+would cap that model's prompt at ~1400 tokens for memory it does not allocate.
+
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `antares`
-and `hermes` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `antares`,
+`hermes` and `gemma4` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
 capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
-and Qwen3 will not load without `shader-f16`. `lfm2.5` shares LFM2's verified call markers but is its
+and Qwen3 will not load without `shader-f16` — which, per §10.14, needs different hardware rather
+than a different browser. `gemma4` was promoted at PLAN §10.15 off five real turns of the ONNX build —
+note that the *kernel* entry shares that grammar and has still never emitted a token, so it borrows
+nothing from this. `lfm2.5` shares LFM2's verified call markers but is its
 own entry because the checkpoint always reasons first: its chat template ends the generation prompt
 with a bare `<think>`, so completions open inside the scratchpad and the dialect splits it off. Its
 transcript fixture is still outstanding — the `test.todo` at the end of `lfm25.test.ts` says how to

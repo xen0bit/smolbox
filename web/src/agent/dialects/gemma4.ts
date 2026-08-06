@@ -49,7 +49,21 @@ export const THINK_MARKERS: ThinkMarkers = { open: "<|channel>", close: "<channe
 
 // Turn scaffolding that leaks into decoded text. Gemma's own, kept local rather
 // than added to the shared list: they mean nothing to any other family.
-const SCAFFOLDING = ["<|turn>", "<turn|>", "<|think|>", "<bos>", "<eos>"];
+//
+// The tool-response markers are here because they are STOP tokens for this
+// checkpoint (generation_config lists <|tool_response>, id 50), and a stop token
+// lands in the decoded text: the worker decodes with special tokens visible,
+// which is the only way the call markers survive. Measured — the first real turn
+// came back ending in a bare <|tool_response>.
+const SCAFFOLDING = [
+  "<|turn>",
+  "<turn|>",
+  "<|think|>",
+  "<bos>",
+  "<eos>",
+  "<|tool_response>",
+  "<tool_response|>",
+];
 
 function stripScaffolding(s: string): string {
   let out = s;
@@ -262,8 +276,8 @@ class GemmaReader {
 export const gemma4: Dialect = {
   name: "gemma4",
   label: "Gemma 4 (<|tool_call>call:name{…})",
-  verified: false,
-  note: "Implemented from the checkpoint's own rendered chat template, not from a captured turn. Its call grammar is unlike any other here; capture a transcript before trusting it.",
+  verified: true,
+  note: "Verified against Gemma 4 E2B ONNX at q4 on WebGPU: five turns, four tool calls, structured history. The kernel build shares this grammar but has never been run (PLAN §10.14).",
   parseTurn,
   preview,
   // Gemma's template renders a tool result from structured tool_calls and a
