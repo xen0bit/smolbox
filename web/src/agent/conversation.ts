@@ -93,6 +93,9 @@ export class Conversation {
   // for a value that changes only when the registry does; the identity of the
   // array is enough to notice that.
   private toolsCache: { tools: unknown[]; chars: number } | null = null;
+  // Only has to be unique within one conversation: it exists so a structured
+  // template can match a result to the call it answers.
+  private callSeq = 0;
 
   constructor(
     private opts: ConversationOptions,
@@ -170,7 +173,26 @@ export class Conversation {
           return;
         }
 
-        this.history.push({ role: "assistant", content: result.text });
+        // A structured dialect's template rebuilds the call from data rather
+        // than replaying the model's text, so the assistant turn carries the
+        // parsed calls and each result names the one it answers. See
+        // Dialect.historyStyle: fed a flat history, Gemma 4 renders the tool
+        // result as nothing at all.
+        const structured = this.opts.dialect.historyStyle === "structured";
+        const ids = calls.map((_, n) => `call_${++this.callSeq}_${n}`);
+        this.history.push(
+          structured
+            ? {
+                role: "assistant",
+                content: prose,
+                tool_calls: calls.map((c, n) => ({
+                  id: ids[n]!,
+                  type: "function" as const,
+                  function: { name: c.name, arguments: c.args },
+                })),
+              }
+            : { role: "assistant", content: result.text },
+        );
         // Reasoning alone is worth an event: a reasoning model that thinks for
         // a page and then calls a tool would otherwise leave the log with
         // nothing at all between the question and the command.
@@ -178,11 +200,12 @@ export class Conversation {
           this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning });
         }
 
-        for (const call of calls) {
+        for (const [n, call] of calls.entries()) {
           if (this.cancelled) {
             this.emit({ kind: "stopped", reason: "cancelled" });
             return;
           }
+          const answers = structured ? { tool_call_id: ids[n]! } : {};
           this.emit({ kind: "tool-start", call });
           let out: Awaited<ReturnType<ToolRunner["run"]>>;
           try {
@@ -192,7 +215,7 @@ export class Conversation {
             // the model's mistake and correctable, exactly like a parse failure.
             const message = err instanceof Error ? err.message : String(err);
             this.emit({ kind: "error", message });
-            this.history.push({ role: "tool", content: `error: ${message}` });
+            this.history.push({ role: "tool", content: `error: ${message}`, ...answers });
             continue;
           }
           this.emit({
@@ -202,7 +225,7 @@ export class Conversation {
             exitCode: out.exitCode,
             request: out.request,
           });
-          this.history.push({ role: "tool", content: out.text });
+          this.history.push({ role: "tool", content: out.text, ...answers });
         }
       }
 

@@ -24,6 +24,7 @@ const partial: Record<string, string> = {
   hermes: 'Let me look. <tool_call>{"name": "run_terminal_command", "argum',
   antares: 'thinking</think>Let me look. <tool_call>{"name": "terminal", "comm',
   llama: 'Let me look. <|python_tag|>{"name": "run_terminal_command"',
+  gemma4: 'Let me look. <|tool_call>call:run_terminal_command{cmd:<|"|>ls',
 };
 
 describe("every dialect previews a partial turn", () => {
@@ -60,6 +61,7 @@ const complete: Record<string, string> = {
   hermes: 'Let me look. <tool_call>{"name": "run_terminal_command", "arguments": {"cmd": "ls"}}</tool_call>',
   antares: 'thinking</think>Let me look. <tool_call>{"name": "terminal", "command": "ls"}</tool_call>',
   llama: 'Let me look. <|python_tag|>{"name": "run_terminal_command", "arguments": {"cmd": "ls"}}<|eom_id|>',
+  gemma4: 'Let me look. <|tool_call>call:run_terminal_command{cmd:<|"|>ls<|"|>}<tool_call|>',
 };
 
 const prose: Record<string, string> = {
@@ -68,6 +70,7 @@ const prose: Record<string, string> = {
   hermes: "<think>counting them</think>There are three files.",
   antares: "counting them</think>There are three files.",
   llama: "There are three files.",
+  gemma4: "<|channel>thought\ncounting them<channel|>There are three files.",
 };
 
 describe("reasoning is previewed as reasoning, never as the answer", () => {

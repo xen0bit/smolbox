@@ -49,8 +49,19 @@ export interface StreamPreview {
   pendingCall: boolean;
 }
 
-const THINK_OPEN = "<think>";
-const THINK_CLOSE = "</think>";
+/**
+ * The tags a family wraps its reasoning in.
+ *
+ * `<think>`/`</think>` is the common pair, but it is not universal: Gemma 4
+ * uses a named-channel form (`<|channel>thought … <channel|>`), so the markers
+ * are a parameter rather than a constant.
+ */
+export interface ThinkMarkers {
+  open: string;
+  close: string;
+}
+
+export const THINK_TAGS: ThinkMarkers = { open: "<think>", close: "</think>" };
 
 /**
  * Splits a completion into its reasoning and its prose.
@@ -60,11 +71,17 @@ const THINK_CLOSE = "</think>";
  * reasoning, and a block the model opened and has not finished is reasoning to
  * its end.
  */
-export function splitThinking(raw: string, style: ThinkStyle): { text: string; reasoning: string } {
+export function splitThinking(
+  raw: string,
+  style: ThinkStyle,
+  markers: ThinkMarkers = THINK_TAGS,
+): { text: string; reasoning: string } {
   if (style === "none") {
     return { text: raw, reasoning: "" };
   }
 
+  const THINK_OPEN = markers.open;
+  const THINK_CLOSE = markers.close;
   const parts: string[] = [];
   let rest = raw;
 
@@ -82,16 +99,28 @@ export function splitThinking(raw: string, style: ThinkStyle): { text: string; r
 
   // Whole blocks the model opened itself. Both styles can produce these; a
   // `prompt-opened` model reopening one after its answer is a real shape.
-  rest = rest.replace(/<think>([\s\S]*?)<\/think>/g, (_m, inner: string) => {
-    parts.push(inner);
-    return "";
-  });
-
-  const open = rest.indexOf(THINK_OPEN);
-  if (open !== -1) {
-    parts.push(rest.slice(open + THINK_OPEN.length));
-    rest = rest.slice(0, open);
+  // Scanned rather than matched with a RegExp because the markers are now a
+  // parameter, and Gemma 4's are full of characters a pattern would read as
+  // syntax (`<|channel>`, `<channel|>`).
+  let scanned = "";
+  let cursor = 0;
+  for (;;) {
+    const open = rest.indexOf(THINK_OPEN, cursor);
+    if (open === -1) {
+      scanned += rest.slice(cursor);
+      break;
+    }
+    scanned += rest.slice(cursor, open);
+    const close = rest.indexOf(THINK_CLOSE, open + THINK_OPEN.length);
+    if (close === -1) {
+      // Opened and never finished: reasoning runs to the end of what we have.
+      parts.push(rest.slice(open + THINK_OPEN.length));
+      break;
+    }
+    parts.push(rest.slice(open + THINK_OPEN.length, close));
+    cursor = close + THINK_CLOSE.length;
   }
+  rest = scanned;
 
   // A further `</think>` in the remainder is left exactly where it is. The
   // prompt opened one block and the first close ended it, so a second one is a
@@ -116,6 +145,7 @@ export function previewBlocks(
   start: string,
   end: string,
   style: ThinkStyle = "none",
+  markers: ThinkMarkers = THINK_TAGS,
 ): StreamPreview {
   let rest = "";
   let cursor = 0;
@@ -136,7 +166,7 @@ export function previewBlocks(
     cursor = close + end.length;
   }
 
-  const { text, reasoning } = splitThinking(rest, style);
+  const { text, reasoning } = splitThinking(rest, style, markers);
   return { text: stripSpecialTokens(text).trim(), reasoning: stripSpecialTokens(reasoning).trim(), pendingCall };
 }
 

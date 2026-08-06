@@ -312,6 +312,71 @@ describe("Conversation", () => {
     expect(kinds(events)).toContain("elided");
   });
 
+  // Gemma 4's template rebuilds the call from data instead of replaying the
+  // model's text, and matches each result to a call by tool_call_id. Given the
+  // flat history every other dialect uses it renders the tool result as nothing
+  // at all — the model asks for a command and never sees its output.
+  describe("a structured dialect", () => {
+    const structured = { ...lfm2, historyStyle: "structured" as const };
+
+    test("records the parsed calls and the id each result answers", async () => {
+      const { convo } = build(
+        [{ name: "x", turns: [{ text: call("ls") }, { text: "done" }] }],
+        { dialect: structured },
+      );
+      await convo.send("go");
+
+      const assistant = convo.messages().find((m) => m.role === "assistant")!;
+      expect(assistant.tool_calls).toHaveLength(1);
+      expect(assistant.tool_calls![0]!.function).toEqual({
+        name: "run_terminal_command",
+        arguments: { cmd: "ls" },
+      });
+      // The assistant turn carries the prose, not the raw markers: the template
+      // renders the call itself, so replaying the text would duplicate it.
+      expect(assistant.content).not.toContain("tool_call_start");
+
+      const result = convo.messages().find((m) => m.role === "tool")!;
+      expect(result.tool_call_id).toBe(assistant.tool_calls![0]!.id);
+    });
+
+    test("a refused call still names the call it answers", async () => {
+      const events: AgentEvent[] = [];
+      const convo = new Conversation(
+        { systemPrompt: "sys", tools: [], dialect: structured, ...DEFAULTS },
+        new FakeModelClient([{ name: "bad", turns: [{ text: call("x") }, { text: "sorry" }] }]),
+        { run: async () => { throw new Error("no such tool"); } },
+        (e) => events.push(e),
+      );
+      await convo.send("go");
+      const result = convo.messages().find((m) => m.role === "tool")!;
+      expect(result.content).toContain("no such tool");
+      expect(result.tool_call_id).toBeTruthy();
+    });
+
+    test("ids are unique across turns, so a result cannot answer the wrong call", async () => {
+      const { convo } = build(
+        [{ name: "x", turns: [{ text: call("a") }, { text: call("b") }, { text: "done" }] }],
+        { dialect: structured, maxIterations: 4 },
+      );
+      await convo.send("go");
+      const ids = convo.messages().filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+    });
+
+    test("the default dialect keeps the flat history untouched", async () => {
+      const { convo } = build([{ name: "x", turns: [{ text: call("ls") }, { text: "done" }] }]);
+      await convo.send("go");
+      const assistant = convo.messages().find((m) => m.role === "assistant")!;
+      // Raw text replayed, and no structured fields for a template that would
+      // otherwise render the same call a second time (LFM2.5's does).
+      expect(assistant.content).toContain("<|tool_call_start|>");
+      expect(assistant.tool_calls).toBeUndefined();
+      expect(convo.messages().find((m) => m.role === "tool")!.tool_call_id).toBeUndefined();
+    });
+  });
+
   test("cancel stops the turn and says so", async () => {
     const { convo, events, ran } = build([
       { name: "slow", turns: [{ text: call("sleep"), delayMs: 400 }] },

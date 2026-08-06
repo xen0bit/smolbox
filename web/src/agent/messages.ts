@@ -1,10 +1,31 @@
 // The message contract between the page and the model worker. Shared by both
 // ends so the pair cannot drift, in the same spirit as protocol.ts.
 
-/** A chat message in the shape the LFM2 chat template consumes. */
+/** One call, in the OpenAI shape chat templates read structured history from. */
+export interface ToolCallRecord {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: Record<string, unknown> };
+}
+
+/**
+ * A chat message, in the shape a chat template consumes.
+ *
+ * `content` alone is enough for every template that replays the assistant's own
+ * text — LFM2, Qwen, Llama, Granite. The two optional fields exist for templates
+ * that rebuild the call from data instead: Gemma 4 renders the assistant's
+ * `tool_calls` itself and matches each result to one by `tool_call_id`, and
+ * given a history without them it renders the tool result as nothing at all.
+ *
+ * They are only populated for a dialect whose `historyStyle` is "structured",
+ * because a template that reads both would render the call twice — LFM2.5's
+ * does exactly that.
+ */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  tool_calls?: ToolCallRecord[];
+  tool_call_id?: string;
 }
 
 /** Page -> worker. */
