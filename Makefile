@@ -9,7 +9,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model gemma-kernels \
+.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
         test-conformance lint clean
 
@@ -98,6 +98,35 @@ web:
 #     entry's preferred one, for an adapter that cannot run the preferred one
 model:
 	bun web/fetch-model.ts $(MODEL)
+
+# Every downloadable registry entry, in one go — roughly 11 GB, so this is a
+# "leave it running" target rather than a routine one. Already-complete files
+# are skipped by the fetcher's cached-size check, which makes a re-run a cheap
+# way to finish an interrupted pull.
+#
+# It keeps going past a failure and reports at the end: a dropped connection on
+# the 3.6 GB entry must not throw away the five that would have succeeded after
+# it. The exit status still reflects the failures, so CI cannot mistake a
+# partial shelf for a full one.
+#
+# The gated Antares entries are absent because they are not downloadable at all
+# (--keys omits them); `make antares-onnx` builds those.
+models:
+	@keys=$$(bun web/fetch-model.ts --keys) || { echo "error: could not read the model registry" >&2; exit 1; }; \
+	failed=(); \
+	for key in $$keys; do \
+		echo "==> $$key"; \
+		bun web/fetch-model.ts $$key || failed+=("$$key"); \
+	done; \
+	if [ $${#failed[@]} -gt 0 ]; then \
+		echo "" >&2; \
+		echo "failed ($${#failed[@]}): $${failed[*]}" >&2; \
+		echo "re-run 'make models' to retry — what already landed is kept" >&2; \
+		exit 1; \
+	fi; \
+	echo ""; \
+	echo "all downloadable registry entries are in $(DIST)/models"; \
+	echo "note: gemma4-e2b also needs 'make gemma-kernels'; antares needs 'make antares-onnx'"
 
 # The Gemma 4 WebGPU kernel engine. Downloaded rather than vendored: the Space
 # that publishes it declares no license, so a pinned pull into gitignored dist/

@@ -58,6 +58,7 @@ pure and drive it with `FakeModelClient`.
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
+| `make models` | pull **every** downloadable registry entry (~11 GB); keeps going past a failure and reports at the end. Gated/local entries (Antares) are excluded |
 | `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |

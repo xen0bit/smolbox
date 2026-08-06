@@ -7,6 +7,7 @@
 //   bun web/fetch-model.ts qwen3-1.7b             # a specific one
 //   bun web/fetch-model.ts gemma4-e2b-onnx --dtype q4   # a non-default build
 //   bun web/fetch-model.ts --list
+//   bun web/fetch-model.ts --keys              # downloadable keys, for `make models`
 //
 // transformers.js resolves a local model as <localModelPath>/<repo>/<file>, so
 // the layout here mirrors the HF repo exactly.
@@ -40,6 +41,15 @@ if (args.includes("--list")) {
   for (const m of models) {
     say(`${m.key.padEnd(24)} ${human(m.approxBytes).padStart(9)}  ${m.dialect.padEnd(7)} ${m.label}`);
   }
+  process.exit(0);
+}
+
+// One key per line on stdout, for `make models` to loop over. The local entries
+// are omitted rather than listed and skipped by the caller: whether a key can be
+// downloaded is a property of the registry, and this is the only place that
+// reads it.
+if (args.includes("--keys")) {
+  process.stdout.write(`${models.filter((m) => !m.local).map((m) => m.key).join("\n")}\n`);
   process.exit(0);
 }
 
