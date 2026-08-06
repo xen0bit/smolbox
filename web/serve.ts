@@ -1,12 +1,33 @@
 import { serve } from "bun";
+import { pathToFileURL } from "node:url";
+
+/**
+ * A served directory: `$name` from the environment when set, otherwise a path
+ * relative to this file.
+ *
+ * The override exists for deployments where the big artifacts do not sit beside
+ * the source tree — a container serving weights out of a mounted volume, say.
+ * The trailing slash is not cosmetic: `new URL(rel, root)` resolves *inside* a
+ * root only when the root ends in one, and an operator's MODELS_DIR will not.
+ */
+function servedDir(name: string, fallback: string): URL {
+  const override = Bun.env[name];
+  if (!override) {
+    return new URL(fallback, import.meta.url);
+  }
+  return pathToFileURL(override.endsWith("/") ? override : override + "/");
+}
 
 const distRoot = new URL("./dist/", import.meta.url);
 // Model weights are served straight out of dist/models rather than copied into
 // web/dist: the q4 checkpoint is ~1.2 GB and duplicating it per bundle is silly.
-const modelRoot = new URL("../dist/models/", import.meta.url);
+const modelRoot = servedDir("MODELS_DIR", "../dist/models/");
 // The Gemma kernel engine, served from dist for the same reason as the weights:
 // it is downloaded by `make gemma-kernels`, not committed (see fetch-kernels.ts).
-const kernelRoot = new URL("../dist/kernels/", import.meta.url);
+const kernelRoot = servedDir("KERNELS_DIR", "../dist/kernels/");
+// 0.0.0.0 is what Bun binds when asked for nothing, spelled out here so HOST has
+// something to override.
+const hostname = Bun.env.HOST ?? "0.0.0.0";
 const port = Number(Bun.env.PORT ?? 8080);
 
 const isolationHeaders = {
@@ -15,6 +36,7 @@ const isolationHeaders = {
 };
 
 serve({
+  hostname,
   port,
   async fetch(request) {
     const url = new URL(request.url);
@@ -88,4 +110,10 @@ async function serveFile(file: Bun.BunFile, range: string | null): Promise<Respo
   });
 }
 
-console.log(`smolbox dev server (cross-origin isolated): http://localhost:${port}`);
+// A wildcard bind is not a URL anyone can click, so name localhost in that case
+// and the actual address otherwise.
+const shown = hostname === "0.0.0.0" || hostname === "::" ? "localhost" : hostname;
+console.log(
+  `smolbox dev server (cross-origin isolated): http://${shown}:${port}` +
+    ` [bind ${hostname}:${port}, models ${modelRoot.pathname}]`,
+);

@@ -1,0 +1,16 @@
+# The root Dockerfile bind-mounts the whole build context to pick up dist/smolbox.wasm
+# and dist/js, so everything else large or irrelevant is excluded here. dist/models
+# alone is tens of gigabytes of checkpoints — it is a runtime mount, never context.
+dist/models/
+dist/kernels/
+node_modules/
+.git/
+bin/
+web/dist/
+test-results/
+playwright-report/
+tools/.venv/
+__pycache__/
+.env
+.env.*
+!.env.example

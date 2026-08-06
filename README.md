@@ -139,6 +139,19 @@ the agent spike at `/agent/`. The agent page needs a GPU; it loads weights from 
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
+The same dev server runs in a container, built from the root `Dockerfile`:
+
+```
+docker build -t smolbox/serve:dev .
+docker run --rm -p 8080:8080 -v $PWD/dist/models:/models:ro smolbox/serve:dev
+```
+
+`HOST`, `PORT`, `MODELS_DIR` and `KERNELS_DIR` configure the bind address, the port, and where the
+weights and the Gemma kernel engine are read from (`/models` and `/kernels` in the image; the paths
+beside the source tree otherwise). The build bakes in `dist/smolbox.wasm` and `dist/js` when the
+build context already has them and skips them when it does not — `make wasm` cannot run inside a
+container build, since it needs the host's Docker socket.
+
 Toolchain: **Go 1.24+** for the CLI, **Docker** for the conversion, and **bun** for the web tooling
 (bundling, unit tests, typecheck, and the dev server). Run `bun install` once to fetch the web
 dependencies.
