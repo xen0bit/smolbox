@@ -109,7 +109,7 @@ export async function boot(page: Page, fixture?: FixtureNode): Promise<Handle> {
 export async function installMount(
   page: Page,
   fixture: FixtureNode,
-  hook: "__smolbox" | "__smolagent",
+  hook: "__smolbox" | "__smolagent" | "__smolscan",
 ): Promise<void> {
   await page.evaluate(
     async ({ tree, hook }) => {

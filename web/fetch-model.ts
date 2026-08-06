@@ -41,6 +41,14 @@ if (args.includes("--list")) {
 }
 
 const entry = modelFor(args[0] ?? DEFAULT_MODEL_KEY);
+if (entry.local) {
+  // No ONNX build of these exists on the hub and the source weights are gated,
+  // so there is nothing here to download (PLAN §11.1.5). Say which command does
+  // produce them rather than emitting a wall of 404s.
+  say(`${entry.key} is built locally, not downloaded.`);
+  say(`  run: make antares-onnx ANTARES=${entry.repo.split("/").pop()?.replace("-ONNX", "")}`);
+  process.exit(1);
+}
 // The first candidate dtype is what a headless run will use; f16 variants are a
 // runtime choice the page makes against the adapter, not something to download
 // speculatively.

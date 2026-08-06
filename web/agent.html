@@ -36,6 +36,8 @@
         padding-bottom: 0.75rem;
         margin-bottom: 1rem;
       }
+      nav { margin-left: auto; display: flex; gap: 0.75rem; font-size: 0.8rem; }
+      nav [aria-current="page"] { font-weight: 600; text-decoration: none; }
       #status {
         color: var(--muted);
         font-size: 0.85rem;
@@ -205,6 +207,11 @@
     <header>
       <h1>smolbox agent</h1>
       <span id="status">idle</span>
+      <nav>
+        <a href="/">VM</a>
+        <a href="/agent/" aria-current="page">chat</a>
+        <a href="/scan/">scan</a>
+      </nav>
       <span style="flex: 1"></span>
       <select id="model" title="which checkpoint to load"></select>
       <button id="start" type="button">start</button>

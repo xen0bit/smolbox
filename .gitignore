@@ -4,5 +4,14 @@ web/dist/
 node_modules/
 test-results/
 playwright-report/
+.env
+.env.*
+!.env.example
+
+# The conversion toolchain's virtualenv (1.1 GB of torch) and bytecode cache.
+# tools/uv.lock IS committed — it is what makes the conversion reproducible.
+tools/.venv/
+__pycache__/
+*.pyc
 *.log
 .DS_Store
