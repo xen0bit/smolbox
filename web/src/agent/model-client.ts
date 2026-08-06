@@ -6,7 +6,26 @@
 // coverage at all — the same reasoning that produced M7's mock caller, one
 // level up.
 
-import type { ChatMessage, ModelRequest, ModelResponse } from "./messages.ts";
+import type { ChatMessage, ModelErrorCode, ModelRequest, ModelResponse } from "./messages.ts";
+
+/**
+ * A model failure the caller can act on.
+ *
+ * An Error subclass rather than a plain message because it crosses the worker
+ * boundary as data and has to become a throwable again on this side without the
+ * loop having to pattern-match on error strings.
+ */
+export class ModelError extends Error {
+  constructor(
+    message: string,
+    readonly code?: ModelErrorCode,
+    /** For `prompt-too-long`: the ceiling the worker enforced. */
+    readonly limitTokens?: number,
+  ) {
+    super(message);
+    this.name = "ModelError";
+  }
+}
 
 export interface GenerateRequest {
   messages: ChatMessage[];
@@ -89,7 +108,7 @@ export class WorkerModelClient implements ModelClient {
       case "error": {
         // The worker does not say which request failed, so fail whichever is
         // outstanding rather than leaving a promise pending forever.
-        const err = new Error(msg.message);
+        const err = new ModelError(msg.message, msg.code, msg.limitTokens);
         this.pendingGen?.reject(err);
         this.pendingLoad?.reject(err);
         this.pendingGen = null;

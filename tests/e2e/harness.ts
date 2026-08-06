@@ -154,6 +154,21 @@ export async function installMount(
   );
 }
 
+// Mount a real host directory through the page's folder picker rather than
+// through setMount. In a browser without showDirectoryPicker this exercises the
+// <input webkitdirectory> fallback end to end — the file chooser is the same
+// dialog a user gets, and the page rebuilds the tree from the FileList.
+export async function pickHostFolder(page: Page, dir: string, selector = "#pick"): Promise<void> {
+  const chooser = page.waitForEvent("filechooser");
+  await page.click(selector);
+  await (await chooser).setFiles(dir);
+  await page.waitForFunction(
+    (hook) => Boolean((globalThis as Record<string, any>)[hook]?.mountStatus?.()),
+    "__smolbox",
+    { timeout: 30_000 },
+  );
+}
+
 // Boot the emscripten (--to-js) page at /js/. That build has no host mount, so
 // there is no fixture to install: setMount is a no-op there and /mnt/host stays
 // empty. Everything past the page load is the same framed protocol.
@@ -165,7 +180,7 @@ export async function bootJs(page: Page): Promise<Handle> {
 
 // Drive window.__smolbox.boot and wrap the remaining session calls. Shared by
 // both pages: the WASI worker and the emscripten runtime expose the same hook.
-async function attach(
+export async function attach(
   page: Page,
   execTimeoutMs = EXEC_TIMEOUT_MS,
   bootTimeoutMs = BOOT_TIMEOUT_MS,

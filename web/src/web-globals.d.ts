@@ -17,6 +17,12 @@ declare const crossOriginIsolated: boolean;
 declare const document: {
   getElementById(id: string): Element | null;
   createElement(tag: string): Element;
+  /** The folder-picker fallback parks its hidden <input> here. */
+  body: Element;
+};
+
+declare const window: {
+  addEventListener(type: "focus", listener: () => void, options?: { once?: boolean }): void;
 };
 
 interface Element {
@@ -28,13 +34,32 @@ interface Element {
   scrollTop: number;
   readonly scrollHeight: number;
   readonly children: readonly Element[];
+  // The chat log builds assistant bubbles incrementally — reasoning, prose and
+  // a status line, each created on demand — so it needs to find and reorder
+  // children rather than only append them.
+  readonly firstChild: Element | null;
+  readonly parentElement: Element | null;
+  querySelector(selectors: string): Element | null;
+  insertBefore(node: Element, before: Element | null): Element;
   appendChild(child: Element): Element;
   replaceChildren(...children: Element[]): void;
   setAttribute(name: string, value: string): void;
   removeAttribute(name: string): void;
   /** Only used to trigger the JSON download on a synthesised anchor. */
   click(): void;
-  addEventListener(type: "click" | "keydown" | "change" | "input", listener: (ev: KeyboardEventLike) => void): void;
+  addEventListener(
+    type: "click" | "keydown" | "change" | "input" | "cancel",
+    listener: (ev: KeyboardEventLike) => void,
+  ): void;
+  remove(): void;
+}
+
+/**
+ * The subset of <input type="file" webkitdirectory> the cross-browser folder
+ * picker uses. `files` is a FileList, which is array-like rather than an array.
+ */
+interface FileInputLike extends Element {
+  readonly files: ArrayLike<import("./mount-tree").PickedFile> | null;
 }
 
 /** Only the fields the agent page reads off a key event. */

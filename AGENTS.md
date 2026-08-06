@@ -55,8 +55,10 @@ pure and drive it with `FakeModelClient`.
 | `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
+| `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
+| `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
@@ -124,6 +126,21 @@ and the handle itself live in `MountHost` on the main thread** — the worker ca
 postMessage mid-run, so worker-side cache invalidation on `remount()` is impossible without an epoch
 dance. `remount()` is a main-thread-only cache clear; the VM boots with an empty mount until the
 page calls `setMount(handle, links)`. (PLAN §4.4.)
+
+### Folder picking is cross-browser; the handle is the interface
+Only Chromium has `showDirectoryPicker()`, so `pickDirectoryHandle()` falls back to
+`<input type="file" webkitdirectory>` — supported by every current engine despite the prefix — and
+`web/src/mount-tree.ts` rebuilds the flat `FileList` (each entry carries `webkitRelativePath`) into
+the same structural `DirectoryHandleLike` the bridge already consumes. Nothing below the provider
+knows which one ran. Keep it that way: the handle shape in `fsbridge/main-host.ts` is the seam, so a
+new source of directories is a new provider, never a change to `MountHost`.
+
+Two limits are inherent to the fallback and are not bugs: the tree is enumerated at pick time
+(contents stay lazy — a `File` is a `Blob` over the real file), and a file input cannot report empty
+directories or symlinks, so the virtual-link table has nothing to fill it. That is why the Firefox
+spec expects `hello.txt\nsub\n` where the OPFS one expects `link.txt` too. The builder is pure and
+unit-tested (`mount-tree.test.ts`, including a pass through `MountHost.dispatch`); the DOM half is
+covered only by `make test-e2e-firefox`, which is the sole suite that runs outside Chromium.
 
 ### The bridge's virtual symlink table
 The File System Access API has no symlink concept, so `MountHost` keeps a path→target table checked
@@ -264,6 +281,32 @@ wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.
 `make web` copies **every** variant. A missing one surfaces as "no available backend found", not a
 404. (PLAN §2.11.25-26.)
 
+A third trap, and the one that bites conversions rather than downloads: **transformers.js reads a
+chat template only from `chat_template` inside `tokenizer_config.json`.** The standalone
+`chat_template.jinja` is loaded by `Processor`, on the multimodal path, and by nothing else — while
+Python `transformers` prefers the standalone file. So a checkpoint that ships only the file passes
+every build-time check (they all run under Python), loads on the page, and then throws inside
+`apply_chat_template` on the first turn. `make antares-onnx` writes both, and the worker fetches the
+standalone file as a fallback when the tokenizer has no inline template, which covers repos built
+before that.
+
+### The prompt budget is a GPU allocation, not a preference
+Every ONNX export here emits **full-sequence** logits (`[batch, sequence_length, vocab_size]`), so a
+prefill of N tokens allocates `N × vocab_size × 4` bytes that onnxruntime-web must map back to the
+CPU. The agent loop re-prefills the whole conversation every iteration, so a chat grows into that
+allocation one tool result at a time — and when it fails, the WebGPU device is **poisoned**: every
+later run returns "invalid due to a previous error" and the session is over, not just the turn.
+Measured with LFM2.5 2.6B at q4 on a 16 GB adapter: 16 k chars of history fine, 24 k fatal. LFM2 1.2B
+never showed it only because its vocabulary is half the size (PLAN §10.10).
+
+So `ModelEntry.vocabSize` is load-bearing: `maxPromptChars()` divides
+`PREFILL_LOGITS_BUDGET_BYTES` by it, and selecting a model sets `promptBudgetChars` from that. Adding
+a registry entry **means reading `vocab_size` out of its config.json** — `models.test.ts` fails an
+entry without one. Do not restore a flat default shared across checkpoints; that is the bug.
+`promptBudgetChars` counts the serialised tool schema as well, because the chat template puts it in
+every prompt. The worker's exact token check (`prompt-too-long`, which the loop elides to and retries
+once) is the guarantee; the character budget is only the guardrail in front of it.
+
 ### The agent loop: budgets belong to the request, not to the arguments
 `Conversation` caps output per call, but it passes the budget to the `ToolRunner` — it must never
 write `max_output` into the model's argument object. Template tools declare their own parameters and
@@ -282,10 +325,73 @@ definition format is defined in Go (`internal/tool/template.go`) and its schema 
 (`{param:raw}` opts out): correctness while raw shell is exposed, and the thing that would make a
 template-only session safe. Exposure is opt-in — a definition is ~0.5–2.3 KB of prompt on every turn.
 
+### A dialect owns the live view too, not just the parse
+`Dialect.preview(raw)` is the mid-stream half of `parseTurn`: prose so far, reasoning so far, and
+whether a tool-call block has opened and not yet closed. It exists because the page used to hold one
+hardcoded `<|tool_call_start|>`, so Qwen, Antares and Llama streamed their raw call syntax into the
+chat log as prose while LFM2 did not — the markers that must not reach the screen are exactly the
+ones that differ per family. Adding a dialect means adding both functions; `preview.test.ts` runs
+every registered dialect through the same partial-turn table.
+
+Reasoning is **separated, not discarded**. `ParsedTurn.reasoning` carries it, the chat log collapses
+it under the answer, and a turn that never left the scratchpad says so instead of rendering a page of
+first-person deliberation as the reply. `splitThinking` knows three shapes: `none`, `tagged` (the
+model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
+`<think>`, so the completion starts inside the block — LFM2.5, Antares). The localize page joins the
+two channels back together, because there the deliberation *is* the content it displays.
+
+### There are two inference engines now, and only one interface
+`ModelEntry.backend` picks between them. `transformers` is onnxruntime-web through
+transformers.js; `gemma4-kernels` is the webml-community WebGPU engine, which reads safetensors
+itself and carries its own WGSL. They meet at `ModelClient` and nowhere else — the loop, the
+dialects, the tool registry and the UI cannot tell them apart, and it should stay that way.
+
+The kernel engine is **downloaded, not vendored**: its Space declares no license, so
+`make gemma-kernels` pulls a pinned revision into gitignored `dist/kernels/` and the worker imports
+it dynamically (`gemma-kernels.ts`). Do not commit it, and do not turn that dynamic import into a
+static one — `make web` must work on a checkout that has never run the fetch.
+
+Two of its own behaviours are deliberately bypassed and both would silently break tool calling if
+restored: its `encodePrompt` renders the chat template with `tools: null`, and its `generate()`
+decodes with `skip_special_tokens: true`, which eats the very markers the dialect parses. So the
+prompt and the decode come from the transformers.js tokenizer the worker already loads, and only the
+forward pass comes from the engine, via its `_model` / `_generationState` / `_eosTokenIds`
+accessors. The prefix-cache logic around it is ours and is unit-tested
+(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16` and cannot run headless at all
+(PLAN §10.13).
+
+**`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
+256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
+allocating 2.5 GB. That looks like a bug in the engine and is not.
+
+### A registry entry must name a build that actually loads
+Two failures live here and neither is visible from a model card. transformers.js reads a weight file
+into **one `Uint8Array`** before onnxruntime sees it, so a checkpoint published as a single large
+`.onnx` with no external data blob dies in `readResponse`; and a file that does read can still fail
+`std::bad_alloc` when ORT builds the session inside the wasm heap. Qwen3 1.7B hits both (q4 at
+2.147 GB, q8 at 1.742 GB) and is therefore listed with **q4f16 only** — `pickDtype` returning
+undefined and the page saying so beats a 2 GB download that fails nine frames deep. Do not add a
+dtype back "for headless" without loading it.
+
+`weightFiles()` mirrors transformers.js' `DEFAULT_DTYPE_SUFFIX_MAPPING` and is **not** the identity:
+`q8` is `model_quantized.onnx`, `fp32` is a bare `model.onnx`. The fetcher and the loader must name
+the same file; `models.test.ts` guards it.
+
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. Only `lfm2` is verified;
-`hermes` and `llama` are marked unverified and say so in the UI. Promote a dialect by capturing a
-real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `antares`
+and `hermes` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
+capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+`hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
+`dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
+and Qwen3 will not load without `shader-f16`. `lfm2.5` shares LFM2's verified call markers but is its
+own entry because the checkpoint always reasons first: its chat template ends the generation prompt
+with a bare `<think>`, so completions open inside the scratchpad and the dialect splits it off. Its
+transcript fixture is still outstanding — the `test.todo` at the end of `lfm25.test.ts` says how to
+take it.
+
+**Verified is about the parser, not the model.** Qwen2.5 0.5B emits flawless `<tool_call>` JSON
+naming tools that do not exist, and never takes the correction; that is what promoted `hermes` and it
+is still not a usable agent. Say which of the two a registry note is talking about.
 
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
@@ -320,6 +426,11 @@ real transcript, never by reading a vendor doc — that is the M8 lesson encoded
 - `tests/e2e/harness.ts` `installMount(page, fixture, hook)` is shared by the VM page and the agent
   page, so both mount through the identical bridge and virtual-symlink path. Take the hook name as a
   parameter rather than forking it.
+- `tests/e2e/mount-picker.spec.ts` is the only spec that runs in **Firefox**
+  (`playwright.firefox.config.ts`, `make test-e2e-firefox`) — it is where the no-`showDirectoryPicker`
+  path is real. It drives the page's own pick button through Playwright's `filechooser` event with a
+  directory path, so the mount comes from the real dialog rather than a test hook. It rides the
+  existing browser-e2e CI job, which already has the wasm artifact.
 - `tests/e2e/emscripten.spec.ts` (M6) drives the `/js/` page through `bootJs()` and needs `dist/js`,
   not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
   WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.

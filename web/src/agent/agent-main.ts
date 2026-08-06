@@ -9,15 +9,23 @@
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
-import { getOpfsDirectoryHandle, pickDirectoryHandle } from "../mount.ts";
+import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "../mount.ts";
 import { toolName } from "../tool.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { dialectFor } from "./dialects/index.ts";
-import { DEFAULT_MODEL_KEY, type Dtype, modelFor, models, pickDtype } from "./models.ts";
+import {
+  DEFAULT_MODEL_KEY,
+  type Dtype,
+  type ModelEntry,
+  maxPromptChars,
+  modelFor,
+  models,
+  pickDtype,
+} from "./models.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
-import type { ParsedCall } from "./parse.ts";
+import type { ParsedCall, StreamPreview } from "./parse.ts";
 import { ToolRegistry } from "./tool-registry.ts";
 import type { TemplateTool } from "./user-tools.ts";
 
@@ -139,43 +147,63 @@ const convo = new Conversation(
   onEvent,
 );
 
+// The raw completion for the turn in flight. The preview is recomputed from the
+// whole buffer rather than appended to, because whether a chunk is prose depends
+// on markers that may only close several chunks later.
+let turnRaw = "";
+// The tool bubble opened at tool-start and completed at tool-end. A command can
+// take seconds inside the VM, and an empty log for those seconds reads as a hang.
+let pendingTool: { body: Element; out: Element } | null = null;
+
 function onEvent(ev: AgentEvent): void {
   events.push(ev);
   switch (ev.kind) {
     case "user":
       bubble("user", "you")!.textContent = ev.text;
-      streaming = null;
+      endStream();
       break;
     case "token": {
-      // Prose streams live; a tool-call block is held back until it closes,
-      // because half a call rendered as text is noise, not progress.
-      if (!streaming) {
-        streaming = bubble("assistant", "model");
-      }
-      if (streaming) {
-        const next = (streaming.textContent ?? "") + ev.text;
-        streaming.textContent = visiblePart(next);
-        logEl && (logEl.scrollTop = logEl.scrollHeight);
-      }
+      turnRaw += ev.text;
+      renderStream(convo.options().dialect.preview(turnRaw));
       break;
     }
     case "assistant":
-      if (streaming) {
-        streaming.textContent = ev.text;
-      } else if (ev.text) {
-        bubble("assistant", "model")!.textContent = ev.text;
-      }
-      streaming = null;
+      // The parsed turn supersedes the preview: same content, but split by a
+      // parser that has seen the whole completion rather than a prefix of it.
+      finishStream(ev.text, ev.reasoning ?? "");
       break;
-    case "tool-start":
-      streaming = null;
-      break;
-    case "tool-end": {
-      const body = bubble("tool", `tool · exit ${ev.exitCode}`);
+    case "tool-start": {
+      endStream();
+      const body = bubble("tool", "tool · running…");
       if (body) {
         const cmd = document.createElement("span");
         cmd.className = "cmd";
-        cmd.textContent = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
+        cmd.textContent = `$ ${String(ev.call.args.cmd ?? ev.call.name)}`;
+        const out = document.createElement("span");
+        out.className = "pending";
+        out.textContent = "waiting for the guest…";
+        body.appendChild(cmd);
+        body.appendChild(out);
+        pendingTool = { body, out };
+      }
+      break;
+    }
+    case "tool-end": {
+      const cmdText = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
+      const label = `tool · exit ${ev.exitCode}`;
+      if (pendingTool) {
+        setLabel(pendingTool.body, label, ev.exitCode === 0 ? "tool" : "tool bad");
+        (pendingTool.body.firstChild as Element).textContent = cmdText;
+        pendingTool.out.className = "";
+        pendingTool.out.textContent = ev.rendered;
+        pendingTool = null;
+        break;
+      }
+      const body = bubble(ev.exitCode === 0 ? "tool" : "tool bad", label);
+      if (body) {
+        const cmd = document.createElement("span");
+        cmd.className = "cmd";
+        cmd.textContent = cmdText;
         const out = document.createElement("span");
         out.textContent = ev.rendered;
         body.appendChild(cmd);
@@ -185,38 +213,134 @@ function onEvent(ev: AgentEvent): void {
     }
     case "elided":
       bubble("note", "context")!.textContent =
-        `elided ${ev.messages} older message(s) to stay within the history budget (now ~${ev.chars} chars)`;
+        `trimmed ${ev.messages} older message(s) to stay inside this model's prompt budget (now ~${ev.chars} chars)`;
       break;
     case "stopped":
+      endStream();
       bubble("note", "stopped")!.textContent =
         ev.reason === "iteration-cap"
           ? "stopped: hit the tool-call limit for this turn"
           : "stopped by you";
-      streaming = null;
       break;
     case "error":
+      endStream();
       bubble("error", "error")!.textContent = ev.message;
-      streaming = null;
       break;
   }
 }
 
-const OPEN = "<|tool_call_start|>";
-
-// Everything from an unclosed tool-call marker onward is withheld.
-function visiblePart(raw: string): string {
-  const open = raw.lastIndexOf(OPEN);
-  if (open === -1) {
-    return stripMarkers(raw);
+/**
+ * The live view of the turn in flight.
+ *
+ * Three things can be true at once and each gets its own place: prose is the
+ * answer and streams as text, reasoning is collapsed behind a summary so a
+ * model that thinks for a page does not bury the reply, and a tool call that
+ * has opened but not closed is a status line rather than half of its own
+ * syntax. That last one is what made the parsing look broken from the outside:
+ * the markers streamed into the chat as prose until the block completed.
+ */
+function renderStream(p: StreamPreview): void {
+  if (!streaming) {
+    streaming = bubble("assistant", "model");
   }
-  return stripMarkers(raw.slice(0, open));
+  if (!streaming) {
+    return;
+  }
+  const think = p.reasoning ? thinkingBlock(streaming) : null;
+  if (think) {
+    think.body.textContent = p.reasoning;
+    think.summary.textContent = `thinking… (${p.reasoning.length} chars)`;
+  }
+  proseNode(streaming).textContent = p.text;
+  statusNode(streaming).textContent = p.pendingCall ? "preparing a tool call…" : "";
+  scrollLog();
 }
 
-function stripMarkers(s: string): string {
-  return s
-    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/g, "")
-    .replace(/<\|im_(start|end)\|>/g, "")
-    .replace(/<\|(start|end)oftext\|>/g, "");
+/** Replaces the live view with the parsed one and closes the bubble. */
+function finishStream(text: string, reasoning: string): void {
+  if (!streaming && !text && !reasoning) {
+    return;
+  }
+  if (!streaming) {
+    streaming = bubble("assistant", "model");
+  }
+  if (!streaming) {
+    return;
+  }
+  statusNode(streaming).textContent = "";
+  proseNode(streaming).textContent = text;
+  if (reasoning) {
+    const think = thinkingBlock(streaming);
+    think.body.textContent = reasoning;
+    think.summary.textContent = text
+      ? `thought first (${reasoning.length} chars)`
+      : `thought for ${reasoning.length} chars, then stopped without answering`;
+  }
+  endStream();
+}
+
+function endStream(): void {
+  // A turn that was only a tool call leaves an empty bubble behind — a "MODEL"
+  // label with nothing under it, which is the kind of artefact that makes a
+  // working page look unfinished.
+  if (streaming && !streaming.textContent?.trim()) {
+    streaming.parentElement?.remove();
+  }
+  streaming = null;
+  turnRaw = "";
+}
+
+// The assistant bubble's body holds up to three children, created on demand and
+// always in this order: reasoning, prose, status.
+function thinkingBlock(body: Element): { summary: Element; body: Element } {
+  const existing = body.querySelector(".think");
+  if (existing) {
+    return {
+      summary: existing.querySelector("summary")!,
+      body: existing.querySelector(".think-body")!,
+    };
+  }
+  const details = document.createElement("details");
+  details.className = "think";
+  const summary = document.createElement("summary");
+  const inner = document.createElement("div");
+  inner.className = "think-body";
+  details.appendChild(summary);
+  details.appendChild(inner);
+  body.insertBefore(details, body.firstChild);
+  return { summary, body: inner };
+}
+
+function childNode(body: Element, cls: string): Element {
+  const existing = body.querySelector(`.${cls}`);
+  if (existing) {
+    return existing;
+  }
+  const node = document.createElement("div");
+  node.className = cls;
+  body.appendChild(node);
+  return node;
+}
+
+const proseNode = (body: Element) => childNode(body, "prose");
+const statusNode = (body: Element) => childNode(body, "pending");
+
+function setLabel(body: Element, text: string, cls: string): void {
+  const wrap = body.parentElement;
+  if (!wrap) {
+    return;
+  }
+  wrap.className = `msg ${cls}`;
+  const who = wrap.querySelector(".who");
+  if (who) {
+    who.textContent = text;
+  }
+}
+
+function scrollLog(): void {
+  if (logEl) {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
 }
 
 // -------------------------------------------------------------- page plumbing
@@ -238,15 +362,90 @@ async function adapterFeatures(): Promise<ReadonlySet<string>> {
   return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
+// The loop passes maxNewTokens and promptBudgetChars on every generate, so they
+// win over whatever the registry entry declares — which is right for knobs the
+// user can turn, and wrong as defaults. A reasoning model that thinks before it
+// answers needs more than 512 new tokens or it stops mid-thought every turn; and
+// the prompt ceiling is a property of the checkpoint's vocabulary, not a
+// preference, because exceeding it kills the WebGPU device rather than the turn
+// (models.ts PREFILL_LOGITS_BUDGET_BYTES). Selecting a model moves both knobs to
+// that checkpoint's numbers; changing them afterwards still wins.
+function applyModelBudgets(entry: ModelEntry): void {
+  const tokens = entry.generation?.max_new_tokens;
+  if (tokens) {
+    convo.configure({ maxNewTokens: tokens });
+    setInput("opt-tokens", tokens);
+  }
+  const budget = maxPromptChars(entry);
+  convo.configure({ promptBudgetChars: budget });
+  setInput("opt-history", budget);
+}
+
+function setInput(id: string, value: number): void {
+  const input = el(id);
+  if (input) {
+    input.value = String(value);
+  }
+}
+
+/**
+ * Says out loud when the selected entry is not a chat model.
+ *
+ * Antares is trained for one job, with a fixed termination protocol, and the
+ * registry has always known that (`task: "localize"`). The chat dropdown listed
+ * it anyway with nothing to distinguish it from LFM2 — which is precisely the
+ * "confident nonsense" the registry comment warns about, offered as though it
+ * were a supported choice. The scan page is where it belongs and is one link
+ * away, so say so before the weights are fetched rather than after.
+ */
+function noteModelChoice(entry: ModelEntry): void {
+  if (entry.task !== "localize") {
+    return;
+  }
+  const body = bubble("note", "not a chat model");
+  if (body) {
+    body.textContent =
+      `${entry.label} is trained for vulnerability localization, not conversation — it expects one ` +
+      `task and a fixed way of finishing it. The scan page at /scan/ is built around that protocol. ` +
+      `Loading it here will produce fluent answers that mean very little.`;
+  }
+}
+
 let busy = false;
+// Two separate readiness facts, because they fail for different reasons and the
+// composer should say which one is missing rather than accepting a message and
+// answering it with "generate before ready".
+let vmReady = false;
+let modelReady = false;
 
 function setBusy(on: boolean): void {
   busy = on;
+  refreshControls();
+}
+
+function refreshControls(): void {
+  const ready = vmReady && modelReady;
   if (sendEl) {
-    sendEl.disabled = on;
+    sendEl.disabled = busy || !ready;
   }
   if (stopEl) {
-    stopEl.disabled = !on;
+    stopEl.disabled = !busy;
+  }
+  if (startEl) {
+    startEl.disabled = busy;
+    startEl.textContent = ready ? "reload model" : "start";
+  }
+  if (promptEl) {
+    promptEl.setAttribute(
+      "placeholder",
+      busy
+        ? "working…"
+        : ready
+          ? "ask about the mounted folder…"
+          : vmReady
+            ? "press start to load the model"
+            : "press start to boot the VM and load a model",
+    );
   }
 }
 
@@ -289,7 +488,20 @@ const handle: SmolagentHandle = {
     const dialect = dialectFor(entry.dialect);
     convo.configure({ dialect });
 
-    const dtype = pickDtype(entry, await adapterFeatures());
+    const features = await adapterFeatures();
+    // Checked before anything is fetched. The kernel backend would otherwise
+    // stream 2.5 GB onto the GPU and fail on the first forward pass with "No
+    // supported WebGPU variant", which reads as a bug rather than as an
+    // unsupported adapter.
+    const missing = (entry.requiresFeatures ?? []).filter((f) => !features.has(f));
+    if (missing.length > 0) {
+      throw new Error(
+        `${entry.label} needs the WebGPU feature${missing.length > 1 ? "s" : ""} ` +
+          `${missing.join(", ")}, which this adapter does not expose. ` +
+          `Headless Chromium never does; a desktop browser on a recent GPU usually will.`,
+      );
+    }
+    const dtype = pickDtype(entry, features);
     if (!dtype) {
       throw new Error(
         `${entry.label}: none of its quantizations (${entry.dtypes.join(", ")}) run on this adapter`,
@@ -303,17 +515,28 @@ const handle: SmolagentHandle = {
     const useLocal = local ?? (await haveLocalWeights(entry.repo));
     setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
     const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
+    modelReady = true;
+    refreshControls();
     setStatus(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     return ready;
   },
   setModel: (key: string) => {
-    currentModelKey = modelFor(key).key;
-    convo.configure({ dialect: dialectFor(modelFor(key).dialect) });
-    setStatus(`model: ${modelFor(key).label} (not loaded yet)`);
+    const entry = modelFor(key);
+    currentModelKey = entry.key;
+    convo.configure({ dialect: dialectFor(entry.dialect) });
+    applyModelBudgets(entry);
+    // The weights in the worker are still the previous model's, and answering
+    // with them under a new dialect would be the worst of both.
+    modelReady = false;
+    refreshControls();
+    noteModelChoice(entry);
+    setStatus(`model: ${entry.label} — press start to load it`);
   },
   bootVm: async (timeoutMs?: number) => {
     setStatus("booting the VM…");
     const caps = await session.boot(timeoutMs);
+    vmReady = true;
+    refreshControls();
     setStatus(`vm ready (agent v${caps.version})`);
     return caps;
   },
@@ -382,7 +605,7 @@ function DEMO_SCRIPTS(): FakeScript[] {
 const optionInputs: Record<string, string> = {
   "opt-iterations": "maxIterations",
   "opt-maxoutput": "perCallMaxOutput",
-  "opt-history": "historyBudgetChars",
+  "opt-history": "promptBudgetChars",
   "opt-tokens": "maxNewTokens",
 };
 for (const [id, key] of Object.entries(optionInputs)) {
@@ -398,6 +621,11 @@ for (const [id, key] of Object.entries(optionInputs)) {
     }
   });
 }
+
+// The dropdown starts on the default entry without ever firing `change`, so its
+// budgets have to be applied here too — otherwise the first model anyone loads
+// runs on the loop's generic defaults instead of its own ceiling.
+applyModelBudgets(modelFor(DEFAULT_MODEL_KEY));
 
 el("composer")?.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
@@ -423,7 +651,16 @@ async function submit(): Promise<void> {
     await handle.send(text);
     setStatus("ready");
   } catch (err) {
-    setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
+    // The loop turns model and tool failures into `error` events, so reaching
+    // here means something outside it broke. Put it in the log anyway: a status
+    // line above the fold is not where anyone looks for why a message they just
+    // sent produced nothing.
+    const message = err instanceof Error ? err.message : String(err);
+    const body = bubble("error", "error");
+    if (body) {
+      body.textContent = message;
+    }
+    setStatus(`error: ${message}`);
   }
 }
 
@@ -447,7 +684,15 @@ startEl?.addEventListener("click", async () => {
     await handle.loadModel();
     setStatus("ready — ask something");
   } catch (err) {
-    setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
+    // Loading a 2 GB checkpoint fails for reasons the user can act on — no
+    // adapter, no weights, a quantization this GPU cannot run — so the reason
+    // goes in the log next to the question it will not be answering.
+    const message = err instanceof Error ? err.message : String(err);
+    const body = bubble("error", "error");
+    if (body) {
+      body.textContent = message;
+    }
+    setStatus(`error: ${message}`);
   } finally {
     setBusy(false);
   }
@@ -457,7 +702,11 @@ pickEl?.addEventListener("click", async () => {
   try {
     handle.setMount(await pickDirectoryHandle());
   } catch (err) {
-    setStatus(`pick failed: ${err instanceof Error ? err.message : String(err)}`);
+    setStatus(
+      isPickCancelled(err)
+        ? "mount unchanged (no folder chosen)"
+        : `pick failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 });
 
@@ -549,17 +798,33 @@ el("tool-import")?.addEventListener("click", () => {
 
 renderToolList();
 
-// Populate the model dropdown from the registry, marking unverified dialects
-// so an odd answer reads as "we never checked this family" rather than a bug.
+// Populate the model dropdown from the registry, marking unverified dialects so
+// an odd answer reads as "we never checked this family" rather than a bug, and
+// keeping the task-specific checkpoints in a group of their own so they are not
+// presented as chat models that happen to be further down the list.
 const modelSelect = el("model");
 if (modelSelect) {
-  for (const m of models) {
+  const option = (m: ModelEntry) => {
     const opt = document.createElement("option");
     opt.value = m.key;
     const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
     opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
-    modelSelect.appendChild(opt);
+    return opt;
+  };
+
+  for (const m of models.filter((e) => e.task !== "localize")) {
+    modelSelect.appendChild(option(m));
   }
+  const special = models.filter((e) => e.task === "localize");
+  if (special.length > 0) {
+    const group = document.createElement("optgroup");
+    group.setAttribute("label", "not chat models — see /scan/");
+    for (const m of special) {
+      group.appendChild(option(m));
+    }
+    modelSelect.appendChild(group);
+  }
+
   modelSelect.value = currentModelKey;
   modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
 }

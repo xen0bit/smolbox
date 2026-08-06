@@ -5,7 +5,13 @@
 // UNVERIFIED — see the note in hermes.ts. Written from Meta's documented format,
 // not from a captured turn.
 
-import { type ParsedCall, type ParsedTurn, parseCallBody, stripSpecialTokens } from "../parse.ts";
+import {
+  type ParsedCall,
+  type ParsedTurn,
+  type StreamPreview,
+  parseCallBody,
+  stripSpecialTokens,
+} from "../parse.ts";
 import type { Dialect } from "./types.ts";
 
 export const PYTHON_TAG = "<|python_tag|>";
@@ -48,10 +54,32 @@ function looksLikeBareCall(s: string): boolean {
   }
 }
 
+/**
+ * Everything from the python tag onward is call, not prose.
+ *
+ * There is no closing marker to wait for — `<|eom_id|>` ends the turn — so the
+ * call is pending from the tag until generation stops. The bare-JSON form has
+ * no marker at all and cannot be recognised until the turn is complete, so it
+ * streams as the prose it looks like; that is a limit of the format rather than
+ * of this function.
+ */
+export function preview(raw: string): StreamPreview {
+  const tag = raw.indexOf(PYTHON_TAG);
+  if (tag === -1) {
+    return { text: stripSpecialTokens(raw).trim(), reasoning: "", pendingCall: false };
+  }
+  return {
+    text: stripSpecialTokens(raw.slice(0, tag)).trim(),
+    reasoning: "",
+    pendingCall: !raw.includes("<|eom_id|>", tag),
+  };
+}
+
 export const llama: Dialect = {
   name: "llama",
   label: "Llama 3.x (<|python_tag|> JSON)",
   verified: false,
   note: "Implemented from Meta's documented format, never run against the real model. Capture a transcript before trusting it.",
   parseTurn,
+  preview,
 };

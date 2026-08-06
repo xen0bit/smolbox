@@ -24,14 +24,16 @@ describe("antares dialect", () => {
 <tool_call>
 {"name": "terminal", "command": "find . -type f | grep -E \\"\\\\.(sql|db)\\" | head -n 200", "max_chars": 20000}
 </tool_call>`;
-    const { calls, text } = parseTurn(raw);
+    const { calls, text, reasoning } = parseTurn(raw);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.name).toBe("terminal");
     expect(calls[0]!.args.command).toBe('find . -type f | grep -E "\\.(sql|db)" | head -n 200');
     expect(calls[0]!.args.max_chars).toBe(20000);
-    // The reasoning is not prose for the user.
-    expect(text).not.toContain("</think>");
-    expect(text).toContain("SQL-related keywords");
+    // The reasoning is kept, but as its own channel — not as prose for the user
+    // and not as the answer. The scan page shows it under its own event kind.
+    expect(text).toBe("");
+    expect(reasoning).toContain("SQL-related keywords");
+    expect(reasoning).not.toContain("</think>");
   });
 
   test("CAPTURED: nested arguments still work, and take precedence", () => {
@@ -97,9 +99,11 @@ describe("antares dialect", () => {
     // quoting JSON at the user file a finding. Same refusal as the llama
     // dialect (PLAN §10.9).
     const raw = 'Here is what I found: {"ranked_files": ["src/app/index.js"]}';
-    const { calls, text } = parseTurn(raw);
+    const { calls, text, reasoning } = parseTurn(raw);
     expect(calls).toHaveLength(0);
-    expect(text).toContain("ranked_files");
+    // No `</think>` yet, so this checkpoint is still inside the block its own
+    // prompt opened: the text is reasoning, and either way it is not a call.
+    expect(`${text}${reasoning}`).toContain("ranked_files");
   });
 
   test("Pythonic syntax is refused rather than parsed", () => {
@@ -118,14 +122,16 @@ describe("antares dialect", () => {
     expect(calls.map((c) => c.args.command)).toEqual(["ls", "pwd"]);
   });
 
-  test("a turn with no call is prose, with think blocks removed", () => {
-    const { calls, text } = parseTurn("I'll look at the repo.\n</think>\nStarting now.");
+  test("a turn with no call splits into reasoning and the prose after it", () => {
+    const { calls, text, reasoning } = parseTurn("I'll look at the repo.\n</think>\nStarting now.");
     expect(calls).toHaveLength(0);
-    expect(text).toBe("I'll look at the repo.\n\nStarting now.");
+    expect(reasoning).toBe("I'll look at the repo.");
+    expect(text).toBe("Starting now.");
   });
 
-  test("special tokens are stripped from prose", () => {
-    const { text } = parseTurn("done<|end_of_text|>");
-    expect(text).toBe("done");
+  test("special tokens are stripped from both channels", () => {
+    // Still inside the block the prompt opened, so this is reasoning.
+    expect(parseTurn("done<|end_of_text|>").reasoning).toBe("done");
+    expect(parseTurn("thinking</think>done<|end_of_text|>").text).toBe("done");
   });
 });

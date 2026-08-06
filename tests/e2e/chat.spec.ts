@@ -19,6 +19,7 @@ const mountDir = fileURLToPath(new URL("../../testdata/mount", import.meta.url))
 interface AgentEvent {
   kind: string;
   text?: string;
+  reasoning?: string;
   message?: string;
   reason?: string;
   rendered?: string;
@@ -31,6 +32,7 @@ interface AgentEvent {
 type AgentGlobal = {
   __smolagent?: {
     useFake(scripts: unknown[]): void;
+    setModel(key: string): void;
     loadModel(local?: boolean): Promise<{ source: string }>;
     bootVm(timeoutMs?: number): Promise<{ version: string }>;
     send(text: string): Promise<AgentEvent[]>;
@@ -235,5 +237,68 @@ test.describe("agent chat loop", () => {
     await expect(log.locator(".msg.assistant").last()).toContainText("hello.txt, link.txt and sub");
     // A tool-call block must never be rendered as raw prose.
     await expect(log).not.toContainText("tool_call_start");
+  });
+
+  // A turn that was only a tool call used to leave an empty assistant bubble
+  // behind — a "MODEL" label with nothing under it, once per call.
+  test("a turn that is only a tool call leaves no empty bubble", async ({ page }) => {
+    await send(page, "what files are in the folder?");
+    const log = page.locator("#log");
+    await expect(log.locator(".msg.assistant")).toHaveCount(1);
+    await expect(log.locator(".msg.assistant").first()).toContainText("hello.txt, link.txt and sub");
+  });
+
+  test("prose before a call is its own bubble and the markers stay out of it", async ({ page }) => {
+    await send(page, "explain then look");
+    const log = page.locator("#log");
+    await expect(log.locator(".msg.assistant").first()).toContainText("Let me check the folder first.");
+    await expect(log).not.toContainText("tool_call");
+  });
+
+  test("a failed command is labelled by its exit code", async ({ page }) => {
+    await send(page, "try writing to the mount");
+    const log = page.locator("#log");
+    await expect(log.locator(".msg.tool.bad")).toHaveCount(1);
+    await expect(log.locator(".msg.tool.bad .who")).not.toContainText("exit 0");
+  });
+
+  test.describe("a reasoning model", () => {
+    test.beforeEach(async ({ page }) => {
+      // The dialect is what decides how a turn is split, and it moves with the
+      // model. No weights are loaded — the scripted client ignores them.
+      await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.setModel("lfm2.5-2.6b"));
+    });
+
+    test("the scratchpad is collapsed under the answer, not shown as one", async ({ page }) => {
+      const events = await send(page, "think first about this");
+      const log = page.locator("#log");
+
+      // The answer is the answer.
+      await expect(log.locator(".msg.assistant").last()).toContainText("There are three entries.");
+      // The reasoning is present, in its own collapsed block, and closed.
+      const think = log.locator(".msg.assistant .think").last();
+      await expect(think).toHaveCount(1);
+      await expect(think).not.toHaveAttribute("open", /.*/);
+      await expect(think.locator(".think-body")).toContainText("Now I have the listing");
+      // And it is not part of the prose.
+      await expect(log.locator(".msg.assistant .prose").last()).not.toContainText(
+        "Now I have the listing",
+      );
+      await expect(log).not.toContainText("</think>");
+
+      const answer = events.filter((e) => e.kind === "assistant").at(-1);
+      expect(answer?.text).toBe("There are three entries.");
+      expect(answer?.reasoning).toContain("Now I have the listing");
+    });
+
+    test("a turn that never leaves the scratchpad says so instead of looking empty", async ({ page }) => {
+      await send(page, "think forever please");
+      const log = page.locator("#log");
+      const bubble = log.locator(".msg.assistant").last();
+      await expect(bubble.locator(".think summary")).toContainText("without answering");
+      await expect(bubble.locator(".think-body")).toContainText("Let me consider");
+      // The deliberation is not presented in the same voice as an answer.
+      await expect(bubble.locator(".prose")).toHaveText("");
+    });
   });
 });

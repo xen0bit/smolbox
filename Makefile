@@ -9,8 +9,9 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model \
-        test test-integration test-web test-e2e test-e2e-js test-e2e-agent test-conformance lint clean
+.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model gemma-kernels \
+        test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
+        test-conformance lint clean
 
 # c2w runs as root in the container, so everything it writes to dist/ lands
 # root-owned — and then a later `mkdir dist/js` fails with EPERM for the user who
@@ -96,6 +97,14 @@ web:
 model:
 	bun web/fetch-model.ts $(MODEL)
 
+# The Gemma 4 WebGPU kernel engine. Downloaded rather than vendored: the Space
+# that publishes it declares no license, so a pinned pull into gitignored dist/
+# is the honest way to depend on it (web/fetch-kernels.ts). web/serve.ts serves
+# it at /kernels/ straight out of dist, exactly as it does the weights, and the
+# agent page imports it dynamically and says to run this when it is absent.
+gemma-kernels:
+	bun web/fetch-kernels.ts
+
 # Builds Antares into ONNX, because nobody publishes one (PLAN §11.1.5). This is
 # the only target in the repo that needs Python, uv and an HF_TOKEN; everything
 # else is Go and bun. The weights are gated, and acceptance is per repository —
@@ -137,6 +146,11 @@ test-web:
 
 test-e2e: web
 	bunx --bun playwright test --config tests/e2e/playwright.config.ts
+
+# The cross-browser mount: Firefox has no showDirectoryPicker, so this is the
+# only suite that exercises the <input webkitdirectory> fallback for real.
+test-e2e-firefox: web
+	bunx --bun playwright test --config tests/e2e/playwright.firefox.config.ts
 
 test-e2e-js: web
 	@test -d "$(DIST)/js" || { echo "error: $(DIST)/js missing; run 'make wasm-js' first (M6)" >&2; exit 1; }

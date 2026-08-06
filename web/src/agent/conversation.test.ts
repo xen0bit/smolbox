@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { lfm2 } from "./dialects/lfm2.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
+import { ModelError } from "./model-client.ts";
 import type { ParsedCall } from "./parse.ts";
 
 const call = (cmd: string) => `<|tool_call_start|>[run_terminal_command(cmd="${cmd}")]<|tool_call_end|>`;
@@ -181,7 +182,7 @@ describe("Conversation", () => {
         tools: [],
         dialect: lfm2,
         ...DEFAULTS,
-        historyBudgetChars: 6000,
+        promptBudgetChars: 6000,
         maxIterations: 6,
       },
       new FakeModelClient([
@@ -198,6 +199,182 @@ describe("Conversation", () => {
     expect(tools.some((m) => m.content.startsWith("[older output elided]"))).toBe(true);
     // The exit code survives elision: that it ran and worked outlives the bytes.
     expect(tools.some((m) => m.content.includes("exit_code: 0"))).toBe(true);
+  });
+
+  // The LFM2.5 failure: a prompt past the checkpoint's prefill ceiling killed
+  // the WebGPU device, the rejection propagated straight out of send(), and the
+  // page was left with a user message, no reply, and nothing on screen saying
+  // why. Every later message rebuilt the same prompt and died the same way.
+  test("a model failure ends the turn as a visible event, not a rejection", async () => {
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => {
+          throw new Error("failed to call OrtRun()");
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+    expect(events.some((e) => e.kind === "error" && /OrtRun/.test(e.message))).toBe(true);
+    // And no phantom assistant turn was invented to stand in for the reply.
+    expect(convo.messages().some((m) => m.role === "assistant")).toBe(false);
+  });
+
+  test("a prompt-too-long refusal elides to the reported ceiling and retries", async () => {
+    const events: AgentEvent[] = [];
+    const seen: number[] = [];
+    let turn = 0;
+    const convo = new Conversation(
+      // A budget the loop believes is roomy, which is the situation the char
+      // estimate gets wrong and the worker's real tokenizer catches.
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 1_000_000 },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async (req) => {
+          seen.push(req.messages.reduce((n, m) => n + m.content.length, 0));
+          turn++;
+          // First a tool call, to put a large result in history. Then the
+          // refusal, and only then an answer.
+          if (turn === 1) {
+            return { text: call("ls"), tokens: 1, ms: 0, stopped: false };
+          }
+          if (turn === 2) {
+            // 500 tokens ≈ 2000 chars, which is the budget the loop must adopt.
+            throw new ModelError("prompt is 9001 tokens", "prompt-too-long", 500);
+          }
+          return { text: "ok", tokens: 1, ms: 0, stopped: false };
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: `exit_code: 0\n${"x".repeat(8000)}`, exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    expect(seen).toHaveLength(3);
+    // The retry is a smaller prompt than the one that was refused.
+    expect(seen[2]!).toBeLessThan(seen[1]!);
+    // 500 tokens of room, less the two characters the empty tool list costs.
+    expect(convo.options().promptBudgetChars).toBe(1998);
+    expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
+  });
+
+  test("a second prompt-too-long is reported rather than retried forever", async () => {
+    const events: AgentEvent[] = [];
+    let calls = 0;
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => {
+          calls++;
+          throw new ModelError("still too long", "prompt-too-long", 10);
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+    expect(calls).toBe(2);
+    expect(events.some((e) => e.kind === "error" && /still too long/.test(e.message))).toBe(true);
+  });
+
+  // The tool schema is prompt text the messages never contain: the chat template
+  // serialises it into the system turn on every single turn. Leaving it out of
+  // the budget meant a user with several template tools enabled was ~10 KB over
+  // a ceiling the loop believed it was under.
+  test("the serialised tool schema counts against the prompt budget", async () => {
+    const script: FakeScript[] = [
+      { name: "x", turns: [{ text: call("a".repeat(700)) }, { text: call("b".repeat(700)) }, { text: "done" }] },
+    ];
+    const opts = { promptBudgetChars: 4500, maxIterations: 4 };
+
+    // ~3 KB of conversation fits the budget on its own…
+    const { convo: roomy, events: quiet } = build(script, { ...opts, tools: [] });
+    await roomy.send("go");
+    expect(kinds(quiet)).not.toContain("elided");
+
+    // …and does not once the tool schema on every prompt is counted too.
+    const { convo, events } = build(script, {
+      ...opts,
+      tools: [{ name: "t", description: "d".repeat(4000) }],
+    });
+    await convo.send("go");
+    expect(kinds(events)).toContain("elided");
+  });
+
+  // Gemma 4's template rebuilds the call from data instead of replaying the
+  // model's text, and matches each result to a call by tool_call_id. Given the
+  // flat history every other dialect uses it renders the tool result as nothing
+  // at all — the model asks for a command and never sees its output.
+  describe("a structured dialect", () => {
+    const structured = { ...lfm2, historyStyle: "structured" as const };
+
+    test("records the parsed calls and the id each result answers", async () => {
+      const { convo } = build(
+        [{ name: "x", turns: [{ text: call("ls") }, { text: "done" }] }],
+        { dialect: structured },
+      );
+      await convo.send("go");
+
+      const assistant = convo.messages().find((m) => m.role === "assistant")!;
+      expect(assistant.tool_calls).toHaveLength(1);
+      expect(assistant.tool_calls![0]!.function).toEqual({
+        name: "run_terminal_command",
+        arguments: { cmd: "ls" },
+      });
+      // The assistant turn carries the prose, not the raw markers: the template
+      // renders the call itself, so replaying the text would duplicate it.
+      expect(assistant.content).not.toContain("tool_call_start");
+
+      const result = convo.messages().find((m) => m.role === "tool")!;
+      expect(result.tool_call_id).toBe(assistant.tool_calls![0]!.id);
+    });
+
+    test("a refused call still names the call it answers", async () => {
+      const events: AgentEvent[] = [];
+      const convo = new Conversation(
+        { systemPrompt: "sys", tools: [], dialect: structured, ...DEFAULTS },
+        new FakeModelClient([{ name: "bad", turns: [{ text: call("x") }, { text: "sorry" }] }]),
+        { run: async () => { throw new Error("no such tool"); } },
+        (e) => events.push(e),
+      );
+      await convo.send("go");
+      const result = convo.messages().find((m) => m.role === "tool")!;
+      expect(result.content).toContain("no such tool");
+      expect(result.tool_call_id).toBeTruthy();
+    });
+
+    test("ids are unique across turns, so a result cannot answer the wrong call", async () => {
+      const { convo } = build(
+        [{ name: "x", turns: [{ text: call("a") }, { text: call("b") }, { text: "done" }] }],
+        { dialect: structured, maxIterations: 4 },
+      );
+      await convo.send("go");
+      const ids = convo.messages().filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+    });
+
+    test("the default dialect keeps the flat history untouched", async () => {
+      const { convo } = build([{ name: "x", turns: [{ text: call("ls") }, { text: "done" }] }]);
+      await convo.send("go");
+      const assistant = convo.messages().find((m) => m.role === "assistant")!;
+      // Raw text replayed, and no structured fields for a template that would
+      // otherwise render the same call a second time (LFM2.5's does).
+      expect(assistant.content).toContain("<|tool_call_start|>");
+      expect(assistant.tool_calls).toBeUndefined();
+      expect(convo.messages().find((m) => m.role === "tool")!.tool_call_id).toBeUndefined();
+    });
   });
 
   test("cancel stops the turn and says so", async () => {

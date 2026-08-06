@@ -21,7 +21,8 @@
 1. **A full x86_64 Linux VM running in portable WebAssembly**, which treats a dynamically mounted
    host directory as a read-only part of its filesystem. It must run under **wazero** (local
    debugging, Go integration tests) and in a **browser**, where the mounted directory comes from the
-   File System Access API (`showDirectoryPicker`).
+   File System Access API (`showDirectoryPicker`), or, where that does not exist, an equivalent
+   handle rebuilt from an `<input type="file" webkitdirectory>` pick (§4.4).
 2. **A small LLM on WebGPU** that performs terminal tool calls into the VM.
 
 This plan builds **component 1 in full** and designs the exec API so component 2 drops in later.
@@ -413,6 +414,8 @@ in-memory only.
   <https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle>
   → **A picked directory can never be read synchronously. A blocking bridge is mandatory.**
 - Availability: Chromium-only (Chrome/Edge/Opera); not Firefox, not Safari. Secure context required.
+  The picker has a cross-browser substitute (`<input type="file" webkitdirectory>`, §4.4), but it
+  hands back `File` objects, which are just as async — the bridge is mandatory either way.
 - **The bridge is free.** `xterm-pty` "relies on SharedArrayBuffer and Atomics" and requires
   `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp`.
   <https://github.com/mame/xterm-pty> — so the page is cross-origin isolated regardless, and the
@@ -949,12 +952,20 @@ worker thread (wasm, may block)        main thread (holds the DirectoryHandle)
 Playwright cannot drive `showDirectoryPicker()`, but `navigator.storage.getDirectory()` (OPFS)
 returns the same interface — so E2E tests populate an OPFS tree (walked from `testdata/mount` on the
 Node side, so the bytes match the wazero mount) and mount that, exercising the identical code path
-with no native dialog.
+with no native dialog. The `<input webkitdirectory>` picker *can* be driven (Playwright's
+`filechooser` event takes a directory path), which is what lets the Firefox suite mount
+`testdata/mount` through the real dialog instead of a hook.
 
-**Browser support.** Chromium-only for the picker. Firefox and Safari get a clearly-labelled degraded
-path (drag-and-drop a folder, or OPFS) behind the same provider interface. The page must check
-`crossOriginIsolated === true` at startup and fail with a readable message rather than a cryptic
-`Atomics` error.
+**Browser support.** `showDirectoryPicker()` is Chromium-only, but folder mounting is not: browsers
+without it pick through `<input type="file" webkitdirectory>` (supported by every current engine
+despite the prefix), and `web/src/mount-tree.ts` rebuilds the flat `FileList` — whose entries carry
+`webkitRelativePath` — into the same structural directory handle the bridge already consumes. Both
+paths sit behind `pickDirectoryHandle()`, so `MountHost`, the worker, and the guest see no
+difference. Two things the fallback cannot do: the tree is enumerated at pick time rather than
+lazily (file *contents* are still lazy — a `File` is a `Blob` over the real file), and it cannot
+report empty directories or symlinks. `tests/e2e/mount-picker.spec.ts` runs that path in Firefox
+against a real VM (`make test-e2e-firefox`). The page must check `crossOriginIsolated === true` at
+startup and fail with a readable message rather than a cryptic `Atomics` error.
 
 ### 4.5 Tool-call surface for the future LLM (M7 — done)
 
@@ -1525,6 +1536,215 @@ All three are **done**; M9 and M10's done-when conditions are met the same way (
 - **The real model still works through all of it, unchanged:** `make test-e2e-agent` passes with the
   same transcript as M8 (~9.5 s including load), now through the dialect registry, the multi-turn
   loop and the tool registry. The budget is visible in the request it sends: `max_output: 4096`.
+
+### 10.10 The prefill ceiling: why a long chat killed the GPU (2026-08-06)
+
+Reported as "LFM2.5 throws a JavaScript error and the chat breaks after a few tool calls with larger
+responses". It is not a JavaScript bug; it is an allocation the loop had no idea it was making.
+
+**The mechanism.** Every ONNX export in the registry declares its logits output as
+`[batch_size, sequence_length, vocab_size]` — the **full** sequence, not just the last position.
+onnxruntime-web has to map that tensor back to the CPU to sample from it, so one prefill of N tokens
+allocates `N × vocab_size × 4` bytes of host-visible memory. Because the agent loop re-prefills the
+entire conversation on every iteration, and every tool result makes the conversation longer, a chat
+walks into that allocation from below, one tool call at a time.
+
+**Measured** on this machine (RTX 4070 Ti SUPER, 16 GB; LFM2.5 2.6B at q4, vocab 128 000), by
+sending a single filler message of a known size and growing it:
+
+| history | prefill logits | result |
+|---|---|---|
+| 16 261 chars | ~2.15 GB | fine |
+| 24 261 chars | ~3.07 GB | `Failed to allocate memory for buffer mapping` (Dawn) |
+
+The failure is **not recoverable in place**: after it, every run on that `InferenceSession` returns
+`[Invalid Buffer] is invalid due to a previous error`. The device is poisoned, so the *next* message
+fails too, and the one after that. That is the "chat breaks" half of the report.
+
+**Why LFM2 1.2B never showed it.** Same loop, same budgets, **half the vocabulary** (65 536), so half
+the allocation — its 24 000-char prompts landed at ~1.57 GB and survived. The bug was latent in the
+flat default from M9 and only became reachable when M10 added a checkpoint with a 128 000-entry
+vocabulary. Qwen3's 151 936 would have been worse.
+
+**The fix, in four parts.** The first two prevent it and the second two mean no future adapter can
+reproduce it:
+
+1. `ModelEntry.vocabSize` and `maxPromptTokens()` / `maxPromptChars()` (`models.ts`) turn the
+   allocation into arithmetic: `PREFILL_LOGITS_BUDGET_BYTES` (1.5 GiB, chosen against the
+   measurement above — the 2.15 GB prefill worked and is not a target to aim at) divided by
+   `vocab_size × 4`. Selecting a model sets the loop's prompt budget from its own ceiling, exactly as
+   it already set `max_new_tokens`. The flat 24 000 default is gone.
+2. `promptBudgetChars` (was `historyBudgetChars`) now counts the **serialised tool schema** too.
+   That was never counted and is ~2.3 KB of prompt on every turn for `run_terminal_command` alone —
+   a user with several template tools enabled was well over a ceiling the loop believed it was under.
+3. The model worker checks the **real** token count from the real tokenizer before running, and
+   refuses with `prompt-too-long` and the ceiling it measured. The loop elides to that number and
+   retries the turn once. The char budget is a guardrail; this is the guarantee.
+4. A run that fails anyway is treated as a device loss: the worker disposes the session and rebuilds
+   it on the next request, and the loop turns *any* generate failure into a visible `error` event
+   instead of a rejection out of `send()`. Previously that rejection left a user message with no
+   reply and nothing on screen saying why.
+
+**Verified** against the real model: five prompts, nine tool calls, `dmesg` and `ls -laR /etc` among
+them, elision holding the prompt at ~12 000 chars — zero device errors, where the same script
+previously died on the third prompt. Regression coverage is in `models.test.ts` (the arithmetic, and
+that LFM2.5's ceiling is below the default that used to crash it) and `conversation.test.ts` (failure
+becomes an event, the refusal-and-retry, the tool schema counting against the budget) — all GPU-free,
+all in CI.
+
+### 10.11 Every chat model through its paces (2026-08-06, this machine)
+
+Each registry entry driven through the same four prompts on `/agent/` against a real VM and a real
+GPU (RTX 4070 Ti SUPER, 16 GB), headless Chromium with the WebGPU launch flags.
+
+| entry | dtype | load | tool calls | errors | verdict |
+|---|---|---|---|---|---|
+| LFM2 1.2B Tool | q4 | 4.2 s | 2/4 prompts | 0 | works; still the reference |
+| LFM2.5 2.6B | q4 | 3.9 s | 3/4 prompts | 0 | works, and reasons well |
+| Qwen2.5 0.5B Instruct | q4 | 4.6 s | 0/4 prompts | 3 | syntax right, model too small |
+| Qwen3 1.7B | — | — | — | — | cannot load here (no `shader-f16`) |
+
+- **`hermes` is now verified.** Qwen2.5 emitted
+  `<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "cat /mnt/host/hello.txt",
+  "timeout_ms": 500}}\n</tool_call><|im_end|>` — textbook, parsed correctly, reached the guest. The
+  transcript is checked in as a `CAPTURED:` case in `dialects.test.ts`, which is what the flag
+  asserts the existence of. Its `<think>` path is **not** covered: Qwen2.5 does not reason and Qwen3
+  could not be run, so that half stays implemented-from-template.
+- **A verified dialect is not a working agent.** At 0.5B, Qwen2.5 emits *correct syntax naming a tool
+  that does not exist* — `{"name": "ls"}`, `{"name": "find"}` — then apologises for having no tools.
+  The registry reports it as correctable ("no tool named ls is available (available:
+  run_terminal_command)") and the model never takes the correction. Worth stating plainly in the
+  note: the entry verifies the parser, not the workflow.
+- **Qwen3 1.7B has exactly one browser-viable build, and it needs `shader-f16`.** Every variant is
+  published as a single undivided `.onnx`: q4 (2.147 GB) dies in transformers.js before onnxruntime
+  sees it (`RangeError: Array buffer allocation failed` out of `readResponse`, which reads a weight
+  file into one `Uint8Array`); q8 (1.742 GB, `model_quantized.onnx`) reads fine and then cannot build
+  a session inside the wasm heap (`ERROR_CODE: 6, std::bad_alloc`). Only q4f16 (1.43 GB) works. The
+  entry now lists q4f16 alone, so `pickDtype` returns undefined on an adapter without the feature and
+  the page says so in 1.5 s instead of downloading 2.1 GB and failing nine frames deep. Headless
+  Chromium does **not** expose `shader-f16` even on a real NVIDIA adapter (confirmed here: vendor
+  `nvidia`, architecture `lovelace`, `shader-f16: false` at every `powerPreference`), so this entry
+  is unverifiable in this environment by construction — PLAN §2.11.24 again.
+- **`weightFiles()` did not name the files transformers.js asks for.** It derived
+  `onnx/model_${dtype}.onnx`, which is right for exactly the three dtypes the registry happened to
+  use and wrong for the two it did not: `q8` is `model_quantized.onnx` and `fp32` is a bare
+  `model.onnx`. Found by trying to add a q8 fallback. Now mirrors
+  `DEFAULT_DTYPE_SUFFIX_MAPPING` with a drift test, in the same spirit as every other
+  two-runtimes-one-definition gate here.
+- **Antares was being offered as a chat model.** Both entries are `task: "localize"` and the registry
+  has always said loading one in a chat box produces confident nonsense — and the dropdown listed
+  them anyway, indistinguishable from LFM2. They are now in an optgroup of their own
+  ("not chat models — see /scan/") and selecting one says so before any weights are fetched.
+
+### 10.12 Gemma 4: the ONNX path, surveyed and not taken
+
+The reference given was `webml-community/gemma-4-webgpu-kernels`, which turns out **not** to be a
+path this project should follow: it is a static Space carrying a hand-written WebGPU engine (147
+`.wgsl` references, its own `createComputePipeline` calls) driving
+`google/gemma-4-E2B-it-qat-mobile-transformers` — safetensors, no ONNX. Adopting it would mean a
+second inference backend.
+
+**This section records the alternative, which was surveyed first and then not taken** — §10.13 is
+what shipped. Kept because the obstacles below are real and three of them had to be solved anyway.
+
+The ONNX path is available: `onnx-community/gemma-4-E2B-it-ONNX` exists, and transformers.js 4.2.0
+already knows `gemma4`/`gemma4_text`, so no custom kernels are needed for it. Four things stand in
+the way, in order of risk:
+
+1. **A genuinely new dialect.** Gemma 4's grammar is neither JSON nor Pythonic:
+   `<|tool_call>call:NAME{arg:value}<tool_call|>`, with asymmetric markers, a custom quote token
+   `<|"|>`, and tool declarations rendered as `<|tool>declaration:NAME{…}<tool|>`. `extractBlocks`
+   handles the markers; the body parser is new work. The template also has an `enable_thinking`
+   path, so `ThinkStyle` applies.
+2. **The tool-result role does not line up.** The template resolves a response's function name from
+   `tool_call_id` on the assistant message's structured `tool_calls`. Our history is flat
+   `{role: "tool", content}` with raw assistant text, so results may render as `unknown` or be
+   dropped entirely. **Measure this first** — it decides whether the rest is worth doing.
+3. **The export is multi-component.** `embed_tokens` + `decoder_model_merged` (+ vision and audio
+   encoders — the checkpoint is `any-to-any`), not one `model_*.onnx`. `weightFiles()` cannot express
+   that shape at all, so `make model` needs to change before the page can load anything locally.
+4. **`vocab_size` is 262 144** — double Qwen3, the largest here by a wide margin. Under
+   `PREFILL_LOGITS_BUDGET_BYTES` that is ~1536 prompt tokens (~6 KB), of which
+   `run_terminal_command`'s schema alone is ~600. Check whether this export emits full-sequence
+   logits (§10.10) before assuming the ceiling binds; if it does, the agent loop may not have room to
+   work with.
+
+Already handled: the repo ships no inline `chat_template`, only the standalone `.jinja` — the trap in
+§2.11.26, which the worker's `loadChatTemplate` fallback already covers.
+
+### 10.13 Gemma 4 on the WebGPU kernel backend (2026-08-06)
+
+Built at the maintainer's call for the *kernel* engine rather than the ONNX path
+of §10.12 — "I definitely want Gemma4 to use the optimized kernel backend, it's WAY faster."
+It is a second inference engine sitting behind `ModelClient`, which is the first
+time this project has had one, and everything above that interface — the loop,
+the dialects, the tool registry, the UI — is untouched.
+
+**What the engine is.** `webml-community/gemma-4-webgpu-kernels` is a static Space
+carrying one ~540 KB ES module with its own WGSL kernels, its own safetensors
+reader and its own tokenizer. It is **downloaded, not vendored**: the Space
+declares no license, so `make gemma-kernels` pulls a pinned revision
+(`158f16ae`) into gitignored `dist/kernels/` and the page imports it at runtime.
+`web/serve.ts` serves it at `/kernels/`, exactly as it serves weights at
+`/models/`. If the licensing is ever clarified this becomes a one-line change.
+
+**Two things the engine does that smolbox cannot use**, which is why
+`gemma-kernels.ts` exists rather than a three-line call to its `generate()`:
+
+1. Its `encodePrompt` hardcodes `tools: null` when rendering the chat template.
+   smolbox's entire prompt *is* the generated tool schema (§9.2), so tools could
+   never reach the model.
+2. Its `generate()` decodes with `skip_special_tokens: true`, which strips
+   `<|tool_call>` and `<tool_call|>` — precisely what the dialect parses.
+
+So the prompt is built and the output decoded with the transformers.js tokenizer
+the worker already loads, and only the forward pass comes from the engine,
+through the `_model` / `_generationState` / `_eosTokenIds` accessors it exposes.
+The prefix-cache bookkeeping is reimplemented faithfully and is worth more here
+than in a chat app: the agent loop re-sends the whole history on every tool round
+trip, and within a turn each prompt strictly extends the last, so only the new
+tokens are prefilled.
+
+**Three real bugs were found on the way, all now fixed:**
+
+- **The dev server had no `Range` support.** The engine reads
+  `model.safetensors` in 256 KB chunks so a 2.5 GB checkpoint never has to be
+  held in memory. Against a server that ignores `Range` it got the *whole file*
+  back for every chunk and died allocating a 2.5 GB `Uint8Array` — which reads as
+  an out-of-memory bug in the engine rather than a missing feature in
+  `web/serve.ts`. The HF CDN supports ranges, so the Space never saw it.
+- **The prefill ceiling had to become backend-aware.** §10.10's arithmetic is
+  about a logits tensor onnxruntime maps back to the CPU. This engine samples on
+  the GPU with its own argmax kernels and never downloads one, so charging its
+  262 144-entry vocabulary the same cost would have capped its prompt at ~1500
+  tokens for something it does not pay. A new `AGENT_WORKING_TOKENS` (8192) is
+  the loop's own ceiling — under every existing entry's limit, so a no-op for
+  them, and the only thing bounding an engine that would otherwise be unbounded.
+- **A flat tool history renders to nothing.** See §10.12 obstacle 2, now
+  confirmed and handled by `Dialect.historyStyle` (commit `adbe064`).
+
+**Status: implemented, loads, and cannot be run here.** Measured: the engine
+imports, the tokenizer and standalone chat template load, 2.46 GB of weights
+stream onto the GPU in **7.4 s**, and the first forward pass then fails with
+`No supported WebGPU variant for com.xenova.gemma4.DenseGemv`. The reason is
+exact and in the bundle's own guards: every variant is gated on `shader-f16`
+(`tensorDtypes.aT != "float16" or device.features.has("shader-f16")`), because
+the QAT checkpoint's tensors are f16. Headless Chromium exposes no `shader-f16`
+on **any** adapter or behind **any** flag — four combinations were tried
+(`--use-angle=vulkan --enable-features=Vulkan`, `--enable-unsafe-webgpu`,
+`VulkanFromANGLE`, `--enable-dawn-features=allow_unsafe_apis`); the real NVIDIA
+adapter reports 18 features and f16 is not among them, and `--enable-unsafe-webgpu`
+alone drops to the fallback adapter. PLAN §2.11.24 again, and the same wall Qwen3
+hit in §10.11.
+
+So the entry declares `requiresFeatures: ["shader-f16"]` and the page refuses
+**before fetching anything** — 2.5 GB and 7.4 s became an instant, accurate
+message. On a desktop browser with a recent GPU this should run; that has not
+been observed here and the dialect stays `verified: false` until a transcript
+exists. What *is* tested in CI is the half this project wrote:
+`gemma-kernels.test.ts` covers the prefix-cache reuse, the reset rules,
+cancellation and the token budget against a fake engine, and
+`gemma4.test.ts` pins the call grammar to the checkpoint's own rendered template.
 
 ---
 

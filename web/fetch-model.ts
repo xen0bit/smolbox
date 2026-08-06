@@ -17,6 +17,7 @@ import {
   DEFAULT_MODEL_KEY,
   OPTIONAL_FILES,
   REQUIRED_FILES,
+  SAFETENSORS_EXTRA_FILES,
   modelFor,
   models,
   weightFiles,
@@ -51,9 +52,12 @@ if (entry.local) {
 }
 // The first candidate dtype is what a headless run will use; f16 variants are a
 // runtime choice the page makes against the adapter, not something to download
-// speculatively.
+// speculatively. A safetensors repo has no variants at all — the quantization is
+// baked in — so the dtype is only along for the log line.
 const dtype = entry.dtypes[0]!;
-const weights = weightFiles(dtype);
+const layout = entry.weights ?? "onnx";
+const weights = weightFiles(dtype, layout);
+const extras = layout === "safetensors" ? SAFETENSORS_EXTRA_FILES : [];
 
 const outRoot = path.join("dist", "models", entry.repo);
 
@@ -127,10 +131,13 @@ async function fetchFile(rel: string, optional: boolean): Promise<number> {
   return written;
 }
 
-say(`fetching ${entry.key} (${entry.repo}@${entry.revision.slice(0, 8)}, ${dtype}) -> ${outRoot}`);
+say(
+  `fetching ${entry.key} (${entry.repo}@${entry.revision.slice(0, 8)}, ` +
+    `${layout === "safetensors" ? "safetensors" : dtype}) -> ${outRoot}`,
+);
 
 let total = 0;
-for (const rel of [...REQUIRED_FILES, ...weights.required]) {
+for (const rel of [...REQUIRED_FILES, ...extras, ...weights.required]) {
   total += await fetchFile(rel, false);
 }
 for (const rel of [...OPTIONAL_FILES, ...weights.optional]) {

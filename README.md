@@ -28,7 +28,7 @@ Two components.
 artifact with [container2wasm](https://github.com/container2wasm/container2wasm). The same artifact
 runs under [wazero](https://wazero.io) on your machine and inside a browser tab, and in both places
 it can be handed a host directory that appears inside the guest as an ordinary read-only folder at
-`/mnt/host`. In the browser, that directory is one the user picked with the File System Access API —
+`/mnt/host`. In the browser, that directory is one the user picked with the browser's folder picker —
 files are read lazily, on demand, straight off the local disk, never uploaded anywhere.
 
 **2. The agent.** A small LLM running locally on WebGPU (in the shape of
@@ -60,7 +60,8 @@ one folder they explicitly chose, and cannot write to it.
   host filesystem boundary, not by guest configuration, so a compromised guest cannot write through.
 - In the browser, the mount is backed lazily by a `FileSystemDirectoryHandle` from
   `showDirectoryPicker()`. Large directories cost nothing until read. A `remount()` picks up changes
-  made on disk.
+  made on disk. Browsers without that API (Firefox, Safari) pick the folder through
+  `<input type="file" webkitdirectory>` and get an equivalent handle rebuilt from the file list.
 - A second browser build (`c2w --to-js`, QEMU with a TCG JIT) is available for workloads that do not
   need a host mount. It runs the emulated CPU **1.4–2.9× faster**, but it boots slower (~7 s against
   ~1.8 s, on 116 MB of assets against a wizer pre-booted 108 MB) and its console is ~10× slower, so
@@ -156,8 +157,9 @@ emscripten build, `make test-e2e-js` (boot smoke, a `/mnt/host` is-empty guard, 
 `cases.json` minus the mount cases).
 
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
-and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. The directory picker is
-Chromium-only today; other browsers get a labelled fallback.
+and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. Folder mounting works in
+every current browser: `showDirectoryPicker()` where it exists, `<input type="file" webkitdirectory>`
+otherwise — `make test-e2e-firefox` runs that second path against a real VM in Firefox.
 
 ---
 

@@ -1,12 +1,44 @@
 import { describe, expect, test } from "bun:test";
 
 import { ToolCallParseError } from "../parse.ts";
-import { DEFAULT_MODEL_KEY, models, modelFor, pickDtype } from "../models.ts";
+import { describeError } from "../messages.ts";
+import {
+  CHAT_TEMPLATE_FILE,
+  DEFAULT_MODEL_KEY,
+  OPTIONAL_FILES,
+  chatTemplateUrl,
+  models,
+  modelFor,
+  pickDtype,
+} from "../models.ts";
 import { dialectFor, dialects } from "./index.ts";
 import { hermes } from "./hermes.ts";
 import { llama } from "./llama.ts";
 
 describe("hermes dialect (Qwen-style)", () => {
+  // What onnx-community/Qwen2.5-0.5B-Instruct at q4 actually emitted on WebGPU,
+  // verbatim including the trailing <|im_end|>, for
+  // "Use the tool to run `cat /mnt/host/hello.txt` and tell me the contents."
+  // This is what `verified: true` on this dialect asserts the existence of.
+  test("CAPTURED: a real turn from Qwen2.5 0.5B Instruct at q4", () => {
+    const raw =
+      '<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "cat /mnt/host/hello.txt", "timeout_ms": 500}}\n</tool_call><|im_end|>';
+    const turn = hermes.parseTurn(raw);
+    expect(turn.calls).toEqual([
+      { name: "run_terminal_command", args: { cmd: "cat /mnt/host/hello.txt", timeout_ms: 500 } },
+    ]);
+    // The turn was only a call, so there is no prose and the marker is gone.
+    expect(turn.text).toBe("");
+  });
+
+  // The same model, same session, inventing a tool that does not exist. Kept
+  // because it is the failure the registry has to report as correctable rather
+  // than as a parse error: the syntax was fine, the name was not.
+  test("CAPTURED: a hallucinated tool name parses cleanly and fails later", () => {
+    const turn = hermes.parseTurn('<tool_call>\n{"name": "ls", "arguments": {}}\n</tool_call><|im_end|>');
+    expect(turn.calls).toEqual([{ name: "ls", args: {} }]);
+  });
+
   test("a single <tool_call> block", () => {
     const turn = hermes.parseTurn(
       '<tool_call>\n{"name": "run_terminal_command", "arguments": {"cmd": "ls /mnt/host"}}\n</tool_call>',
@@ -121,8 +153,71 @@ describe("the model registry", () => {
     expect(new Set(models.map((m) => m.key)).size).toBe(models.length);
   });
 
+  // Every field here is spread into transformers.js' generate(), where an
+  // unknown name is ignored rather than rejected — so a typo would look like
+  // the checkpoint misbehaving.
+  test("declared sampling settings are ones the runtime implements", () => {
+    const known = new Set(["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens"]);
+    for (const m of models) {
+      for (const k of Object.keys(m.generation ?? {})) {
+        expect(known.has(k), `${m.key} declares an unknown sampling field: ${k}`).toBe(true);
+      }
+    }
+  });
+
   test("an unknown key names the ones that exist", () => {
     expect(() => modelFor("nope")).toThrow(/known:/);
+  });
+
+  // A repo that keeps its template only in chat_template.jinja loads fine and
+  // then throws on the first turn, because transformers.js' tokenizer reads an
+  // inline template and nothing else. The locally-built Antares is such a repo,
+  // which is what broke the scan page.
+  test("the chat template is read from the same place the weights are", () => {
+    const entry = modelFor("antares-1b");
+    expect(chatTemplateUrl(entry, true)).toBe(`/models/${entry.repo}/${CHAT_TEMPLATE_FILE}`);
+    expect(chatTemplateUrl(entry, false)).toBe(
+      `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${CHAT_TEMPLATE_FILE}`,
+    );
+  });
+
+  test("the hub URL pins the revision, so it cannot drift from the fetched copy", () => {
+    for (const m of models) {
+      expect(chatTemplateUrl(m, false)).toContain(`/resolve/${m.revision}/`);
+    }
+  });
+
+  test("the fetcher pulls the standalone template, so a local load can find it", () => {
+    expect(OPTIONAL_FILES).toContain(CHAT_TEMPLATE_FILE);
+  });
+});
+
+// What reaches the page when the worker throws. The scan page showed five
+// anonymous Firefox frames and no message for exactly this reason.
+describe("describeError", () => {
+  test("a V8 stack, which already carries the message, is passed through", () => {
+    const err = new Error("chat_template is not set");
+    err.stack = "Error: chat_template is not set\n    at generate (model-worker.js:1:1)";
+    expect(describeError(err)).toBe(err.stack);
+  });
+
+  test("a SpiderMonkey stack, which does not, gets the message prepended", () => {
+    const err = new Error("chat_template is not set");
+    err.stack = "get_chat_template@http://localhost:8080/agent/model-worker.js:13623:15";
+    const out = describeError(err);
+    expect(out.startsWith("chat_template is not set\n")).toBe(true);
+    expect(out).toContain("get_chat_template@");
+  });
+
+  test("an error with no stack still says what went wrong", () => {
+    const err = new Error("boom");
+    err.stack = undefined;
+    expect(describeError(err)).toBe("boom");
+  });
+
+  test("a thrown non-Error is stringified rather than dropped", () => {
+    expect(describeError("just a string")).toBe("just a string");
+    expect(describeError(undefined)).toBe("undefined");
   });
 
   test("f16 quantizations are skipped when the adapter lacks shader-f16", () => {

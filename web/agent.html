@@ -106,6 +106,45 @@
         font-weight: bold;
         margin-bottom: 0.3rem;
       }
+      /* A tool whose command failed reads differently from one that worked. */
+      .msg.bad .body {
+        border-color: #bf8700;
+      }
+      /* Tool output is the bulkiest thing in the log and the least often read
+         in full; cap it and let it scroll rather than pushing the answer off
+         the screen. */
+      .msg.tool .body > span:last-child {
+        display: block;
+        max-height: 14rem;
+        overflow-y: auto;
+      }
+      /* Reasoning is collapsed by default: present, inspectable, and not
+         competing with the answer for the reader's attention. */
+      .think {
+        margin-bottom: 0.4rem;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      .think summary {
+        cursor: pointer;
+        font-style: italic;
+      }
+      .think-body {
+        margin-top: 0.3rem;
+        padding-left: 0.6rem;
+        border-left: 2px solid var(--line);
+        max-height: 16rem;
+        overflow-y: auto;
+      }
+      /* "preparing a tool call…", "waiting for the guest…" — transient status,
+         never mistakable for the model's own words. */
+      .pending {
+        color: var(--muted);
+        font-style: italic;
+      }
+      .pending:empty {
+        display: none;
+      }
       form {
         display: flex;
         gap: 0.5rem;
@@ -253,7 +292,7 @@
     <div id="settings">
       <label>max tool calls <input id="opt-iterations" type="number" min="1" max="20" /></label>
       <label>output cap (bytes) <input id="opt-maxoutput" type="number" min="256" step="256" /></label>
-      <label>history budget (chars) <input id="opt-history" type="number" min="2000" step="1000" /></label>
+      <label title="System turn, history and tool schema together. Set from the selected model's prefill ceiling.">prompt budget (chars) <input id="opt-history" type="number" min="2000" step="1000" /></label>
       <label>max new tokens <input id="opt-tokens" type="number" min="32" step="32" /></label>
     </div>
 
