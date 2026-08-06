@@ -16,6 +16,128 @@ export interface ParsedCall {
 export interface ParsedTurn {
   text: string;
   calls: ParsedCall[];
+  /**
+   * The reasoning channel, for families that have one.
+   *
+   * Separated rather than discarded. A reasoning model that hides its
+   * scratchpad and then answers in one word looks broken, and on the turns
+   * where it stops mid-thought it looks like nothing happened at all — the chat
+   * log has to be able to say "it thought about this" without saying it in the
+   * same voice as the answer.
+   */
+  reasoning?: string;
+}
+
+/**
+ * How a model family delimits its reasoning.
+ *
+ *  - `none`: no reasoning channel.
+ *  - `tagged`: the model writes both `<think>` and `</think>` itself (Qwen3).
+ *  - `prompt-opened`: the chat template ends the generation prompt with a bare
+ *    `<think>`, so a completion starts *inside* the block and the only tag it
+ *    ever emits is the close (LFM2.5, Antares).
+ */
+export type ThinkStyle = "none" | "tagged" | "prompt-opened";
+
+/** What to show the user while a completion is still arriving. */
+export interface StreamPreview {
+  /** Prose so far, safe to display. */
+  text: string;
+  /** Reasoning so far. */
+  reasoning: string;
+  /** A tool-call block has opened and not yet closed. */
+  pendingCall: boolean;
+}
+
+const THINK_OPEN = "<think>";
+const THINK_CLOSE = "</think>";
+
+/**
+ * Splits a completion into its reasoning and its prose.
+ *
+ * Handles the partial shapes too, because the same function runs on every
+ * streamed chunk: a `prompt-opened` completion with no close yet is entirely
+ * reasoning, and a block the model opened and has not finished is reasoning to
+ * its end.
+ */
+export function splitThinking(raw: string, style: ThinkStyle): { text: string; reasoning: string } {
+  if (style === "none") {
+    return { text: raw, reasoning: "" };
+  }
+
+  const parts: string[] = [];
+  let rest = raw;
+
+  if (style === "prompt-opened") {
+    const close = rest.indexOf(THINK_CLOSE);
+    if (close === -1) {
+      // Still inside the block the prompt opened. Everything is scratchpad —
+      // which is also the right answer for a turn that hit max_new_tokens
+      // mid-thought, because the reasoning is now shown rather than dropped.
+      return { text: "", reasoning: rest.trim() };
+    }
+    parts.push(rest.slice(0, close));
+    rest = rest.slice(close + THINK_CLOSE.length);
+  }
+
+  // Whole blocks the model opened itself. Both styles can produce these; a
+  // `prompt-opened` model reopening one after its answer is a real shape.
+  rest = rest.replace(/<think>([\s\S]*?)<\/think>/g, (_m, inner: string) => {
+    parts.push(inner);
+    return "";
+  });
+
+  const open = rest.indexOf(THINK_OPEN);
+  if (open !== -1) {
+    parts.push(rest.slice(open + THINK_OPEN.length));
+    rest = rest.slice(0, open);
+  }
+
+  // A further `</think>` in the remainder is left exactly where it is. The
+  // prompt opened one block and the first close ended it, so a second one is a
+  // model quoting the tag at the user — and swallowing the answer up to the
+  // last tag it happened to write is the worse reading.
+  return { text: rest, reasoning: parts.join("\n").trim() };
+}
+
+/**
+ * The live view of a partial completion, for a family whose calls are delimited
+ * by a start and an end marker.
+ *
+ * A half-written tool call must never reach the chat log as prose: it is not
+ * something the user asked to read, and watching `<|tool_call_start|>[run_te`
+ * appear character by character is how the parsing came to look broken from the
+ * outside even though it worked. Everything from an unclosed marker onward is
+ * withheld and reported as `pendingCall` instead, so the UI can say what is
+ * actually happening.
+ */
+export function previewBlocks(
+  raw: string,
+  start: string,
+  end: string,
+  style: ThinkStyle = "none",
+): StreamPreview {
+  let rest = "";
+  let cursor = 0;
+  let pendingCall = false;
+
+  for (;;) {
+    const open = raw.indexOf(start, cursor);
+    if (open === -1) {
+      rest += raw.slice(cursor);
+      break;
+    }
+    rest += raw.slice(cursor, open);
+    const close = raw.indexOf(end, open + start.length);
+    if (close === -1) {
+      pendingCall = true;
+      break;
+    }
+    cursor = close + end.length;
+  }
+
+  const { text, reasoning } = splitThinking(rest, style);
+  return { text: stripSpecialTokens(text).trim(), reasoning: stripSpecialTokens(reasoning).trim(), pendingCall };
 }
 
 /** Thrown when a tool-call block is present but unusable. */

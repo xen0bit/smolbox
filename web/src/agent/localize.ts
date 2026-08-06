@@ -173,7 +173,11 @@ export class LocalizeRun {
       try {
         const parsed = this.opts.dialect.parseTurn(generated.text);
         calls = parsed.calls;
-        prose = parsed.text;
+        // This page shows the model's deliberation as its own event kind, so
+        // both channels belong in it: Antares reasons inside <think> before
+        // every call, and the dialect now hands that back separately from any
+        // prose that followed the close.
+        prose = [parsed.reasoning, parsed.text].filter(Boolean).join("\n\n");
       } catch (err) {
         const message = err instanceof ToolCallParseError ? err.message : String(err);
         this.emit({ kind: "error", message });

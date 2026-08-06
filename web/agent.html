@@ -106,6 +106,45 @@
         font-weight: bold;
         margin-bottom: 0.3rem;
       }
+      /* A tool whose command failed reads differently from one that worked. */
+      .msg.bad .body {
+        border-color: #bf8700;
+      }
+      /* Tool output is the bulkiest thing in the log and the least often read
+         in full; cap it and let it scroll rather than pushing the answer off
+         the screen. */
+      .msg.tool .body > span:last-child {
+        display: block;
+        max-height: 14rem;
+        overflow-y: auto;
+      }
+      /* Reasoning is collapsed by default: present, inspectable, and not
+         competing with the answer for the reader's attention. */
+      .think {
+        margin-bottom: 0.4rem;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      .think summary {
+        cursor: pointer;
+        font-style: italic;
+      }
+      .think-body {
+        margin-top: 0.3rem;
+        padding-left: 0.6rem;
+        border-left: 2px solid var(--line);
+        max-height: 16rem;
+        overflow-y: auto;
+      }
+      /* "preparing a tool call…", "waiting for the guest…" — transient status,
+         never mistakable for the model's own words. */
+      .pending {
+        color: var(--muted);
+        font-style: italic;
+      }
+      .pending:empty {
+        display: none;
+      }
       form {
         display: flex;
         gap: 0.5rem;

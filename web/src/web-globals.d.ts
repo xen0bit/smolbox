@@ -34,6 +34,13 @@ interface Element {
   scrollTop: number;
   readonly scrollHeight: number;
   readonly children: readonly Element[];
+  // The chat log builds assistant bubbles incrementally — reasoning, prose and
+  // a status line, each created on demand — so it needs to find and reorder
+  // children rather than only append them.
+  readonly firstChild: Element | null;
+  readonly parentElement: Element | null;
+  querySelector(selectors: string): Element | null;
+  insertBefore(node: Element, before: Element | null): Element;
   appendChild(child: Element): Element;
   replaceChildren(...children: Element[]): void;
   setAttribute(name: string, value: string): void;

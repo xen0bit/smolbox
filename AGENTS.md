@@ -324,6 +324,21 @@ definition format is defined in Go (`internal/tool/template.go`) and its schema 
 (`{param:raw}` opts out): correctness while raw shell is exposed, and the thing that would make a
 template-only session safe. Exposure is opt-in — a definition is ~0.5–2.3 KB of prompt on every turn.
 
+### A dialect owns the live view too, not just the parse
+`Dialect.preview(raw)` is the mid-stream half of `parseTurn`: prose so far, reasoning so far, and
+whether a tool-call block has opened and not yet closed. It exists because the page used to hold one
+hardcoded `<|tool_call_start|>`, so Qwen, Antares and Llama streamed their raw call syntax into the
+chat log as prose while LFM2 did not — the markers that must not reach the screen are exactly the
+ones that differ per family. Adding a dialect means adding both functions; `preview.test.ts` runs
+every registered dialect through the same partial-turn table.
+
+Reasoning is **separated, not discarded**. `ParsedTurn.reasoning` carries it, the chat log collapses
+it under the answer, and a turn that never left the scratchpad says so instead of rendering a page of
+first-person deliberation as the reply. `splitThinking` knows three shapes: `none`, `tagged` (the
+model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
+`<think>`, so the completion starts inside the block — LFM2.5, Antares). The localize page joins the
+two channels back together, because there the deliberation *is* the content it displays.
+
 ### Dialects: verified means a transcript exists
 `Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5` and
 `antares` are verified; `hermes` and `llama` are marked unverified and say so in the UI. Promote a

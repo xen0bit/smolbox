@@ -25,7 +25,7 @@ import {
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
-import type { ParsedCall } from "./parse.ts";
+import type { ParsedCall, StreamPreview } from "./parse.ts";
 import { ToolRegistry } from "./tool-registry.ts";
 import type { TemplateTool } from "./user-tools.ts";
 
@@ -147,43 +147,63 @@ const convo = new Conversation(
   onEvent,
 );
 
+// The raw completion for the turn in flight. The preview is recomputed from the
+// whole buffer rather than appended to, because whether a chunk is prose depends
+// on markers that may only close several chunks later.
+let turnRaw = "";
+// The tool bubble opened at tool-start and completed at tool-end. A command can
+// take seconds inside the VM, and an empty log for those seconds reads as a hang.
+let pendingTool: { body: Element; out: Element } | null = null;
+
 function onEvent(ev: AgentEvent): void {
   events.push(ev);
   switch (ev.kind) {
     case "user":
       bubble("user", "you")!.textContent = ev.text;
-      streaming = null;
+      endStream();
       break;
     case "token": {
-      // Prose streams live; a tool-call block is held back until it closes,
-      // because half a call rendered as text is noise, not progress.
-      if (!streaming) {
-        streaming = bubble("assistant", "model");
-      }
-      if (streaming) {
-        const next = (streaming.textContent ?? "") + ev.text;
-        streaming.textContent = visiblePart(next);
-        logEl && (logEl.scrollTop = logEl.scrollHeight);
-      }
+      turnRaw += ev.text;
+      renderStream(convo.options().dialect.preview(turnRaw));
       break;
     }
     case "assistant":
-      if (streaming) {
-        streaming.textContent = ev.text;
-      } else if (ev.text) {
-        bubble("assistant", "model")!.textContent = ev.text;
-      }
-      streaming = null;
+      // The parsed turn supersedes the preview: same content, but split by a
+      // parser that has seen the whole completion rather than a prefix of it.
+      finishStream(ev.text, ev.reasoning ?? "");
       break;
-    case "tool-start":
-      streaming = null;
-      break;
-    case "tool-end": {
-      const body = bubble("tool", `tool · exit ${ev.exitCode}`);
+    case "tool-start": {
+      endStream();
+      const body = bubble("tool", "tool · running…");
       if (body) {
         const cmd = document.createElement("span");
         cmd.className = "cmd";
-        cmd.textContent = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
+        cmd.textContent = `$ ${String(ev.call.args.cmd ?? ev.call.name)}`;
+        const out = document.createElement("span");
+        out.className = "pending";
+        out.textContent = "waiting for the guest…";
+        body.appendChild(cmd);
+        body.appendChild(out);
+        pendingTool = { body, out };
+      }
+      break;
+    }
+    case "tool-end": {
+      const cmdText = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
+      const label = `tool · exit ${ev.exitCode}`;
+      if (pendingTool) {
+        setLabel(pendingTool.body, label, ev.exitCode === 0 ? "tool" : "tool bad");
+        (pendingTool.body.firstChild as Element).textContent = cmdText;
+        pendingTool.out.className = "";
+        pendingTool.out.textContent = ev.rendered;
+        pendingTool = null;
+        break;
+      }
+      const body = bubble(ev.exitCode === 0 ? "tool" : "tool bad", label);
+      if (body) {
+        const cmd = document.createElement("span");
+        cmd.className = "cmd";
+        cmd.textContent = cmdText;
         const out = document.createElement("span");
         out.textContent = ev.rendered;
         body.appendChild(cmd);
@@ -193,38 +213,134 @@ function onEvent(ev: AgentEvent): void {
     }
     case "elided":
       bubble("note", "context")!.textContent =
-        `elided ${ev.messages} older message(s) to stay within the history budget (now ~${ev.chars} chars)`;
+        `trimmed ${ev.messages} older message(s) to stay inside this model's prompt budget (now ~${ev.chars} chars)`;
       break;
     case "stopped":
+      endStream();
       bubble("note", "stopped")!.textContent =
         ev.reason === "iteration-cap"
           ? "stopped: hit the tool-call limit for this turn"
           : "stopped by you";
-      streaming = null;
       break;
     case "error":
+      endStream();
       bubble("error", "error")!.textContent = ev.message;
-      streaming = null;
       break;
   }
 }
 
-const OPEN = "<|tool_call_start|>";
-
-// Everything from an unclosed tool-call marker onward is withheld.
-function visiblePart(raw: string): string {
-  const open = raw.lastIndexOf(OPEN);
-  if (open === -1) {
-    return stripMarkers(raw);
+/**
+ * The live view of the turn in flight.
+ *
+ * Three things can be true at once and each gets its own place: prose is the
+ * answer and streams as text, reasoning is collapsed behind a summary so a
+ * model that thinks for a page does not bury the reply, and a tool call that
+ * has opened but not closed is a status line rather than half of its own
+ * syntax. That last one is what made the parsing look broken from the outside:
+ * the markers streamed into the chat as prose until the block completed.
+ */
+function renderStream(p: StreamPreview): void {
+  if (!streaming) {
+    streaming = bubble("assistant", "model");
   }
-  return stripMarkers(raw.slice(0, open));
+  if (!streaming) {
+    return;
+  }
+  const think = p.reasoning ? thinkingBlock(streaming) : null;
+  if (think) {
+    think.body.textContent = p.reasoning;
+    think.summary.textContent = `thinking… (${p.reasoning.length} chars)`;
+  }
+  proseNode(streaming).textContent = p.text;
+  statusNode(streaming).textContent = p.pendingCall ? "preparing a tool call…" : "";
+  scrollLog();
 }
 
-function stripMarkers(s: string): string {
-  return s
-    .replace(/<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/g, "")
-    .replace(/<\|im_(start|end)\|>/g, "")
-    .replace(/<\|(start|end)oftext\|>/g, "");
+/** Replaces the live view with the parsed one and closes the bubble. */
+function finishStream(text: string, reasoning: string): void {
+  if (!streaming && !text && !reasoning) {
+    return;
+  }
+  if (!streaming) {
+    streaming = bubble("assistant", "model");
+  }
+  if (!streaming) {
+    return;
+  }
+  statusNode(streaming).textContent = "";
+  proseNode(streaming).textContent = text;
+  if (reasoning) {
+    const think = thinkingBlock(streaming);
+    think.body.textContent = reasoning;
+    think.summary.textContent = text
+      ? `thought first (${reasoning.length} chars)`
+      : `thought for ${reasoning.length} chars, then stopped without answering`;
+  }
+  endStream();
+}
+
+function endStream(): void {
+  // A turn that was only a tool call leaves an empty bubble behind — a "MODEL"
+  // label with nothing under it, which is the kind of artefact that makes a
+  // working page look unfinished.
+  if (streaming && !streaming.textContent?.trim()) {
+    streaming.parentElement?.remove();
+  }
+  streaming = null;
+  turnRaw = "";
+}
+
+// The assistant bubble's body holds up to three children, created on demand and
+// always in this order: reasoning, prose, status.
+function thinkingBlock(body: Element): { summary: Element; body: Element } {
+  const existing = body.querySelector(".think");
+  if (existing) {
+    return {
+      summary: existing.querySelector("summary")!,
+      body: existing.querySelector(".think-body")!,
+    };
+  }
+  const details = document.createElement("details");
+  details.className = "think";
+  const summary = document.createElement("summary");
+  const inner = document.createElement("div");
+  inner.className = "think-body";
+  details.appendChild(summary);
+  details.appendChild(inner);
+  body.insertBefore(details, body.firstChild);
+  return { summary, body: inner };
+}
+
+function childNode(body: Element, cls: string): Element {
+  const existing = body.querySelector(`.${cls}`);
+  if (existing) {
+    return existing;
+  }
+  const node = document.createElement("div");
+  node.className = cls;
+  body.appendChild(node);
+  return node;
+}
+
+const proseNode = (body: Element) => childNode(body, "prose");
+const statusNode = (body: Element) => childNode(body, "pending");
+
+function setLabel(body: Element, text: string, cls: string): void {
+  const wrap = body.parentElement;
+  if (!wrap) {
+    return;
+  }
+  wrap.className = `msg ${cls}`;
+  const who = wrap.querySelector(".who");
+  if (who) {
+    who.textContent = text;
+  }
+}
+
+function scrollLog(): void {
+  if (logEl) {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
 }
 
 // -------------------------------------------------------------- page plumbing

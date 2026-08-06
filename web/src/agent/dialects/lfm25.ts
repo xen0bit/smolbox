@@ -30,58 +30,59 @@
 // is that a documented call format is a hypothesis until a real turn confirms
 // it, and `verified: true` is the claim that such a turn exists.
 
-import { type ParsedCall, type ParsedTurn, extractBlocks, parseCallBody, stripSpecialTokens } from "../parse.ts";
+import {
+  type ParsedCall,
+  type ParsedTurn,
+  type StreamPreview,
+  extractBlocks,
+  parseCallBody,
+  previewBlocks,
+  splitThinking,
+  stripSpecialTokens,
+} from "../parse.ts";
 import type { Dialect } from "./types.ts";
 import { TOOL_CALL_END, TOOL_CALL_START } from "./lfm2.ts";
 
+/**
+ * The reasoning is separated, not discarded.
+ *
+ * Three shapes have to be handled, and they mean different things:
+ *
+ *  - `…</think>answer` — the usual case. The prompt opened the block, so the
+ *    close is the first tag in the completion and everything before it is
+ *    scratchpad. Only the first one counts: the prompt opened exactly one.
+ *  - `<think>…</think>answer` — a whole block the model opened itself, after
+ *    the first one closed.
+ *  - `…` with no close at all — reasoning that hit max_new_tokens. It is *all*
+ *    scratchpad. Treating it as the answer used to be the safer guess, because
+ *    the alternative was blanking the turn; now that reasoning is rendered as
+ *    its own channel rather than dropped, nothing is lost by calling it what it
+ *    is, and the user gets "it was still thinking" instead of a paragraph of
+ *    first-person deliberation presented as the reply.
+ */
 export function parseTurn(raw: string): ParsedTurn {
   const { bodies, rest } = extractBlocks(raw, TOOL_CALL_START, TOOL_CALL_END);
   const calls: ParsedCall[] = [];
   for (const body of bodies) {
     calls.push(...parseCallBody(body));
   }
-  return { text: stripSpecialTokens(stripThinking(rest)).trim(), calls };
+  const { text, reasoning } = splitThinking(rest, "prompt-opened");
+  return {
+    text: stripSpecialTokens(text).trim(),
+    reasoning: stripSpecialTokens(reasoning).trim(),
+    calls,
+  };
 }
 
-const CLOSE = "</think>";
-
-/**
- * Removes the reasoning, not just its tags.
- *
- * Three shapes have to be handled, and they mean different things:
- *
- *  - `<think>…</think>answer` — a whole block the model opened itself.
- *  - `…</think>answer` — the usual case. The prompt opened the block, so the
- *    close is the first tag in the completion and everything before it is
- *    scratchpad. Only the first one counts: the prompt opened exactly one.
- *  - `…<think>…` with no close — a block the model opened and never finished.
- *    There is no answer after it to keep, so the tail goes.
- *
- * A completion with no tag at all is left alone. It is either an answer or
- * reasoning that hit max_new_tokens, and nothing in the text distinguishes
- * them; blanking the turn on a guess is the worse of the two mistakes.
- *
- * Antares takes the opposite decision on the same shape (it keeps the prose so
- * the localize UI can show reasoning as its own event kind); here the chat log
- * has one channel and the answer is what belongs in it.
- */
-function stripThinking(s: string): string {
-  let out = s.replace(/<think>[\s\S]*?<\/think>/g, "");
-  const close = out.indexOf(CLOSE);
-  if (close !== -1) {
-    out = out.slice(close + CLOSE.length);
-  }
-  const open = out.indexOf("<think>");
-  if (open !== -1) {
-    out = out.slice(0, open);
-  }
-  return out;
+export function preview(raw: string): StreamPreview {
+  return previewBlocks(raw, TOOL_CALL_START, TOOL_CALL_END, "prompt-opened");
 }
 
 export const lfm25: Dialect = {
   name: "lfm2.5",
   label: "LFM2.5 (Pythonic or JSON, with <think>)",
   verified: true,
-  note: "Verified against LiquidAI/LFM2.5-2.6B-ONNX at q4. Reasoning is hidden, so a turn that looks empty was all thinking.",
+  note: "Verified against LiquidAI/LFM2.5-2.6B-ONNX at q4. It reasons before every answer; the scratchpad is collapsed under the reply rather than shown as one.",
   parseTurn,
+  preview,
 };

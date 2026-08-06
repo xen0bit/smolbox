@@ -12,9 +12,12 @@
 import {
   type ParsedCall,
   type ParsedTurn,
+  type StreamPreview,
   ToolCallParseError,
   extractBlocks,
   normalizeJsonCalls,
+  previewBlocks,
+  splitThinking,
   stripSpecialTokens,
   truncate,
 } from "../parse.ts";
@@ -38,7 +41,12 @@ export function parseTurn(raw: string): ParsedTurn {
   for (const body of bodies) {
     calls.push(...parseAntaresCallBody(body));
   }
-  return { text: stripThinking(stripSpecialTokens(rest)).trim(), calls };
+  const { text, reasoning } = splitThinking(stripSpecialTokens(rest), "prompt-opened");
+  return { text: text.trim(), reasoning: reasoning.trim(), calls };
+}
+
+export function preview(raw: string): StreamPreview {
+  return previewBlocks(raw, TOOL_CALL_START, TOOL_CALL_END, "prompt-opened");
 }
 
 /**
@@ -181,18 +189,11 @@ function firstJsonValue(text: string): unknown {
   return undefined;
 }
 
-// Antares reasons inside <think>…</think> on every turn — the checkpoint's chat
-// template opens the block for it (PLAN §11.9). It is not prose for the user.
-// The opening tag often never appears in the completion, because the prompt
-// already emitted it, so an unpaired </think> has to be handled too.
-function stripThinking(s: string): string {
-  return s.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "");
-}
-
 export const antares: Dialect = {
   name: "antares",
   label: "Antares / Granite (<tool_call> JSON)",
   verified: true,
   note: "Verified against fdtn-ai/antares-1b at fp16. Tolerates arguments flattened to the top level, which this checkpoint emits routinely.",
   parseTurn,
+  preview,
 };

@@ -30,7 +30,7 @@ export interface ToolRunner {
 export type AgentEvent =
   | { kind: "user"; text: string }
   | { kind: "token"; text: string }
-  | { kind: "assistant"; text: string; raw: string }
+  | { kind: "assistant"; text: string; raw: string; reasoning?: string }
   | { kind: "tool-start"; call: ParsedCall }
   | {
       kind: "tool-end";
@@ -147,10 +147,12 @@ export class Conversation {
 
         let calls: ParsedCall[];
         let prose: string;
+        let reasoning: string | undefined;
         try {
           const parsed = this.opts.dialect.parseTurn(result.text);
           calls = parsed.calls;
           prose = parsed.text;
+          reasoning = parsed.reasoning;
         } catch (err) {
           // A malformed call is the model's mistake, not a crash. Tell it what
           // went wrong and let it try again — the same courtesy decodeArgs
@@ -164,13 +166,16 @@ export class Conversation {
 
         if (calls.length === 0) {
           this.history.push({ role: "assistant", content: result.text });
-          this.emit({ kind: "assistant", text: prose, raw: result.text });
+          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning });
           return;
         }
 
         this.history.push({ role: "assistant", content: result.text });
-        if (prose) {
-          this.emit({ kind: "assistant", text: prose, raw: result.text });
+        // Reasoning alone is worth an event: a reasoning model that thinks for
+        // a page and then calls a tool would otherwise leave the log with
+        // nothing at all between the question and the command.
+        if (prose || reasoning) {
+          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning });
         }
 
         for (const call of calls) {

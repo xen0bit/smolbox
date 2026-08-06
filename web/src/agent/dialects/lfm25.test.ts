@@ -23,7 +23,9 @@ describe("parseTurn: LFM2.5 keeps LFM2's call syntax", () => {
   });
 
   test("chat special tokens are stripped from the text", () => {
-    expect(parseTurn("<|im_start|>assistant\nhello<|im_end|>").text).toBe("assistant\nhello");
+    expect(parseTurn("thinking</think><|im_start|>assistant\nhello<|im_end|>").text).toBe(
+      "assistant\nhello",
+    );
   });
 });
 
@@ -54,14 +56,21 @@ describe("parseTurn: the reasoning channel", () => {
     expect(turn.text).toBe("The tag is written </think> like this.");
   });
 
-  test("a completion with no </think> at all is kept, not blanked", () => {
-    // This is either reasoning that hit max_new_tokens or a plain answer, and
-    // nothing in the text says which. Guessing "reasoning" would silently empty
-    // a real answer; guessing "answer" at worst shows the user some thinking.
-    // The conservative direction is the visible one, which matters while this
-    // dialect is unverified.
+  test("a completion with no </think> at all is all reasoning, and still kept", () => {
+    // The prompt opened the block, so a completion that never closes it never
+    // left the scratchpad — reasoning that hit max_new_tokens. This used to be
+    // reported as the answer, on the grounds that blanking the turn was the
+    // worse guess. Now that reasoning is a channel of its own rather than
+    // something the parser drops, nothing is lost by naming it correctly.
     const turn = parseTurn("Let me think about what the user is asking for and");
-    expect(turn.text).toBe("Let me think about what the user is asking for and");
+    expect(turn.text).toBe("");
+    expect(turn.reasoning).toBe("Let me think about what the user is asking for and");
+  });
+
+  test("reasoning is handed back separately, not merged into the answer", () => {
+    const turn = parseTurn("The user wants a listing.</think>There are three files.");
+    expect(turn.reasoning).toBe("The user wants a listing.");
+    expect(turn.text).toBe("There are three files.");
   });
 
   test("a block reopened and left unclosed drops only the tail", () => {

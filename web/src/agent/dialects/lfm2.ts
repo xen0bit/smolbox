@@ -7,7 +7,15 @@
 // hallucinating instead of calling). JSON is accepted anyway because it costs
 // nothing and is what a future checkpoint would produce.
 
-import { type ParsedCall, type ParsedTurn, extractBlocks, parseCallBody, stripSpecialTokens } from "../parse.ts";
+import {
+  type ParsedCall,
+  type ParsedTurn,
+  type StreamPreview,
+  extractBlocks,
+  parseCallBody,
+  previewBlocks,
+  stripSpecialTokens,
+} from "../parse.ts";
 import type { Dialect } from "./types.ts";
 
 export const TOOL_CALL_START = "<|tool_call_start|>";
@@ -22,9 +30,14 @@ export function parseTurn(raw: string): ParsedTurn {
   return { text: stripSpecialTokens(rest).trim(), calls };
 }
 
+export function preview(raw: string): StreamPreview {
+  return previewBlocks(raw, TOOL_CALL_START, TOOL_CALL_END);
+}
+
 export const lfm2: Dialect = {
   name: "lfm2",
   label: "LFM2 (Pythonic or JSON)",
   verified: true,
   parseTurn,
+  preview,
 };

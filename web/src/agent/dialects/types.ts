@@ -1,4 +1,4 @@
-import type { ParsedTurn } from "../parse.ts";
+import type { ParsedTurn, StreamPreview } from "../parse.ts";
 
 /**
  * A model family's tool-call syntax.
@@ -19,4 +19,13 @@ export interface Dialect {
   /** Notes shown in the UI when unverified: what is assumed and why. */
   note?: string;
   parseTurn(raw: string): ParsedTurn;
+  /**
+   * The live view of a partial completion, for the chat log to render mid-turn.
+   *
+   * Every family needs its own, because the markers that must not reach the
+   * screen are exactly the ones that differ between families — a single
+   * hardcoded `<|tool_call_start|>` in the page meant Qwen and Antares streamed
+   * their raw call syntax into the chat while LFM2 did not.
+   */
+  preview(raw: string): StreamPreview;
 }

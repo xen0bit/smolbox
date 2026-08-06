@@ -1,5 +1,5 @@
 {
-  "comment": "Scripted model turns for FakeModelClient, the GPU-free stand-in for the WebGPU model. Each `text` is raw model output, markers and all, so the dialect parser and the loop run exactly as they do against the real thing. The failure cases are the ones M8 actually produced against LFM2 — a Pythonic call filling in every optional argument, a truncated block, output that blows the budget — because a loop that has only seen well-formed turns will not survive a real model (PLAN §10.8 risk 17).",
+  "comment": "Scripted model turns for FakeModelClient, the GPU-free stand-in for the WebGPU model. Each `text` is raw model output, markers and all, so the dialect parser and the loop run exactly as they do against the real thing. The failure cases are the ones M8 actually produced against LFM2 \u2014 a Pythonic call filling in every optional argument, a truncated block, output that blows the budget \u2014 because a loop that has only seen well-formed turns will not survive a real model (PLAN \u00a710.8 risk 17).",
   "scripts": [
     {
       "name": "plain answer, no tool",
@@ -167,6 +167,27 @@
         },
         {
           "text": "Echoed."
+        }
+      ]
+    },
+    {
+      "name": "a reasoning model: scratchpad, a call, then the answer",
+      "when": "think first",
+      "turns": [
+        {
+          "text": "The user wants a listing, so I should run ls.</think><|tool_call_start|>[run_terminal_command(cmd=\"ls -1 /mnt/host\")]<|tool_call_end|>"
+        },
+        {
+          "text": "Now I have the listing and can answer.</think>There are three entries."
+        }
+      ]
+    },
+    {
+      "name": "a reasoning model that never leaves the scratchpad",
+      "when": "think forever",
+      "turns": [
+        {
+          "text": "Let me consider what the user is really asking for and whether"
         }
       ]
     }
