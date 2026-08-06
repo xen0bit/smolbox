@@ -147,8 +147,8 @@ function loadWeights(entry: ModelEntry, dtype: Dtype): Promise<PreTrainedModel> 
     device: "webgpu",
     revision: entry.revision,
     // The dtype is chosen by the page against the adapter's feature list, not
-    // hardcoded: f16 variants need shader-f16, which headless Chromium does not
-    // expose but a desktop browser usually does (PLAN §2.11.24).
+    // hardcoded: f16 variants need shader-f16, which no browser on this machine
+    // exposes but other GPUs and platforms do (PLAN §2.11.24, §10.14).
     dtype,
     progress_callback: (p: { status?: string; file?: string; progress?: number }) => {
       if (p.status === "progress" && p.file && typeof p.progress === "number") {

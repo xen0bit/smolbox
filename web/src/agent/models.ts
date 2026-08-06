@@ -91,8 +91,8 @@ export interface ModelEntry {
   /**
    * Candidate quantizations, best first. The page picks the first one the
    * adapter can actually run: f16 variants need the `shader-f16` feature, which
-   * headless Chromium does not expose (PLAN §2.11.24) but a desktop browser
-   * usually does.
+   * no browser on this machine exposes (PLAN §2.11.24, §10.14) but other GPUs
+   * and platforms do.
    */
   dtypes: Dtype[];
   approxBytes: number;
@@ -221,9 +221,9 @@ export const models: ModelEntry[] = [
     //
     // Listing either would be offering a choice that cannot work. q4f16
     // (1.43 GB) does, so it is the entry — and because it needs `shader-f16`,
-    // which headless Chromium does not expose (PLAN §2.11.24), pickDtype
-    // returns undefined there and the page says so instead of failing deep
-    // inside ORT. That is the honest shape of this checkpoint in a browser.
+    // which no browser on this machine exposes (PLAN §2.11.24, §10.14),
+    // pickDtype returns undefined here and the page says so instead of failing
+    // deep inside ORT. That is the honest shape of this checkpoint in a browser.
     dtypes: ["q4f16"],
     approxBytes: 1_430_000_000,
     // 40960 at the pinned revision, not the 32768 this entry claimed.
@@ -299,8 +299,10 @@ export const models: ModelEntry[] = [
     // Measured, not assumed: every variant of com.xenova.gemma4.DenseGemv is
     // guarded on shader-f16 (the checkpoint's tensors are f16), so on an adapter
     // without it the model loads happily and then has no kernel to run.
-    // Headless Chromium does not expose it even on a real NVIDIA adapter, which
-    // is why this entry cannot be exercised by the opt-in GPU suite.
+    // No browser on this machine exposes it, on any adapter, which is why this
+    // entry cannot be exercised here at all — not by the opt-in GPU suite and
+    // not by hand. Verifying it needs different hardware (D3D12, Metal, or a
+    // Mesa-driven GPU), not a different browser: PLAN §10.14.
     requiresFeatures: ["shader-f16"],
     note: "Runs on the webml-community WebGPU kernels rather than onnxruntime. Needs `make gemma-kernels` for the engine and `make model MODEL=gemma4-e2b` for the weights.",
   },

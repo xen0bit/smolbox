@@ -1,8 +1,11 @@
 // The half of the Gemma backend that is ours.
 //
-// The kernels need `shader-f16`, which headless Chromium does not expose on any
-// adapter or behind any flag (measured), so the engine itself cannot run in CI
-// or in the opt-in GPU suite on this machine. What CAN be tested is the code
+// The kernels need `shader-f16`, which no browser on this machine exposes — not
+// headless Chromium, not real Chrome, on no adapter and behind no flag. Dawn's
+// own report (chrome://gpu) enables it on Mesa's software Vulkan here and not on
+// the NVIDIA one, so it is a per-adapter gate rather than anything about how the
+// browser is launched; PLAN §10.14 has the measurements. The engine therefore
+// cannot run in CI, in the opt-in GPU suite, or by hand. What CAN be tested is the code
 // this project actually wrote around it: which tokens get fed to the forward
 // pass, when the KV cache is reused, when it is reset, and what cancellation
 // leaves behind. Those are the parts that would silently corrupt a conversation.

@@ -110,7 +110,7 @@ export class GemmaKernelEngine {
    * Everything below this line is ours — the prefix-cache bookkeeping, the
    * cancellation, the reset rules — and none of it needs a GPU to be wrong. The
    * kernels themselves cannot be tested here at all (they require `shader-f16`,
-   * which headless Chromium does not expose), so the least this file can do is
+   * which no browser on this machine exposes — PLAN §10.14), so the least this file can do is
    * make the part we wrote reachable, exactly as FakeModelClient does for the
    * loop.
    */

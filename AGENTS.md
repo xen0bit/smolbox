@@ -357,8 +357,9 @@ decodes with `skip_special_tokens: true`, which eats the very markers the dialec
 prompt and the decode come from the transformers.js tokenizer the worker already loads, and only the
 forward pass comes from the engine, via its `_model` / `_generationState` / `_eosTokenIds`
 accessors. The prefix-cache logic around it is ours and is unit-tested
-(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16` and cannot run headless at all
-(PLAN §10.13).
+(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16`, which **no browser on this
+machine exposes**, so they cannot be run here at all (PLAN §10.13, and §10.14 for why it is not a
+headless artifact).
 
 **`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
@@ -383,7 +384,8 @@ and `hermes` are verified; `llama` is marked unverified and says so in the UI. P
 capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
-and Qwen3 will not load without `shader-f16`. `lfm2.5` shares LFM2's verified call markers but is its
+and Qwen3 will not load without `shader-f16` — which, per §10.14, needs different hardware rather
+than a different browser. `lfm2.5` shares LFM2's verified call markers but is its
 own entry because the checkpoint always reasons first: its chat template ends the generation prompt
 with a bare `<think>`, so completions open inside the scratchpad and the dialect splits it off. Its
 transcript fixture is still outstanding — the `test.todo` at the end of `lfm25.test.ts` says how to

@@ -354,8 +354,8 @@ async function haveLocalWeights(repo: string): Promise<boolean> {
 }
 
 // The dtype is a runtime question, not a constant: f16 variants need shader-f16
-// on the adapter, which headless Chromium lacks and a desktop browser usually
-// has (PLAN §2.11.24).
+// on the adapter, which varies by GPU and platform far more than by browser —
+// no browser on this machine has it, Windows and macOS do (PLAN §2.11.24, §10.14).
 async function adapterFeatures(): Promise<ReadonlySet<string>> {
   const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
   const adapter = (await gpu?.requestAdapter()) as { features?: Iterable<string> } | undefined;
