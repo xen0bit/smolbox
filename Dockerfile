@@ -59,12 +59,12 @@ COPY --from=web /src/web/dist ./web/dist
 
 # Empty mount points, so an unmounted run 404s per request instead of failing at
 # startup — the pages that need weights say so themselves.
-RUN mkdir -p /models /kernels
+RUN mkdir -p /data/models /data/kernels
 
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    MODELS_DIR=/models \
-    KERNELS_DIR=/kernels
+    MODELS_DIR=/data/models \
+    KERNELS_DIR=/data/kernels
 
 # Documents the default only; a different PORT still needs its own -p mapping.
 EXPOSE 8080

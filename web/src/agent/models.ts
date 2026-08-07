@@ -376,7 +376,7 @@ export const models: ModelEntry[] = [
   },
 ];
 
-export const DEFAULT_MODEL_KEY = "lfm2-1.2b-tool";
+export const DEFAULT_MODEL_KEY = "lfm2.5-2.6b";
 
 // ------------------------------------------------------- the prefill ceiling
 //

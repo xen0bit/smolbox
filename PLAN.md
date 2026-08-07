@@ -1408,8 +1408,8 @@ implemented from documentation alone is `unverified` and says so in the UI. This
 encoded as a type: the vendor docs were wrong, and a plan that trusts the next vendor's docs will be
 wrong again.
 
-`make model MODEL=<key>` takes a registry key; the default stays LFM2 so existing commands keep
-working.
+`make model MODEL=<key>` takes a registry key; the default is the LFM2.5 2.6B entry so existing
+commands keep working.
 
 **Done when:** two model families run the same conversation through their own dialects, the dialect
 parsers pass unit tests from captured fixtures in CI, and selecting a model with an unverified
