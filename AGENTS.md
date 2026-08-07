@@ -52,7 +52,8 @@ pure and drive it with `FakeModelClient`.
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page into `web/dist`; merge the emscripten page into `dist/js`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
-| `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
+| `make compress` | write a `.br` + `.gz` beside every compressible artifact in `dist/` and `web/dist`; `web/serve.ts` serves them by negotiation and falls back to identity when absent |
+| `make test-web` | `bun test web` (protocol + session + fsbridge + tool-surface + serve negotiation unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
@@ -376,6 +377,27 @@ revalidates against. `smolbox.wasm` is ~110 MiB, so this is what stops a slow li
 it every load; the page shows a `<progress>` bar fed by the worker's download stream
 (`web/src/worker.ts` `fetchWasm`) while it does. The `If-Modified-Since` comparison floors the mtime
 to whole seconds — HTTP dates have no sub-second precision — or a freshly touched file never 304s.
+
+**Compression is pre-computed, never on the fly.** `make compress` (`web/precompress.ts`) writes a
+`.br` and a `.gz` beside each compressible artifact; `web/serve.ts` picks one by `Accept-Encoding`,
+preferring brotli, and serves identity when no sibling exists — so the target is optional and a
+deployment that skips it merely loses the saving. Encoding per request instead would cost seconds of
+CPU per cold load and force a chunked response. `dist/smolbox.wasm` goes 117.7 MB → 32.8 MB.
+
+Four things that are easy to get wrong here, all covered by `web/serve.test.ts`:
+
+- **`Content-Type` comes from the identity file.** Bun infers the type from the extension, and the
+  variant's extension is `.br` — left alone, `index.html.br` is served as a download and
+  `smolbox.wasm.br` loses the `application/wasm` that `WebAssembly.instantiateStreaming` requires.
+- **A `Range` request is always answered with identity bytes.** A range names an offset into the
+  *selected* representation, so a range of a brotli stream is legal and useless. `make compress`
+  skips `dist/models` for the same reason; this is the second line of defence.
+- **`ETag` describes the encoding actually served, and `Vary: Accept-Encoding` is on every
+  response** — otherwise a shared cache can hand a brotli body to a client that asked for none.
+- **`X-Uncompressed-Length` carries the identity size.** `Content-Length` measures the encoded body
+  while the stream a reader sees is decoded, so a progress bar dividing by it runs to ~319% on
+  `smolbox.wasm`. `fetchWasm` prefers this header and treats an encoded response without it as
+  unknown-length, which renders the `<progress>` bar indeterminate rather than frozen.
 
 ### A registry entry must name a build that actually loads
 Two failures live here and neither is visible from a model card. transformers.js reads a weight file

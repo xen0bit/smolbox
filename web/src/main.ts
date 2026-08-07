@@ -83,6 +83,11 @@ worker.addEventListener("message", (ev: MessageEvent) => {
             `loading smolbox.wasm… ${pct}% (${formatBytes(msg.loaded)} of ${formatBytes(msg.total)})`,
           );
         } else {
+          // No total to divide by — a chunked response, or an encoded one with
+          // no identity size. A <progress> with no `value` renders as an
+          // indeterminate bar, which is the honest thing to show; leaving a
+          // stale value would freeze the bar mid-track for the whole download.
+          progressEl.removeAttribute("value");
           setStatus(`loading smolbox.wasm… ${formatBytes(msg.loaded)}`);
         }
       }

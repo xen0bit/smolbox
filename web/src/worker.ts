@@ -178,7 +178,16 @@ async function fetchWasm(): Promise<ArrayBuffer> {
   if (!resp.ok) {
     throw new Error(`fetch ${WASM_URL}: ${resp.status} ${resp.statusText}`);
   }
-  const total = Number(resp.headers.get("content-length")) || 0;
+  // The bytes this reader yields are decoded, so on a compressed response
+  // Content-Length (the encoded size) would put the bar past 100% and pin it
+  // there. serve.ts sends the identity size in X-Uncompressed-Length; prefer
+  // it, and treat an encoded response without it as unknown-length rather than
+  // trusting a number that measures the wrong thing.
+  const encoded = resp.headers.get("content-encoding");
+  const total =
+    Number(resp.headers.get("x-uncompressed-length")) ||
+    (encoded ? 0 : Number(resp.headers.get("content-length"))) ||
+    0;
   if (!resp.body) {
     const bytes = await resp.arrayBuffer();
     if (total) {

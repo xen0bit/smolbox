@@ -9,7 +9,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve generate model models gemma-kernels \
+.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
         test-conformance lint clean
 
@@ -157,6 +157,16 @@ antares-verify:
 		--source dist/models/fdtn-ai/$(ANTARES) \
 		--onnx dist/models/fdtn-ai/$(ANTARES)-ONNX --dtype fp16
 
+# Writes a .br and a .gz beside every compressible artifact in dist/. serve.ts
+# picks them up automatically; without them it serves identity and nothing
+# breaks, so this is optional locally and worth doing for anything deployed.
+#
+# Weights under dist/models are skipped: they are quantised (so they barely
+# compress) and the Gemma kernel engine reads them through Range requests.
+# Re-running is cheap — a variant newer than its source is left alone.
+compress:
+	bun web/precompress.ts
+
 serve:
 	bun web/serve.ts
 
@@ -174,7 +184,8 @@ test-integration:
 	go test -tags integration ./tests/integration/...
 
 test-web:
-	bun test web/src
+	@# web/, not web/src: serve.test.ts sits beside serve.ts at the top of web/.
+	bun test web
 
 test-e2e: web
 	bunx --bun playwright test --config tests/e2e/playwright.config.ts

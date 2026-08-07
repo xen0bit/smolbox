@@ -51,6 +51,14 @@ RUN --mount=type=bind,target=/ctx \
 
 RUN make web
 
+# Encode the artifacts once, here, rather than per request at the edge. Covers
+# both trees make compress walks: /src/dist (the VM builds, copied to /data
+# below) and /src/web/dist (the page bundles and the onnxruntime runtime).
+# A mounted DIST_DIR replaces /data wholesale, so a deployment that mounts its
+# own dist/ needs to have run `make compress` against it too — serve.ts just
+# falls back to identity when the .br/.gz siblings are not there.
+RUN make compress
+
 FROM oven/bun:1.2.18-alpine@sha256:a7df687a2f684ee2f7404e2592039e192d75d26a04f843e60d9fc342741187d0
 WORKDIR /app
 
