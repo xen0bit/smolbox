@@ -2,11 +2,11 @@
   "comment": "Scripted model turns for FakeModelClient, the GPU-free stand-in for the WebGPU model. Each `text` is raw model output, markers and all, so the dialect parser and the loop run exactly as they do against the real thing. The failure cases are the ones M8 actually produced against LFM2 \u2014 a Pythonic call filling in every optional argument, a truncated block, output that blows the budget \u2014 because a loop that has only seen well-formed turns will not survive a real model (PLAN \u00a710.8 risk 17).",
   "scripts": [
     {
-      "name": "plain answer, no tool",
+      "name": "plain answer, no tool, as LFM2.5 really emits it (the prompt opened <think>)",
       "when": "who are you",
       "turns": [
         {
-          "text": "I am smolbox, an assistant with a Linux sandbox."
+          "text": "The user is asking who I am.</think>I am smolbox, an assistant with a Linux sandbox."
         }
       ]
     },

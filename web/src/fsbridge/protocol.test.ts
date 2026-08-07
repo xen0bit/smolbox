@@ -4,6 +4,7 @@ import {
   BRIDGE_MAX_REQUEST,
   BRIDGE_PAYLOAD_SIZE,
   BridgeChannel,
+  ERRNO_IO,
   ERRNO_SUCCESS,
   ReadResponse,
   createBridgeSab,
@@ -76,6 +77,32 @@ describe("main-thread respond / worker readResponse", () => {
     main.respond({ op: "read", errno: ERRNO_SUCCESS, len: big.length }, big);
     const resp = worker.readResponse() as ReadResponse;
     expect(resp.data?.length).toBe(BRIDGE_PAYLOAD_SIZE);
+  });
+
+  test("a read response carrying data on the object does not overflow the envelope", () => {
+    // MountHost.read() returns the bytes on the response object and passes the
+    // same object to respond(). Serializing that Uint8Array into the JSON
+    // envelope costs ~10 bytes per file byte and used to throw RangeError past
+    // ~7 KiB, stranding the guest until its 60s timeout.
+    const { worker, main } = pair();
+    const bytes = utf8("SELECT 1;\n".repeat(2000)); // 20 KB, well past the old cliff
+    worker.submitRequest({ op: "read", path: "/forecaster.sql", offset: 0, len: bytes.length });
+    main.readRequest();
+    main.respond({ op: "read", errno: ERRNO_SUCCESS, len: bytes.length, data: bytes }, bytes);
+    const resp = worker.readResponse() as ReadResponse;
+    expect(resp.errno).toBe(ERRNO_SUCCESS);
+    expect(resp.len).toBe(bytes.length);
+    expect(decode(resp.data)).toBe("SELECT 1;\n".repeat(2000));
+  });
+
+  test("an envelope too large for the request region answers EIO instead of throwing", () => {
+    const { worker, main } = pair();
+    const entries = Array.from({ length: 4000 }, (_, i) => ({ name: `entry-${i}.sql`, type: 4 }));
+    worker.submitRequest({ op: "readdir", path: "/" });
+    main.readRequest();
+    expect(() => main.respond({ op: "readdir", errno: ERRNO_SUCCESS, entries })).not.toThrow();
+    const resp = worker.readResponse();
+    expect(resp.errno).toBe(ERRNO_IO);
   });
 
   test("an error response carries no payload data", () => {

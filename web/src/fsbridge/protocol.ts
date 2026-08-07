@@ -142,8 +142,13 @@ export function decodeRequest(bytes: Uint8Array): BridgeRequest {
   return JSON.parse(new TextDecoder().decode(bytes)) as BridgeRequest;
 }
 
+// READ bytes ride the payload window and are deliberately dropped from the
+// envelope: JSON.stringify expands a Uint8Array into {"0":83,"1":69,...}, about
+// ten bytes per file byte, so any read over ~7 KiB would overflow
+// BRIDGE_MAX_REQUEST. The worker refills resp.data from the payload window.
 export function encodeResponse(resp: BridgeResponse): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify(resp));
+  const wire = resp.op === OpRead && resp.data !== undefined ? { ...resp, data: undefined } : resp;
+  return new TextEncoder().encode(JSON.stringify(wire));
 }
 
 export class BridgeChannel {
@@ -240,10 +245,20 @@ export class BridgeChannel {
     } else {
       Atomics.store(this.ints, I_DATALEN, 0);
     }
-    const json = encodeResponse(resp);
+    let json = encodeResponse(resp);
+    let errno = resp.errno;
+    if (json.length > BRIDGE_MAX_REQUEST) {
+      // The worker is asleep in Atomics.wait and only the store below wakes it,
+      // so an envelope that does not fit must degrade to an error rather than
+      // throw: throwing here strands the guest until its 60s timeout fires.
+      console.error(`fsbridge: ${resp.op} response too large (${json.length} bytes), replying EIO`);
+      errno = ERRNO_IO;
+      json = encodeResponse({ op: resp.op, errno } as BridgeResponse);
+      Atomics.store(this.ints, I_DATALEN, 0);
+    }
     this.req.set(json, 0);
     Atomics.store(this.ints, I_RESPLEN, json.length);
-    Atomics.store(this.ints, I_ERRNO, resp.errno);
+    Atomics.store(this.ints, I_ERRNO, errno);
     Atomics.store(this.ints, I_STATE, STATE_RESP);
     Atomics.notify(this.ints, I_STATE, 1);
   }

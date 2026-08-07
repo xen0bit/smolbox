@@ -182,6 +182,14 @@ interface Negotiated {
  *
  * Brotli is preferred over gzip when both are offered and both exist: it is
  * around 4.9x on these artifacts against gzip's 3.9x.
+ *
+ * A variant older than the file it encodes is ignored. `make web` rewrites the
+ * bundles without touching their `.br`/`.gz` siblings, so between that and the
+ * next `make compress` the encoded copy is the *previous* build — and serving
+ * it hands the browser stale code with nothing in the response to say so. The
+ * same mtime comparison precompress.ts uses to decide what needs re-encoding
+ * decides here what is safe to serve; falling through to identity costs
+ * bandwidth and never correctness.
  */
 async function negotiate(
   identity: Bun.BunFile,
@@ -200,7 +208,7 @@ async function negotiate(
       continue;
     }
     const variant = Bun.file(new URL(identityUrl.pathname + suffix, identityUrl));
-    if (await variant.exists()) {
+    if ((await variant.exists()) && variant.lastModified >= identity.lastModified) {
       return { file: variant, encoding: token };
     }
   }

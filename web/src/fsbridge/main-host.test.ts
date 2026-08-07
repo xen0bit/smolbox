@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { MountHost } from "./main-host.ts";
 import {
+  BridgeChannel,
+  BridgeRequest,
   ERRNO_NOENT,
   ERRNO_SUCCESS,
   FILETYPE_DIRECTORY,
   FILETYPE_REGULAR_FILE,
   FILETYPE_SYMBOLIC_LINK,
+  ReadResponse,
+  ReaddirResponse,
   createBridgeSab,
 } from "./protocol.ts";
 import { FakeDirectoryHandle, fixtureTree } from "./test-util.ts";
@@ -112,6 +116,56 @@ describe("MountHost.dispatch", () => {
     expect(second.data?.length).toBe(2048);
     expect(new TextDecoder().decode(first.data)).toBe("x".repeat(2048));
     expect(new TextDecoder().decode(second.data)).toBe("x".repeat(2048));
+  });
+});
+
+describe("MountHost.serve over the SAB", () => {
+  // dispatch() alone never touches the wire, so these drive the full path the
+  // guest uses: submit, serve, read back through the channel.
+  async function roundTrip(host: MountHost, worker: BridgeChannel, req: BridgeRequest) {
+    worker.submitRequest(req);
+    host.serve();
+    await new Promise((r) => setTimeout(r, 0));
+    return worker.readResponse();
+  }
+
+  test("a whole-file read larger than the request region crosses the wire", async () => {
+    // A 10 KB read (the size a `wc -l /mnt/host/*` issues) used to throw
+    // RangeError inside respond(), leaving the guest blocked until it timed out
+    // with "fsbridge: read timed out waiting for the main thread".
+    const sab = createBridgeSab();
+    const host = new MountHost();
+    host.attach(sab);
+    const worker = new BridgeChannel(sab, () => {});
+    const sql = "SELECT count(*) FROM forecasts;\n".repeat(400); // ~12 KB
+    host.setHandle(FakeDirectoryHandle.fromTree({ "forecaster.sql": sql }));
+
+    const resp = (await roundTrip(host, worker, {
+      op: "read",
+      path: "/forecaster.sql",
+      offset: 0,
+      len: sql.length,
+    })) as ReadResponse;
+    expect(resp.errno).toBe(ERRNO_SUCCESS);
+    expect(new TextDecoder().decode(resp.data)).toBe(sql);
+  });
+
+  test("stat and readdir still cross the wire unchanged", async () => {
+    const sab = createBridgeSab();
+    const host = new MountHost();
+    host.attach(sab);
+    const worker = new BridgeChannel(sab, () => {});
+    host.setHandle(FakeDirectoryHandle.fromTree(mountTree));
+
+    const st = await roundTrip(host, worker, { op: "stat", path: "/hello.txt" });
+    expect(st).toEqual({
+      op: "stat",
+      errno: ERRNO_SUCCESS,
+      filetype: FILETYPE_REGULAR_FILE,
+      size: "hello from the mount\n".length,
+    });
+    const rd = (await roundTrip(host, worker, { op: "readdir", path: "/" })) as ReaddirResponse;
+    expect(new Set((rd.entries ?? []).map((e) => e.name))).toEqual(new Set(["hello.txt", "sub"]));
   });
 });
 
