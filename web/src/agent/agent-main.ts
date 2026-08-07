@@ -42,7 +42,13 @@ const session = new Session(vmWorker);
 const mount = new MountHost();
 
 vmWorker.addEventListener("message", (ev: MessageEvent) => {
-  const msg = ev.data as { type?: string; message?: string; sab?: SharedArrayBuffer };
+  const msg = ev.data as {
+    type?: string;
+    message?: string;
+    sab?: SharedArrayBuffer;
+    loaded?: number;
+    total?: number;
+  };
   switch (msg.type) {
     case "fschannel":
       if (msg.sab) {
@@ -51,6 +57,12 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
       break;
     case "fsreq":
       mount.serve();
+      break;
+    case "progress":
+      // smolbox.wasm is ~110 MiB; the VM boots inside session.boot().
+      if (typeof msg.loaded === "number" && msg.total) {
+        setStatus(`loading smolbox.wasm… ${Math.min(100, Math.round((msg.loaded / msg.total) * 100))}%`);
+      }
       break;
   }
 });

@@ -69,7 +69,36 @@ serve({
     if (!(await file.exists())) {
       return new Response("not found: " + pathname, { status: 404, headers: isolationHeaders });
     }
-    return serveFile(file, request.headers.get("range"));
+
+    // Caching: every URL here can change without a filename change (`make web`,
+    // `make wasm` and `make wasm-js` rewrite the bundles and the VM;
+    // model/gemma-kernels re-pull weights), so nothing gets `immutable`. Strong
+    // validators plus a day-long max-age give the big artifacts the right
+    // behaviour on a slow link: a revisit within the day costs no request at
+    // all, a revisit after that is a cheap 304, and a rebuilt artifact is
+    // picked up on revalidation rather than served stale forever. HTML entries
+    // are `no-cache`: they are tiny, and they are the anchor every other
+    // resource revalidates against.
+    const etag = `"${file.size}-${file.lastModified}"`;
+    const lastModified = new Date(file.lastModified).toUTCString();
+    const validators: Record<string, string> = pathname.endsWith("index.html")
+      ? { ETag: etag, "Last-Modified": lastModified, "Cache-Control": "no-cache" }
+      : { ETag: etag, "Last-Modified": lastModified, "Cache-Control": "public, max-age=86400" };
+
+    if (request.headers.get("if-none-match") === etag) {
+      return new Response(null, { status: 304, headers: { ...isolationHeaders, ...validators } });
+    }
+    const ifModifiedSince = request.headers.get("if-modified-since");
+    if (ifModifiedSince) {
+      const since = Date.parse(ifModifiedSince);
+      // HTTP dates carry second precision; the file's mtime does not, so floor
+      // it to a whole second before comparing or a fresh file is never fresh.
+      if (Number.isFinite(since) && Math.floor(file.lastModified / 1000) * 1000 <= since) {
+        return new Response(null, { status: 304, headers: { ...isolationHeaders, ...validators } });
+      }
+    }
+
+    return serveFile(file, request.headers.get("range"), validators);
   },
 });
 
@@ -87,9 +116,13 @@ serve({
  * One range only: that is all any client here asks for, and a multipart
  * response would be a lot of machinery for no caller.
  */
-async function serveFile(file: Bun.BunFile, range: string | null): Promise<Response> {
+async function serveFile(
+  file: Bun.BunFile,
+  range: string | null,
+  validators: Record<string, string>,
+): Promise<Response> {
   const size = file.size;
-  const headers: Record<string, string> = { ...isolationHeaders, "Accept-Ranges": "bytes" };
+  const headers: Record<string, string> = { ...isolationHeaders, ...validators, "Accept-Ranges": "bytes" };
 
   const m = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
   if (!m) {

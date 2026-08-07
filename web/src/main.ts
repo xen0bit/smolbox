@@ -26,11 +26,25 @@ const statusEl = document.getElementById("status");
 const outputEl = document.getElementById("output");
 const runButton = document.getElementById("run");
 const pickButton = document.getElementById("pick");
+const progressEl = document.getElementById("wasm-progress");
 
 function setStatus(text: string): void {
   if (statusEl) {
     statusEl.textContent = text;
   }
+}
+
+function formatBytes(n: number): string {
+  if (n >= 1 << 30) {
+    return `${(n / (1 << 30)).toFixed(1)} GiB`;
+  }
+  if (n >= 1 << 20) {
+    return `${(n / (1 << 20)).toFixed(1)} MiB`;
+  }
+  if (n >= 1 << 10) {
+    return `${(n / (1 << 10)).toFixed(0)} KiB`;
+  }
+  return `${n} B`;
 }
 
 function appendOutput(text: string): void {
@@ -40,17 +54,45 @@ function appendOutput(text: string): void {
 }
 
 worker.addEventListener("message", (ev: MessageEvent) => {
-  const msg = ev.data as { type?: string; message?: string; sab?: SharedArrayBuffer };
+  const msg = ev.data as {
+    type?: string;
+    message?: string;
+    sab?: SharedArrayBuffer;
+    loaded?: number;
+    total?: number;
+  };
   switch (msg.type) {
     case "log":
       if (msg.message) {
         console.log("smolbox worker:", msg.message);
         setStatus(msg.message);
+        // "fetching wasm" is the message that precedes the download; anything
+        // later (instantiating, booting) means the bar's job is done.
+        if (msg.message !== "fetching wasm" && progressEl) {
+          progressEl.hidden = true;
+        }
+      }
+      break;
+    case "progress":
+      if (progressEl && typeof msg.loaded === "number") {
+        progressEl.hidden = false;
+        if (msg.total) {
+          const pct = Math.min(100, Math.round((msg.loaded / msg.total) * 100));
+          progressEl.setAttribute("value", String(pct));
+          setStatus(
+            `loading smolbox.wasm… ${pct}% (${formatBytes(msg.loaded)} of ${formatBytes(msg.total)})`,
+          );
+        } else {
+          setStatus(`loading smolbox.wasm… ${formatBytes(msg.loaded)}`);
+        }
       }
       break;
     case "error":
       if (msg.message) {
         setStatus(`error: ${msg.message}`);
+      }
+      if (progressEl) {
+        progressEl.hidden = true;
       }
       break;
     case "fschannel":
@@ -112,6 +154,9 @@ if (runButton) {
     }
     booting = true;
     try {
+      if (progressEl) {
+        progressEl.setAttribute("value", "0");
+      }
       const caps = await session.boot();
       setStatus(`ready (agent v${caps.version})`);
       const resp = await session.exec({ op: OpExec, cmd: "echo hello" });

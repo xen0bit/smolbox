@@ -167,10 +167,57 @@ function patchPollOneoff(wasiInstance: WASI, ch: StdinChannel): void {
   };
 }
 
+// smolbox.wasm is ~110 MiB, so on a slow link the download dwarfs the boot.
+// Stream it and report progress to the main thread, which shows a loading bar;
+// the worker can still receive postMessage here because wasi.start() has not
+// run yet. One message per percentage point keeps a fast localhost fetch to
+// ~100 messages, and a missing Content-Length (chunked encoding) falls back to
+// one message per MiB so the bar still moves.
+async function fetchWasm(): Promise<ArrayBuffer> {
+  const resp = await fetch(WASM_URL);
+  if (!resp.ok) {
+    throw new Error(`fetch ${WASM_URL}: ${resp.status} ${resp.statusText}`);
+  }
+  const total = Number(resp.headers.get("content-length")) || 0;
+  if (!resp.body) {
+    const bytes = await resp.arrayBuffer();
+    if (total) {
+      postMessage({ type: "progress", loaded: total, total });
+    }
+    return bytes;
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  let lastPct = -1;
+  let lastMiB = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    chunks.push(value);
+    loaded += value.byteLength;
+    const pct = total ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+    if (pct !== lastPct || (total === 0 && loaded - lastMiB >= 1 << 20)) {
+      lastPct = pct;
+      lastMiB = loaded;
+      postMessage({ type: "progress", loaded, total });
+    }
+  }
+  const bytes = new Uint8Array(loaded);
+  let off = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, off);
+    off += chunk.byteLength;
+  }
+  postMessage({ type: "progress", loaded, total });
+  return bytes.buffer;
+}
+
 async function run(): Promise<void> {
   postLog("fetching wasm");
-  const resp = await fetch(WASM_URL);
-  const bytes = await resp.arrayBuffer();
+  const bytes = await fetchWasm();
   const fds: Array<Fd | undefined> = [
     new StdinFd(stdin),
     new ConsoleStdout((b) => {

@@ -366,6 +366,17 @@ headless artifact).
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
 allocating 2.5 GB. That looks like a bug in the engine and is not.
 
+**`web/serve.ts` caches with validators, never `immutable`.** No URL here is content-addressed —
+`make web`/`make wasm`/`make wasm-js` rewrite the bundles and the VM in place, and
+model/gemma-kernels re-pull weights — so every file is served with an `ETag` (`size-mtime`) and
+`Last-Modified`, and a matching `If-None-Match`/`If-Modified-Since` returns 304. Non-HTML gets
+`Cache-Control: public, max-age=86400` (a revisit within the day costs nothing; after that it is a
+cheap 304); the HTML entry pages are `no-cache` because they are the anchor everything else
+revalidates against. `smolbox.wasm` is ~110 MiB, so this is what stops a slow link from re-downloading
+it every load; the page shows a `<progress>` bar fed by the worker's download stream
+(`web/src/worker.ts` `fetchWasm`) while it does. The `If-Modified-Since` comparison floors the mtime
+to whole seconds — HTTP dates have no sub-second precision — or a freshly touched file never 304s.
+
 ### A registry entry must name a build that actually loads
 Two failures live here and neither is visible from a model card. transformers.js reads a weight file
 into **one `Uint8Array`** before onnxruntime sees it, so a checkpoint published as a single large

@@ -27,12 +27,18 @@
       #status {
         color: #57606a;
       }
+      #wasm-progress {
+        display: block;
+        width: 100%;
+        margin-bottom: 0.75rem;
+      }
     </style>
   </head>
   <body>
     <main>
       <h1>smolbox</h1>
       <p id="status">starting…</p>
+      <progress id="wasm-progress" value="0" max="100" hidden></progress>
       <button id="run" type="button">boot the VM and run echo hello</button>
       <button id="pick" type="button">…</button>
       <pre id="output"></pre>

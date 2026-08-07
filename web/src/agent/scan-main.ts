@@ -54,11 +54,13 @@ const session = new Session(vmWorker);
 const mount = new MountHost();
 
 vmWorker.addEventListener("message", (ev: MessageEvent) => {
-  const msg = ev.data as { type?: string; sab?: SharedArrayBuffer };
+  const msg = ev.data as { type?: string; sab?: SharedArrayBuffer; loaded?: number; total?: number };
   if (msg.type === "fschannel" && msg.sab) {
     mount.attach(msg.sab);
   } else if (msg.type === "fsreq") {
     mount.serve();
+  } else if (msg.type === "progress" && typeof msg.loaded === "number" && msg.total) {
+    status(`loading smolbox.wasm… ${Math.min(100, Math.round((msg.loaded / msg.total) * 100))}%`);
   }
 });
 
