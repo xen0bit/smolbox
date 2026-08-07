@@ -9,7 +9,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all build wasm wasm-js vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
+.PHONY: all everything build wasm wasm-js vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
         test-conformance lint clean
 
@@ -22,7 +22,53 @@ C2W_VERSION ?= 0.8.4
 RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IMAGE) \
 		-R $(shell id -u):$(shell id -g) /out
 
-all: build wasm web
+# A bare `make` builds everything a deployment serves, from a clean checkout.
+#
+# Stated explicitly rather than relying on `everything` being the first target,
+# so that adding a target above this line cannot silently change what `make`
+# does.
+#
+# Be aware this includes `models`, an ~11 GB pull. It is the last step for that
+# reason, and it is resumable: a re-run skips what already landed, and
+# everything else is finished and encoded before it starts.
+.DEFAULT_GOAL := everything
+
+# The order is load-bearing, not cosmetic:
+#
+#   wasm-js before web        `make web` merges the emscripten page into
+#                             dist/js and *silently skips* that step when the
+#                             directory is not there yet, so the other order
+#                             leaves /js/ half-built with no error.
+#   gemma-kernels before      the kernel engine is a .js file under dist and
+#     compress                gets encoded like everything else.
+#   compress before models    weights are excluded from compression anyway, so
+#                             putting the 11 GB pull last means a dropped
+#                             connection costs you the download and not also
+#                             the encoded artifacts. `make models` is resumable;
+#                             re-running it skips what already landed.
+#
+# Sequential $(MAKE) calls rather than prerequisites, so that `make -jN`
+# cannot reorder the steps above into a broken build.
+#
+# `antares-onnx` is not here on purpose: it is the one target needing Python,
+# uv and an HF_TOKEN, against weights that are gated per repository and cannot
+# be fetched unattended. Run it by hand if you need it.
+everything:
+	$(MAKE) build
+	$(MAKE) wasm
+	$(MAKE) wasm-js
+	$(MAKE) web
+	$(MAKE) gemma-kernels
+	$(MAKE) compress
+	$(MAKE) models
+	@echo ""
+	@echo "everything: dist/ is complete and encoded; 'make serve' to run it"
+
+# `all` is the conventional name for the default goal, so it is an alias rather
+# than a second, subtly different build. It used to mean `build wasm web`, which
+# had the wasm-js-before-web bug described above: it produced a dist/js with the
+# converter output but no merged page, and said so only in a passing note.
+all: everything
 
 require-docker:
 	@if [ ! -S "$(DOCKER_SOCK)" ]; then \

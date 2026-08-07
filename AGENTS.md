@@ -41,6 +41,7 @@ pure and drive it with `FakeModelClient`.
 
 | Command | Purpose |
 |---|---|
+| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm wasm-js web gemma-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
 | `make lint` | golangci-lint (v2) + `bunx --bun tsc --noEmit` |
 | `make test` | Go unit tests (no Docker) |
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
@@ -377,6 +378,18 @@ revalidates against. `smolbox.wasm` is ~110 MiB, so this is what stops a slow li
 it every load; the page shows a `<progress>` bar fed by the worker's download stream
 (`web/src/worker.ts` `fetchWasm`) while it does. The `If-Modified-Since` comparison floors the mtime
 to whole seconds — HTTP dates have no sub-second precision — or a freshly touched file never 304s.
+
+**A bare `make` builds everything, and the order is why that is worth having.** Three of the steps are
+order-dependent and fail quietly in the wrong order: `wasm-js` must precede `web`, because `make web`
+merges the emscripten page into `dist/js` and *skips that step with a note rather than an error* when
+the directory is absent; `gemma-kernels` must precede `compress`, or the kernel engine ships
+unencoded; and `compress` runs before `models` so that a dropped connection on the 11 GB pull does
+not also cost the encoded artifacts (weights are excluded from compression anyway, and `make models`
+is resumable). The target drives these as sequential `$(MAKE)` calls rather than prerequisites, so
+`make -jN` cannot reorder them. `.DEFAULT_GOAL` names the target explicitly rather than leaning on it
+being first in the file, so adding a target above it cannot silently change what `make` does.
+`antares-onnx` is excluded: it is the one target needing Python, uv and an `HF_TOKEN`, against
+per-repository gated weights that cannot be fetched unattended.
 
 **Compression is pre-computed, never on the fly.** `make compress` (`web/precompress.ts`) writes a
 `.br` and a `.gz` beside each compressible artifact; `web/serve.ts` picks one by `Accept-Encoding`,
