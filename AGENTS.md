@@ -51,7 +51,7 @@ pure and drive it with `FakeModelClient`.
 | `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver, **plus the mock caller** (M7) |
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
-| `make web` / `make serve` | bundle browser worker + page, copy `smolbox.wasm` + `index.html`; Bun dev server with COOP/COEP |
+| `make web` / `make serve` | bundle browser worker + page into `web/dist`; merge the emscripten page into `dist/js`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
 | `make test-web` | `bun test web/src` (protocol + session + fsbridge + tool-surface unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |

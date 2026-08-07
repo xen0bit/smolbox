@@ -62,13 +62,14 @@ web:
 	mkdir -p web/dist
 	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
 	cp web/index.html web/dist/index.html
-	@if [ -f "$(WASM)" ]; then cp $(WASM) web/dist/; \
-	else echo "note: $(WASM) not built yet; run 'make wasm' (M1)"; fi
+	@# The VM artifacts stay in dist/ and are served from there (web/serve.ts
+	@# resolves them via DIST_DIR); web/dist holds only the bundles. The
+	@# emscripten page is the one merge: js.html and the bundled js-main.ts are
+	@# laid next to the c2w output in dist/js, so that directory is a complete
+	@# page on its own.
 	@if [ -d "$(DIST)/js" ]; then \
-		mkdir -p web/dist/js && \
-		bun build web/src/emscripten/js-main.ts --target=browser --outfile web/dist/js/main.js && \
-		cp -r $(DIST)/js/. web/dist/js/ && \
-		cp web/js.html web/dist/js/index.html; \
+		bun build web/src/emscripten/js-main.ts --target=browser --outfile $(DIST)/js/main.js && \
+		cp web/js.html $(DIST)/js/index.html; \
 	else echo "note: dist/js not built yet; run 'make wasm-js' (M6)"; fi
 	mkdir -p web/dist/agent web/dist/scan web/dist/ort
 	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \

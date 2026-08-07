@@ -5,10 +5,10 @@ import { pathToFileURL } from "node:url";
  * A served directory: `$name` from the environment when set, otherwise a path
  * relative to this file.
  *
- * The override exists for deployments where the big artifacts do not sit beside
- * the source tree — a container serving weights out of a mounted volume, say.
+ * The override exists for deployments where the artifacts do not sit beside
+ * the source tree — a container serving them out of a mounted volume, say.
  * The trailing slash is not cosmetic: `new URL(rel, root)` resolves *inside* a
- * root only when the root ends in one, and an operator's MODELS_DIR will not.
+ * root only when the root ends in one, and an operator's DIST_DIR will not.
  */
 function servedDir(name: string, fallback: string): URL {
   const override = Bun.env[name];
@@ -19,12 +19,13 @@ function servedDir(name: string, fallback: string): URL {
 }
 
 const distRoot = new URL("./dist/", import.meta.url);
-// Model weights are served straight out of dist/models rather than copied into
-// web/dist: the q4 checkpoint is ~1.2 GB and duplicating it per bundle is silly.
-const modelRoot = servedDir("MODELS_DIR", "../dist/models/");
-// The Gemma kernel engine, served from dist for the same reason as the weights:
-// it is downloaded by `make gemma-kernels`, not committed (see fetch-kernels.ts).
-const kernelRoot = servedDir("KERNELS_DIR", "../dist/kernels/");
+// The artifact root: one directory holding everything the build targets put in
+// dist/ — smolbox.wasm, the emscripten build (js/), the weights (models/) and
+// the Gemma kernel engine (kernels/). A single override replaces one-per-dir
+// env vars, which left smolbox.wasm stuck in the image: the weights and
+// kernels were mountable, the WASM itself was not. A whole dist/ mounted over
+// DIST_DIR overrides all of them at once.
+const artifactRoot = servedDir("DIST_DIR", "../dist/");
 // 0.0.0.0 is what Bun binds when asked for nothing, spelled out here so HOST has
 // something to override.
 const hostname = Bun.env.HOST ?? "0.0.0.0";
@@ -52,8 +53,13 @@ serve({
     }
 
     const mounts: [string, URL][] = [
-      ["/models/", modelRoot],
-      ["/kernels/", kernelRoot],
+      // The bundles served by default live in web/dist; everything that
+      // `make wasm`/`make wasm-js`/`make model(s)`/`make gemma-kernels`
+      // produces lives in dist/, so those paths are served from DIST_DIR.
+      ["/smolbox.wasm", new URL("smolbox.wasm", artifactRoot)],
+      ["/js/", new URL("js/", artifactRoot)],
+      ["/models/", new URL("models/", artifactRoot)],
+      ["/kernels/", new URL("kernels/", artifactRoot)],
     ];
     const mount = mounts.find(([prefix]) => pathname.startsWith(prefix));
     const root = mount ? mount[1] : distRoot;
@@ -115,5 +121,5 @@ async function serveFile(file: Bun.BunFile, range: string | null): Promise<Respo
 const shown = hostname === "0.0.0.0" || hostname === "::" ? "localhost" : hostname;
 console.log(
   `smolbox dev server (cross-origin isolated): http://${shown}:${port}` +
-    ` [bind ${hostname}:${port}, models ${modelRoot.pathname}]`,
+    ` [bind ${hostname}:${port}, artifacts ${artifactRoot.pathname}]`,
 );

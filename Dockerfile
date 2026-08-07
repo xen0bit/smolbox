@@ -1,7 +1,7 @@
 # The `make serve` dev server, containerised.
 #
 #   docker build -t smolbox/serve:dev .
-#   docker run --rm -p 8080:8080 -v $PWD/dist/models:/models:ro smolbox/serve:dev
+#   docker run --rm -p 8080:8080 -v $PWD/dist:/data:ro smolbox/serve:dev
 #
 # What it does NOT do is build dist/smolbox.wasm. That conversion (`make wasm`)
 # drives BuildKit through the host Docker daemon, which a container build has no
@@ -10,13 +10,15 @@
 # the agent and scan pages, exactly as `make web` does when dist/ is empty.
 #
 # Configuration, all at run time:
-#   HOST         address to bind          (default 0.0.0.0)
-#   PORT         port to listen on        (default 8080)
-#   MODELS_DIR   weights served at /models/   (default /models)
-#   KERNELS_DIR  Gemma kernel engine at /kernels/ (default /kernels)
+#   HOST       address to bind          (default 0.0.0.0)
+#   PORT       port to listen on        (default 8080)
+#   DIST_DIR   dist/ to serve artifacts from (default /data)
 #
-# The model directory is a mount rather than image content on purpose: dist/models
-# is tens of gigabytes of checkpoints, and none of it belongs in a layer.
+# DIST_DIR is the whole dist/ directory, not one path per artifact: smolbox.wasm,
+# the emscripten build and — when mounted — the weights and the Gemma kernel
+# engine are all read from it. dist/models is tens of gigabytes of checkpoints
+# and none of it belongs in a layer, so only the two small VM artifacts are
+# baked in; mount a host dist/ over /data to replace everything at once.
 
 FROM oven/bun:1.2.18-alpine@sha256:a7df687a2f684ee2f7404e2592039e192d75d26a04f843e60d9fc342741187d0 AS web
 WORKDIR /src
@@ -53,18 +55,17 @@ FROM oven/bun:1.2.18-alpine@sha256:a7df687a2f684ee2f7404e2592039e192d75d26a04f84
 WORKDIR /app
 
 # serve.ts resolves what it serves relative to its own module URL, so the layout
-# under /app has to mirror the repo's: the bundles are its ./dist sibling.
+# under /app has to mirror the repo's: the bundles are its ./dist sibling. The
+# artifacts (smolbox.wasm, the merged js/ page) go to /data, the default
+# DIST_DIR, so an unmounted run still serves them and 404s only the weight and
+# kernel paths that need a mount.
 COPY web/serve.ts ./web/serve.ts
 COPY --from=web /src/web/dist ./web/dist
-
-# Empty mount points, so an unmounted run 404s per request instead of failing at
-# startup — the pages that need weights say so themselves.
-RUN mkdir -p /data/models /data/kernels
+COPY --from=web /src/dist /data
 
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    MODELS_DIR=/data/models \
-    KERNELS_DIR=/data/kernels
+    DIST_DIR=/data
 
 # Documents the default only; a different PORT still needs its own -p mapping.
 EXPOSE 8080
