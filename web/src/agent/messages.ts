@@ -37,6 +37,12 @@ export type ModelRequest =
       messages: ChatMessage[];
       tools: unknown[];
       maxNewTokens?: number;
+      /**
+       * Sampling overrides for this turn, layered over the checkpoint's own
+       * defaults in the registry. Only the keys the user actually changed are
+       * sent, so an untouched setting keeps following the model it belongs to.
+       */
+      generation?: Partial<import("./models.ts").GenerationDefaults>;
     }
   // Cancel is fire-and-forget and deliberately carries no id: there is only
   // ever one generation in flight, and a cancel that arrives after it finished

@@ -6,11 +6,14 @@
     <title>smolbox — agent</title>
     <style>
       :root {
+        --bg: #ffffff;
         --fg: #1f2328;
         --muted: #57606a;
         --line: #d0d7de;
         --panel: #f6f8fa;
         --accent: #0969da;
+        --ok: #1a7f37;
+        --bad: #d1242f;
       }
       * {
         box-sizing: border-box;
@@ -42,6 +45,9 @@
         color: var(--muted);
         font-size: 0.85rem;
       }
+      h2 {
+        font-size: 0.95rem;
+      }
       button,
       input,
       select {
@@ -49,7 +55,7 @@
         padding: 0.35rem 0.7rem;
         border: 1px solid var(--line);
         border-radius: 4px;
-        background: #fff;
+        background: var(--bg);
         color: inherit;
       }
       button {
@@ -95,8 +101,8 @@
         font-size: 0.85rem;
       }
       .msg.error .body {
-        border-color: #d1242f;
-        color: #d1242f;
+        border-color: var(--bad);
+        color: var(--bad);
       }
       .msg.note .body {
         color: var(--muted);
@@ -152,46 +158,94 @@
       #prompt {
         flex: 1;
       }
-      #settings {
+      /* The toolbar: everything that acts on the session, on its own row, so
+         the title and the nav stop competing with the controls for space. */
+      .toolbar {
         display: flex;
-        gap: 1rem;
-        flex-wrap: wrap;
-        font-size: 0.8rem;
-        color: var(--muted);
-        margin-top: 0.75rem;
-        padding-top: 0.75rem;
-        border-top: 1px solid var(--line);
-      }
-      #settings label {
-        display: flex;
-        gap: 0.35rem;
+        gap: 0.5rem;
         align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 0.75rem;
       }
-      #settings input {
-        width: 6rem;
-        padding: 0.15rem 0.35rem;
+      .toolbar .spacer {
+        flex: 1;
       }
-      #tools-panel {
+      /* The status line was a bare span that read the same whether the page was
+         idle, downloading two gigabytes, or broken. Same text, but now the
+         state is visible without reading it. */
+      #status {
         border: 1px solid var(--line);
-        border-radius: 6px;
-        padding: 0.5rem 0.75rem;
-        margin-top: 0.75rem;
+        border-radius: 999px;
+        padding: 0.1rem 0.6rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 24rem;
+      }
+      #status[data-state="loading"] {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      #status[data-state="ready"] {
+        border-color: var(--ok);
+        color: var(--ok);
+      }
+      #status[data-state="error"] {
+        border-color: var(--bad);
+        color: var(--bad);
+      }
+
+      /* The settings dialog. The first <dialog> on the site; sections inside it
+         are <details>, which is the disclosure this page already uses for
+         reasoning and for the tool panel it absorbed. */
+      dialog {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--fg);
+        padding: 0;
+        width: min(44rem, 92vw);
+        max-height: 86vh;
+        overflow-y: auto;
+      }
+      dialog::backdrop {
+        background: rgb(0 0 0 / 45%);
+      }
+      .settings-head {
+        display: flex;
+        align-items: baseline;
+        gap: 1rem;
+        position: sticky;
+        top: 0;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
+        padding: 0.75rem 1rem;
+        margin: 0;
+      }
+      .settings-head h2 {
+        font-size: 0.95rem;
+        margin: 0;
+        flex: 1;
+      }
+      .settings-section {
+        border-bottom: 1px solid var(--line);
+        padding: 0.6rem 1rem;
         font-size: 0.85rem;
       }
-      #tools-panel summary {
+      .settings-section summary {
         cursor: pointer;
         font-weight: bold;
       }
-      #tools-panel .hint {
+      .settings-section .hint {
         color: var(--muted);
         font-size: 0.8rem;
       }
-      #tools-panel .block {
+      .settings-section .block {
         display: block;
         margin: 0.5rem 0;
         color: var(--muted);
       }
-      #tools-panel textarea {
+      .settings-section textarea {
         display: block;
         width: 100%;
         font: inherit;
@@ -203,11 +257,57 @@
         background: transparent;
         color: var(--fg);
       }
-      #tools-panel .row {
+      .settings-section .row {
         display: flex;
         gap: 0.5rem;
         align-items: center;
         flex-wrap: wrap;
+        margin-top: 0.5rem;
+      }
+      /* Knobs sit in a grid rather than a wrapping flex row: a label whose
+         input lands on the next line reads as belonging to the wrong knob. */
+      .knobs {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+        gap: 0.4rem 0.9rem;
+        margin: 0.5rem 0;
+        color: var(--muted);
+      }
+      .knobs label {
+        display: flex;
+        gap: 0.4rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .knobs input[type="number"] {
+        width: 6rem;
+        padding: 0.15rem 0.35rem;
+      }
+      /* A knob the user has taken over stops tracking the selected model, and
+         that is worth seeing before wondering why a new model behaves oddly. */
+      .knobs label[data-touched="1"] {
+        color: var(--fg);
+      }
+      .knobs label[data-touched="1"]::before {
+        content: "•";
+        color: var(--accent);
+      }
+      .cache-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: baseline;
+        justify-content: space-between;
+        padding: 0.15rem 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .cache-row .size {
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .cache-row .name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       .tool-row {
         display: flex;
@@ -225,19 +325,22 @@
       }
       @media (prefers-color-scheme: dark) {
         :root {
+          --bg: #0d1117;
           --fg: #e6edf3;
           --muted: #8b949e;
           --line: #30363d;
           --panel: #161b22;
           --accent: #4493f8;
+          --ok: #3fb950;
+          --bad: #f85149;
         }
         body {
-          background: #0d1117;
+          background: var(--bg);
         }
         button,
         input,
         select {
-          background: #0d1117;
+          background: var(--bg);
         }
       }
     </style>
@@ -245,17 +348,22 @@
   <body>
     <header>
       <h1>smolbox agent</h1>
-      <span id="status">idle</span>
       <nav>
         <a href="/">VM</a>
         <a href="/agent/" aria-current="page">chat</a>
         <a href="/scan/">scan</a>
+        <a href="/js/">js</a>
       </nav>
-      <span style="flex: 1"></span>
+    </header>
+
+    <div class="toolbar">
       <select id="model" title="which checkpoint to load"></select>
       <button id="start" type="button">start</button>
       <button id="pick" type="button">pick folder</button>
-    </header>
+      <button id="settings-open" type="button" title="system prompt, sampling, tools, storage">settings</button>
+      <span class="spacer"></span>
+      <span id="status" data-state="idle">idle</span>
+    </div>
 
     <div id="log"></div>
 
@@ -265,36 +373,102 @@
       <button id="stop" type="button" disabled>stop</button>
     </form>
 
-    <details id="tools-panel">
-      <summary>tools</summary>
-      <p class="hint">
-        Each tool you expose is prompt text the model re-reads every turn —
-        <code>run_terminal_command</code> alone is ~2.3&nbsp;KB — so narrow tools
-        are off by default. Whether they help a small model is an open question.
-      </p>
-      <div id="tool-list"></div>
-      <label class="block">custom tool (JSON)
-        <textarea id="tool-json" rows="7" spellcheck="false" placeholder='{
+    <dialog id="settings">
+      <form method="dialog" class="settings-head">
+        <h2>settings</h2>
+        <button id="settings-close" value="close" type="submit">close</button>
+      </form>
+
+      <details class="settings-section" open>
+        <summary>system prompt</summary>
+        <p class="hint">
+          The system turn, rendered into every prompt. It counts against the
+          prompt budget below, so a long one costs context on every single turn.
+        </p>
+        <textarea id="opt-system" rows="6" spellcheck="false"></textarea>
+        <div class="row">
+          <button id="reset-system" type="button">reset to default</button>
+        </div>
+      </details>
+
+      <details class="settings-section">
+        <summary>sampling</summary>
+        <p class="hint">
+          These follow the selected checkpoint until you change one; a knob you
+          set keeps its value across model switches and is marked. Greedy
+          (<code>sample</code> off) makes a run reproducible, and is wrong for
+          some checkpoints — Antares at temperature 0 loops instead of reaching a
+          tool call.
+        </p>
+        <div class="knobs">
+          <label data-knob="do_sample">sample <input id="gen-do_sample" type="checkbox" /></label>
+          <label data-knob="temperature">temperature <input id="gen-temperature" type="number" min="0" max="2" step="0.05" /></label>
+          <label data-knob="top_p">top_p <input id="gen-top_p" type="number" min="0" max="1" step="0.05" /></label>
+          <label data-knob="top_k">top_k <input id="gen-top_k" type="number" min="0" step="1" /></label>
+          <label data-knob="repetition_penalty">repetition penalty <input id="gen-repetition_penalty" type="number" min="1" max="2" step="0.05" /></label>
+        </div>
+        <div class="row">
+          <button id="reset-sampling" type="button">reset to model defaults</button>
+        </div>
+      </details>
+
+      <details class="settings-section">
+        <summary>loop</summary>
+        <p class="hint">
+          How far the agent may go on one message, and how much of the prompt it
+          may spend. <code>max new tokens</code> and <code>prompt budget</code>
+          also follow the selected checkpoint until you change them.
+        </p>
+        <div class="knobs">
+          <label data-knob="maxIterations">max tool calls <input id="opt-iterations" type="number" min="1" max="20" /></label>
+          <label data-knob="perCallMaxOutput">output cap (bytes) <input id="opt-maxoutput" type="number" min="256" step="256" /></label>
+          <label data-knob="promptBudgetChars" title="System turn, history and tool schema together. Set from the selected model's prefill ceiling.">prompt budget (chars) <input id="opt-history" type="number" min="2000" step="1000" /></label>
+          <label data-knob="maxNewTokens">max new tokens <input id="opt-tokens" type="number" min="32" step="32" /></label>
+        </div>
+        <div class="row">
+          <button id="reset-loop" type="button">reset to defaults</button>
+        </div>
+      </details>
+
+      <details id="tools-panel" class="settings-section">
+        <summary>tools</summary>
+        <p class="hint">
+          Each tool you expose is prompt text the model re-reads every turn —
+          <code>run_terminal_command</code> alone is ~2.3&nbsp;KB — so narrow
+          tools are off by default. Whether they help a small model is an open
+          question.
+        </p>
+        <div id="tool-list"></div>
+        <label class="block">custom tool (JSON)
+          <textarea id="tool-json" rows="7" spellcheck="false" placeholder='{
   "name": "find_todo",
   "description": "Find TODO comments in the folder.",
   "params": [{"name": "path", "type": "string", "description": "Where to look", "default": "/mnt/host"}],
   "template": "grep -rn TODO {path}"
 }'></textarea>
-      </label>
-      <div class="row">
-        <button id="tool-add" type="button">add / replace</button>
-        <button id="tool-export" type="button">export</button>
-        <button id="tool-import" type="button">import from box</button>
-        <span id="tool-msg"></span>
-      </div>
-    </details>
+        </label>
+        <div class="row">
+          <button id="tool-add" type="button">add / replace</button>
+          <button id="tool-export" type="button">export</button>
+          <button id="tool-import" type="button">import from box</button>
+          <span id="tool-msg"></span>
+        </div>
+      </details>
 
-    <div id="settings">
-      <label>max tool calls <input id="opt-iterations" type="number" min="1" max="20" /></label>
-      <label>output cap (bytes) <input id="opt-maxoutput" type="number" min="256" step="256" /></label>
-      <label title="System turn, history and tool schema together. Set from the selected model's prefill ceiling.">prompt budget (chars) <input id="opt-history" type="number" min="2000" step="1000" /></label>
-      <label>max new tokens <input id="opt-tokens" type="number" min="32" step="32" /></label>
-    </div>
+      <details class="settings-section">
+        <summary>cached weights</summary>
+        <p class="hint">
+          Weights are kept in IndexedDB, in chunks, because a checkpoint is far
+          too large for either the HTTP cache or Cache Storage to hold. Clearing
+          this means the next load downloads everything again.
+        </p>
+        <div id="cache-list"></div>
+        <div class="row">
+          <button id="cache-clear" type="button">clear all</button>
+          <span id="cache-msg" class="hint"></span>
+        </div>
+      </details>
+    </dialog>
 
     <p style="font-size: 0.8rem; color: var(--muted)">
       A local model on WebGPU drives a Linux VM through one

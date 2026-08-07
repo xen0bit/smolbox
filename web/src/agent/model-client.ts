@@ -7,6 +7,7 @@
 // level up.
 
 import type { ChatMessage, ModelErrorCode, ModelRequest, ModelResponse } from "./messages.ts";
+import type { GenerationDefaults } from "./models.ts";
 
 /**
  * A model failure the caller can act on.
@@ -31,6 +32,8 @@ export interface GenerateRequest {
   messages: ChatMessage[];
   tools: unknown[];
   maxNewTokens?: number;
+  /** Sampling overrides for this turn. See ModelRequest in messages.ts. */
+  generation?: Partial<GenerationDefaults>;
   /** Called with each decoded chunk as it is produced. */
   onToken?(text: string): void;
 }
@@ -134,6 +137,7 @@ export class WorkerModelClient implements ModelClient {
         messages: req.messages,
         tools: req.tools,
         maxNewTokens: req.maxNewTokens,
+        generation: req.generation,
       });
     });
   }

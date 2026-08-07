@@ -461,6 +461,18 @@ export function maxPromptChars(
   return maxPromptTokens(entry, budgetBytes) * CHARS_PER_TOKEN_ESTIMATE;
 }
 
+/**
+ * What this checkpoint asks to be sampled with, with the registry-wide default
+ * filled in.
+ *
+ * The settings panel needs a concrete value to show and a concrete value to
+ * reset to, and "absent" is not one — an entry with no `generation` block runs
+ * greedy, which is the same thing the worker falls back to.
+ */
+export function generationDefaults(entry: ModelEntry): GenerationDefaults {
+  return entry.generation ?? { do_sample: false };
+}
+
 export function modelFor(key: string): ModelEntry {
   const entry = models.find((m) => m.key === key);
   if (!entry) {

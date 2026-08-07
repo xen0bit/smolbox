@@ -9,7 +9,10 @@ declare const TextEncoder: {
   new (): { encode(input?: string): Uint8Array };
 };
 declare const TextDecoder: {
-  new (label?: string): { decode(input?: Uint8Array): string };
+  // `stream` matters for the console forwarder in worker.ts: it decodes
+  // arbitrary write boundaries, and a multi-byte character split across two of
+  // them must not become two replacement characters.
+  new (label?: string): { decode(input?: Uint8Array, options?: { stream?: boolean }): string };
 };
 
 declare const crossOriginIsolated: boolean;
@@ -29,8 +32,13 @@ interface Element {
   textContent: string | null;
   className: string;
   value: string;
+  /** Checkbox inputs only: the sampling panel's `do_sample`. */
+  checked: boolean;
   disabled: boolean;
   hidden: boolean;
+  /** <dialog> only, and optional so a browser without it degrades to inline. */
+  showModal?(): void;
+  close?(): void;
   scrollTop: number;
   readonly scrollHeight: number;
   readonly children: readonly Element[];
@@ -39,6 +47,11 @@ interface Element {
   // children rather than only append them.
   readonly firstChild: Element | null;
   readonly parentElement: Element | null;
+  /** Inputs only. The terminal reads these to leave Ctrl+C as copy when
+      something is selected, rather than always stealing it. */
+  readonly selectionStart: number | null;
+  readonly selectionEnd: number | null;
+  focus(): void;
   querySelector(selectors: string): Element | null;
   insertBefore(node: Element, before: Element | null): Element;
   appendChild(child: Element): Element;
@@ -66,6 +79,8 @@ interface FileInputLike extends Element {
 interface KeyboardEventLike {
   key?: string;
   shiftKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
   preventDefault?(): void;
 }
 
@@ -82,6 +97,13 @@ declare const localStorage: {
 declare function showDirectoryPicker(
   options?: { mode?: "read" | "readwrite" },
 ): Promise<import("./fsbridge/main-host").DirectoryHandleLike>;
+
+// IndexedDB, where the model cache keeps weight chunks (agent/model-cache.ts).
+// The shapes live there rather than here because the cache takes its factory as
+// a constructor option — bun ships no IndexedDB, so the unit tests pass a fake
+// that has to satisfy exactly these interfaces.
+declare const indexedDB: import("./agent/model-cache").IdbFactoryLike;
+declare const IDBKeyRange: import("./agent/model-cache").IdbKeyRangeLike;
 
 interface Navigator {
   storage: import("./fsbridge/main-host").StorageManagerLike;

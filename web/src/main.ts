@@ -6,8 +6,8 @@
 
 import { MountHost, DirectoryHandleLike } from "./fsbridge/main-host.ts";
 import type { Caps, Request, Response } from "./protocol.ts";
-import { OpExec } from "./protocol.ts";
 import { Session } from "./session.ts";
+import { Terminal } from "./terminal.ts";
 import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "./mount.ts";
 
 export interface SmolboxHandle {
@@ -23,10 +23,21 @@ const session = new Session(worker);
 const mount = new MountHost();
 
 const statusEl = document.getElementById("status");
-const outputEl = document.getElementById("output");
-const runButton = document.getElementById("run");
+const termEl = document.getElementById("terminal");
 const pickButton = document.getElementById("pick");
 const progressEl = document.getElementById("wasm-progress");
+
+// The terminal owns the session; window.__smolbox below still reaches it
+// directly, because that is the hook the e2e suites drive and it must keep
+// working whether or not anyone has typed a command.
+const terminal = termEl
+  ? new Terminal({
+      root: termEl,
+      session,
+      historyKey: "smolbox.history",
+      examples: ["uname -a", "ls /", "cat /proc/cpuinfo", "ls -la /mnt/host"],
+    })
+  : null;
 
 function setStatus(text: string): void {
   if (statusEl) {
@@ -47,12 +58,6 @@ function formatBytes(n: number): string {
   return `${n} B`;
 }
 
-function appendOutput(text: string): void {
-  if (outputEl) {
-    outputEl.textContent += text;
-  }
-}
-
 worker.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as {
     type?: string;
@@ -60,8 +65,14 @@ worker.addEventListener("message", (ev: MessageEvent) => {
     sab?: SharedArrayBuffer;
     loaded?: number;
     total?: number;
+    text?: string;
   };
   switch (msg.type) {
+    case "console":
+      if (msg.text) {
+        terminal?.system(msg.text);
+      }
+      break;
     case "log":
       if (msg.message) {
         console.log("smolbox worker:", msg.message);
@@ -151,26 +162,4 @@ void getOpfsDirectoryHandle()
   })
   .catch(() => undefined);
 
-let booting = false;
-if (runButton) {
-  runButton.addEventListener("click", async () => {
-    if (booting) {
-      return;
-    }
-    booting = true;
-    try {
-      if (progressEl) {
-        progressEl.setAttribute("value", "0");
-      }
-      const caps = await session.boot();
-      setStatus(`ready (agent v${caps.version})`);
-      const resp = await session.exec({ op: OpExec, cmd: "echo hello" });
-      appendOutput(resp.stdout + resp.stderr);
-      setStatus(`done in ${resp.duration_ms}ms`);
-    } catch (err) {
-      setStatus(`error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      booting = false;
-    }
-  });
-}
+terminal?.focus();

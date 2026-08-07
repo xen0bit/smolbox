@@ -14,6 +14,10 @@ import { StdinChannel, StdioRouter } from "./stdio.ts";
 
 const WASM_URL = "smolbox.wasm";
 
+// Stateful on purpose: fd_write hands over whatever the guest happened to flush,
+// so a character can straddle two calls. See the onOutput hook below.
+const consoleText = new TextDecoder();
+
 function postLog(msg: string): void {
   postMessage({ type: "log", message: msg });
 }
@@ -57,6 +61,11 @@ const router = new StdioRouter(stdin, {
   },
   onResponse: (resp: Response) => postMessage({ type: "response", resp }),
   onError: (err: Error) => postMessage({ type: "error", message: String(err) }),
+  // The kernel's boot log shares this stream with the protocol frames and never
+  // becomes a frame itself, so it is invisible to everything downstream of the
+  // decoder. Forward it raw and let the page decide whether to show it — the
+  // terminal on / does, and it is the only live output that page has.
+  onOutput: (_stream, data) => postMessage({ type: "console", text: consoleText.decode(data, { stream: true }) }),
 });
 
 // The emulator treats an EAGAIN from fd_read as "guest keeps waiting", the same

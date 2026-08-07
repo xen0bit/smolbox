@@ -38,6 +38,40 @@ function build(scripts: FakeScript[], patch: Partial<Parameters<Conversation["co
 
 const kinds = (events: AgentEvent[]) => events.map((e) => e.kind);
 
+describe("sampling overrides", () => {
+  test("nothing is sent when the user has changed nothing", async () => {
+    const seen: (Record<string, unknown> | undefined)[] = [];
+    const { convo } = build([{ name: "plain", turns: [{ text: "hi" }] }]);
+    const model = (convo as unknown as { model: { generate: (r: Record<string, unknown>) => unknown } }).model;
+    const inner = model.generate.bind(model);
+    model.generate = (req) => {
+      seen.push(req.generation as Record<string, unknown> | undefined);
+      return inner(req);
+    };
+
+    await convo.send("hi");
+    // An empty override means the worker keeps applying whatever the selected
+    // checkpoint asks for. Sending a partly-filled object here would quietly
+    // pin every model to one model's sampling.
+    expect(seen).toEqual([{}]);
+  });
+
+  test("only the fields that were configured travel with the turn", async () => {
+    const seen: (Record<string, unknown> | undefined)[] = [];
+    const { convo } = build([{ name: "plain", turns: [{ text: "hi" }] }]);
+    convo.configure({ generation: { temperature: 0, do_sample: false } });
+    const model = (convo as unknown as { model: { generate: (r: Record<string, unknown>) => unknown } }).model;
+    const inner = model.generate.bind(model);
+    model.generate = (req) => {
+      seen.push(req.generation as Record<string, unknown> | undefined);
+      return inner(req);
+    };
+
+    await convo.send("hi");
+    expect(seen).toEqual([{ temperature: 0, do_sample: false }]);
+  });
+});
+
 describe("Conversation", () => {
   test("a plain answer ends the turn without touching a tool", async () => {
     const { convo, events, ran } = build([{ name: "plain", turns: [{ text: "Hello there." }] }]);

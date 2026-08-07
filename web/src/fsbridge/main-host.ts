@@ -59,6 +59,9 @@ export type HandleLike = FileHandleLike | DirectoryHandleLike;
 
 export interface StorageManagerLike {
   getDirectory(): Promise<DirectoryHandleLike>;
+  /** Not everywhere, and refusable. The model cache asks and moves on. */
+  persist?(): Promise<boolean>;
+  estimate?(): Promise<{ usage?: number; quota?: number }>;
 }
 
 export class MountHost {

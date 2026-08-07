@@ -17,12 +17,12 @@ import {
   DEFAULT_MODEL_KEY,
   type Dtype,
   type ModelEntry,
-  maxPromptChars,
   modelFor,
   models,
   pickDtype,
 } from "./models.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
+import { Settings } from "./settings.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
 import type { ParsedCall, StreamPreview } from "./parse.ts";
@@ -78,11 +78,30 @@ const stopEl = el("stop");
 const startEl = el("start");
 const pickEl = el("pick");
 
+/**
+ * The status line, and what state it is in.
+ *
+ * The text was always there; what was missing is that "loading Qwen3 1.7B" and
+ * "FAIL: cross-origin isolation required" looked identical at a glance. The
+ * state is inferred from the message rather than passed by every caller — there
+ * are ~20 call sites and threading a second argument through all of them would
+ * be a lot of edits for a colour.
+ */
 function setStatus(text: string): void {
   console.log("[smolagent]", text);
-  if (statusEl) {
-    statusEl.textContent = text;
+  if (!statusEl) {
+    return;
   }
+  statusEl.textContent = text;
+  const lower = text.toLowerCase();
+  const state = /^(fail|error)|\berror\b|failed/.test(lower)
+    ? "error"
+    : /loading|booting|generating|…/.test(lower)
+      ? "loading"
+      : /ready/.test(lower)
+        ? "ready"
+        : "idle";
+  statusEl.setAttribute("data-state", state);
 }
 
 function bubble(cls: string, who: string): Element | null {
@@ -158,6 +177,12 @@ const convo = new Conversation(
   runner,
   onEvent,
 );
+
+const settings = new Settings({
+  configure: (patch) => convo.configure(patch),
+  model: () => modelFor(currentModelKey),
+  defaultSystemPrompt: SYSTEM_PROMPT,
+});
 
 // The raw completion for the turn in flight. The preview is recomputed from the
 // whole buffer rather than appended to, because whether a chunk is prose depends
@@ -374,32 +399,6 @@ async function adapterFeatures(): Promise<ReadonlySet<string>> {
   return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
-// The loop passes maxNewTokens and promptBudgetChars on every generate, so they
-// win over whatever the registry entry declares — which is right for knobs the
-// user can turn, and wrong as defaults. A reasoning model that thinks before it
-// answers needs more than 512 new tokens or it stops mid-thought every turn; and
-// the prompt ceiling is a property of the checkpoint's vocabulary, not a
-// preference, because exceeding it kills the WebGPU device rather than the turn
-// (models.ts PREFILL_LOGITS_BUDGET_BYTES). Selecting a model moves both knobs to
-// that checkpoint's numbers; changing them afterwards still wins.
-function applyModelBudgets(entry: ModelEntry): void {
-  const tokens = entry.generation?.max_new_tokens;
-  if (tokens) {
-    convo.configure({ maxNewTokens: tokens });
-    setInput("opt-tokens", tokens);
-  }
-  const budget = maxPromptChars(entry);
-  convo.configure({ promptBudgetChars: budget });
-  setInput("opt-history", budget);
-}
-
-function setInput(id: string, value: number): void {
-  const input = el(id);
-  if (input) {
-    input.value = String(value);
-  }
-}
-
 /**
  * Says out loud when the selected entry is not a chat model.
  *
@@ -471,7 +470,8 @@ export interface SmolagentHandle {
   setMount(handle: DirectoryHandleLike | null, links?: Record<string, string>): void;
   send(text: string): Promise<AgentEvent[]>;
   cancel(): void;
-  configure(patch: Record<string, number>): void;
+  /** Loose on purpose: the settings panel sends strings and objects too. */
+  configure(patch: Record<string, unknown>): void;
   tools(): { name: string; source: string; enabled: boolean }[];
   addTool(tool: TemplateTool): void;
   enableTool(name: string, on: boolean): void;
@@ -543,7 +543,9 @@ const handle: SmolagentHandle = {
     const entry = modelFor(key);
     currentModelKey = entry.key;
     convo.configure({ dialect: dialectFor(entry.dialect) });
-    applyModelBudgets(entry);
+    // Re-derives every knob the user has not taken over — the new checkpoint's
+    // token ceiling, prompt budget and sampling. See settings.ts.
+    settings.apply();
     // The weights in the worker are still the previous model's, and answering
     // with them under a new dialect would be the worst of both.
     modelReady = false;
@@ -620,31 +622,10 @@ function DEMO_SCRIPTS(): FakeScript[] {
   ];
 }
 
-// Reflect the loop's defaults into the settings inputs, and read them back.
-const optionInputs: Record<string, string> = {
-  "opt-iterations": "maxIterations",
-  "opt-maxoutput": "perCallMaxOutput",
-  "opt-history": "promptBudgetChars",
-  "opt-tokens": "maxNewTokens",
-};
-for (const [id, key] of Object.entries(optionInputs)) {
-  const input = el(id);
-  if (!input) {
-    continue;
-  }
-  input.value = String((convo.options() as unknown as Record<string, number>)[key]);
-  input.addEventListener("change", () => {
-    const n = Number(input.value);
-    if (Number.isFinite(n) && n > 0) {
-      convo.configure({ [key]: n } as never);
-    }
-  });
-}
-
-// The dropdown starts on the default entry without ever firing `change`, so its
-// budgets have to be applied here too — otherwise the first model anyone loads
+// The dropdown starts on the default entry without ever firing `change`, so the
+// settings have to be applied here too — otherwise the first model anyone loads
 // runs on the loop's generic defaults instead of its own ceiling.
-applyModelBudgets(modelFor(DEFAULT_MODEL_KEY));
+settings.apply();
 
 el("composer")?.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {

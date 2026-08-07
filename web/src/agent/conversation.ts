@@ -9,7 +9,7 @@
 import type { ChatMessage } from "./messages.ts";
 import { ModelError, type ModelClient } from "./model-client.ts";
 import type { Dialect } from "./dialects/index.ts";
-import { CHARS_PER_TOKEN_ESTIMATE } from "./models.ts";
+import { CHARS_PER_TOKEN_ESTIMATE, type GenerationDefaults } from "./models.ts";
 import { type ParsedCall, ToolCallParseError } from "./parse.ts";
 
 export interface ToolRunner {
@@ -63,6 +63,12 @@ export interface ConversationOptions {
    * models.ts — does not care which part of the prompt the tokens came from.
    */
   promptBudgetChars: number;
+  /**
+   * Sampling overrides, layered over the checkpoint's registry defaults in the
+   * worker. Empty means "whatever the model asks for", which is the state the
+   * page is in until someone opens the settings panel and changes something.
+   */
+  generation: Partial<GenerationDefaults>;
 }
 
 // Budgets are counted in characters, not tokens: the tokenizer lives in the
@@ -71,6 +77,7 @@ export interface ConversationOptions {
 export { CHARS_PER_TOKEN_ESTIMATE } from "./models.ts";
 
 export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dialect"> = {
+  generation: {},
   maxIterations: 5,
   // Three orders of magnitude below the protocol's 1 MiB default. A model that
   // needs more than this from one command should narrow the command; `truncated`
@@ -259,6 +266,7 @@ export class Conversation {
           messages: this.messages(),
           tools: this.opts.tools,
           maxNewTokens: this.opts.maxNewTokens,
+          generation: this.opts.generation,
           onToken: (t) => this.emit({ kind: "token", text: t }),
         });
       } catch (err) {

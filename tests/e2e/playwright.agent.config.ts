@@ -1,8 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// The M8 agent spike. Its own config because it needs launch flags the other two
-// suites do not, and because it must never run by accident: it wants a real GPU
-// and ~1.2 GB of local weights.
+// The M8 agent spike, plus the weight-cache round trip. Its own config because
+// these need launch flags the other suites do not, and because they must never
+// run by accident: they want a real GPU and gigabytes of local weights.
 //
 // The flags are the minimum that yields a real adapter in headless Chromium
 // (measured at M8): with neither, requestAdapter() returns null, and
@@ -11,7 +11,7 @@ import { defineConfig, devices } from "@playwright/test";
 // http://localhost satisfies.
 export default defineConfig({
   testDir: ".",
-  testMatch: ["**/agent.spec.ts"],
+  testMatch: ["**/agent.spec.ts", "**/model-cache.spec.ts"],
   timeout: 15 * 60 * 1000,
   fullyParallel: false,
   workers: 1,

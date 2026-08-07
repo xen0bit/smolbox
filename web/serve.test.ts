@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 
-import { acceptsEncoding } from "./serve.ts";
+import { acceptsEncoding, cacheControl } from "./serve.ts";
 
 let dist: string;
 let proc: Bun.Subprocess;
@@ -203,6 +203,25 @@ describe("range requests", () => {
     expect(Buffer.from(new Uint8Array(await r.arrayBuffer()))).toEqual(
       WASM_BODY.subarray(1000, 1016),
     );
+  });
+});
+
+describe("cacheControl", () => {
+  test("HTML never sticks", () => {
+    expect(cacheControl("/index.html")).toBe("no-cache");
+    expect(cacheControl("/agent/index.html")).toBe("no-cache");
+  });
+
+  test("the pinned onnxruntime build is immutable", () => {
+    expect(cacheControl("/ort/ort-wasm-simd-threaded.jsep.wasm")).toContain("immutable");
+  });
+
+  test("artifacts a rebuild rewrites in place still revalidate", () => {
+    // These change under the same name, so `immutable` would strand a client on
+    // a stale VM or a stale checkpoint with no way to notice.
+    for (const p of ["/smolbox.wasm", "/main.js", "/models/repo/onnx/model.onnx", "/kernels/gemma4/x.js"]) {
+      expect(cacheControl(p)).toBe("public, max-age=86400");
+    }
   });
 });
 

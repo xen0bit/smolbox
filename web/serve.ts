@@ -80,9 +80,13 @@ export async function handle(request: Request): Promise<Response> {
   // force a chunked response.
   const chosen = await negotiate(file, new URL(rel, root), request);
 
-  // Caching: every URL here can change without a filename change (`make web`,
-  // `make wasm` and `make wasm-js` rewrite the bundles and the VM;
-  // model/gemma-kernels re-pull weights), so nothing gets `immutable`. Strong
+  // Caching: almost every URL here can change without a filename change
+  // (`make web`, `make wasm` and `make wasm-js` rewrite the bundles and the VM;
+  // model/gemma-kernels re-pull weights), so almost nothing gets `immutable`.
+  // The exception is /ort/, which `make web` copies straight out of
+  // node_modules: those four multi-megabyte builds cannot change without a
+  // dependency bump, and paying a revalidation round-trip a day for 105 MB of
+  // runtime that is pinned by bun.lock buys nothing. See cacheControl. Strong
   // validators plus a day-long max-age give the big artifacts the right
   // behaviour on a slow link: a revisit within the day costs no request at
   // all, a revisit after that is a cheap 304, and a rebuilt artifact is
@@ -97,9 +101,11 @@ export async function handle(request: Request): Promise<Response> {
   // free to hand a brotli body to a client that asked for none.
   const etag = `"${chosen.file.size}-${chosen.file.lastModified}"`;
   const lastModified = new Date(chosen.file.lastModified).toUTCString();
-  const validators: Record<string, string> = pathname.endsWith("index.html")
-    ? { ETag: etag, "Last-Modified": lastModified, "Cache-Control": "no-cache" }
-    : { ETag: etag, "Last-Modified": lastModified, "Cache-Control": "public, max-age=86400" };
+  const validators: Record<string, string> = {
+    ETag: etag,
+    "Last-Modified": lastModified,
+    "Cache-Control": cacheControl(pathname),
+  };
   validators.Vary = "Accept-Encoding";
   if (chosen.encoding) {
     validators["Content-Encoding"] = chosen.encoding;
@@ -133,6 +139,30 @@ export async function handle(request: Request): Promise<Response> {
   // `negotiate` returns identity whenever the request carries a Range, so the
   // range arithmetic below always runs against the identity bytes.
   return serveFile(chosen.file, request.headers.get("range"), validators);
+}
+
+/**
+ * How long a client may hold a path without asking again.
+ *
+ * Three tiers. HTML is `no-cache`: it is tiny, and it is the anchor every other
+ * resource revalidates against, so a stale one strands the whole page on an old
+ * bundle. `/ort/` is `immutable`: `make web` copies it verbatim out of
+ * node_modules, so it cannot change unless bun.lock does, and a new version
+ * arrives under a filename carrying its own hash. Everything else revalidates
+ * daily, because a rebuild rewrites it in place under the same name.
+ *
+ * Weights are in the "everything else" tier and stay there: an entry that size
+ * never reaches the HTTP cache in the first place, which is exactly why they
+ * are cached in IndexedDB instead (web/src/agent/model-cache.ts).
+ */
+export function cacheControl(pathname: string): string {
+  if (pathname.endsWith("index.html")) {
+    return "no-cache";
+  }
+  if (pathname.startsWith("/ort/")) {
+    return "public, max-age=31536000, immutable";
+  }
+  return "public, max-age=86400";
 }
 
 /**

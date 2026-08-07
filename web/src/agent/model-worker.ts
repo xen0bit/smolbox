@@ -17,6 +17,7 @@ import {
 } from "@huggingface/transformers";
 
 import { GemmaKernelEngine } from "./gemma-kernels.ts";
+import { ModelCache } from "./model-cache.ts";
 import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
 import {
   CHAT_TEMPLATE_FILE,
@@ -46,6 +47,11 @@ class WorkerError extends Error {
 if (env.backends.onnx.wasm) {
   env.backends.onnx.wasm.wasmPaths = "/ort/";
 }
+
+// One per worker. The page holds its own handle to the same IndexedDB database
+// for the storage panel — it is origin-scoped, so nothing has to cross the
+// worker boundary to read it.
+const modelCache = new ModelCache();
 
 // The bundle targets a worker, but web/tsconfig.json deliberately ships no DOM
 // lib (see web-globals.d.ts), so the worker scope is reached the same way
@@ -100,11 +106,17 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   env.allowRemoteModels = !local;
   if (local) {
     env.localModelPath = LOCAL_MODEL_PATH;
-    // Cache Storage cannot take a 1.2 GB entry (it fails the put with an opaque
-    // "Unexpected internal error"), and caching a file already served from local
-    // disk buys nothing anyway.
-    env.useBrowserCache = false;
   }
+  // Weights are cached in IndexedDB, in chunks, on BOTH paths. Cache Storage
+  // cannot take a 1.2 GB entry (the put fails with an opaque "Unexpected
+  // internal error") and the HTTP cache underneath it will not hold a file this
+  // size either, so before this the local path re-downloaded every checkpoint on
+  // every reload — the served-from-disk argument for not caching only holds for
+  // the server, not for the browser that has to pull it over again. See
+  // model-cache.ts. getCache() prefers the custom cache over both others.
+  env.useCustomCache = true;
+  env.customCache = modelCache;
+  env.useBrowserCache = false;
 
   const started = performance.now();
   // The revision is passed so the hub path honours the pin the registry exists
@@ -277,7 +289,9 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   // at temperature 0 falls into repetition loops and never reaches a tool call,
   // in the reference safetensors model as much as in the converted one
   // (PLAN §11.10). An entry that needs sampling declares it in the registry.
-  const sampling = loaded?.generation ?? { do_sample: false };
+  // The page layers its own overrides on top, and only for the fields someone
+  // actually changed — everything else keeps tracking the selected checkpoint.
+  const sampling = { ...(loaded?.generation ?? { do_sample: false }), ...(req.generation ?? {}) };
   let out: unknown;
   try {
     out = await model!.generate({
