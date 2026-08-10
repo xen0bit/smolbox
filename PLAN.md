@@ -44,7 +44,7 @@ and append new findings at the end of their section.
 |---|---|---|
 | [§9](docs/plan/09-webgpu-agent.md) | The WebGPU agent | M8: the spike that put a local model in front of the tool surface |
 | [§10.1–§10.9](docs/plan/10-chat-models-and-tools.md) | Chat, models and tools | M9–M11: the chat UI, the model registry and dialects, customizable tools |
-| [§10.10–§10.22](docs/plan/10-findings.md) | **What running it taught us** | The measurement log. The prefill ceiling, `shader-f16`, the inline-weight ceiling, the model survey, chunked prefill, the mount's timestamps. Start here when something is behaving strangely. |
+| [§10.10–§10.23](docs/plan/10-findings.md) | **What running it taught us** | The measurement log. The prefill ceiling, `shader-f16`, the inline-weight ceiling, the model survey, chunked prefill, the mount's timestamps. Start here when something is behaving strangely. |
 | [§11](docs/plan/11-antares.md) | Antares | M12–M14, since removed. Kept for the findings, not the feature |
 
 ### Where to add things

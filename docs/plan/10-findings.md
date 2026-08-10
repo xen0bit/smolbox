@@ -1,4 +1,4 @@
-## 10 (continued). What running it taught us (§10.10–§10.22)
+## 10 (continued). What running it taught us (§10.10–§10.23)
 
 The measurement log for component 2: every finding that came from putting a real model on a real GPU
 in front of a real VM, in the order it was found. §10.1–§10.9 in
@@ -1058,3 +1058,64 @@ them:
 - *`MountHost`'s caches never expire*, so a file edited on disk mid-session stays stale inside the
   guest until the folder is picked again. That is the price of not re-stat'ing on every syscall, and
   `cat` of a large file is hundreds of syscalls. Documented on the class rather than changed.
+
+### 10.23 Six follow-ups to the chunked prefill (2026-08-10)
+
+Follow-ups to chunked prefill, in the order they stopped being guesses.
+
+**Elision was fighting the cache it now shares a page with.** `elide()` trimmed to *exactly*
+`promptBudgetChars`, so the next tool result put the prompt straight back over the line — and every
+elision rewrites an older message, which is precisely what invalidates a prefix. A long conversation
+therefore elided on every turn and re-prefilled itself on every turn, which is the cost §10.21
+existed to remove. `ELIDE_TARGET_FRACTION` (0.7) trims well under instead, so one rebuild buys
+several turns. The `elided` event carries how many times it has fired, because 0.7 is a choice and
+that count is what will say whether it was the right one.
+
+**The character budget stops guessing.** §10.16 lost a turn to `CHARS_PER_TOKEN_ESTIMATE` being 4
+where the conversation ran at 3.85, and the error is in the direction that makes an oversized prompt
+look acceptable — so a *refusal* was the only way to learn the real ratio. Every successful turn
+measures it for free: the worker counts tokens with the real tokenizer, the loop already counted the
+characters it sent. `generated` now carries `promptTokens` and `limitTokens`, and `calibrate()`
+lowers the budget to what this conversation actually costs. Strictly downwards, like `shrinkBudget`:
+a ratio measured from a short prompt is not evidence about a longer one.
+
+**The registry no longer gets the last word on `prefillLogits`.** It is declared by hand from a graph
+someone read once, and an entry claiming `"last"` against an export that does not take
+`num_logits_to_keep` is §10.10's device death reintroduced by a registry line rather than by any
+code. The graph is right there at load, so it wins, and the disagreement is logged.
+
+It found one on its first live run: `lfm2.5-350m` declared nothing and its graph *does* take the
+input, so it was being chunked for an allocation it never makes. All eight local graphs were then
+checked by hand for the input name and for §10.20's `logits_to_keep` misspelling — one wrong, seven
+right:
+
+| entry | graph takes `num_logits_to_keep` | registry said | now |
+|---|---|---|---|
+| lfm2.5-350m | yes | (sequence, by omission) | **corrected to `last`** |
+| qwen3.5-0.8b, granite-4.0-h-1b, gemma4-e2b-onnx | yes | last | unchanged |
+| lfm2-1.2b-tool, lfm2.5-2.6b, qwen2.5-0.5b | no | (sequence) | unchanged |
+
+**§10.16's "not fixed" is fixed.** The worker's own reload runs on the same onnxruntime module and
+therefore the same WebGPU device, so a device that was genuinely *lost* survives it.
+`WorkerModelClient` counts consecutive `device-lost` errors and, on the second, terminates the
+worker, spawns a replacement and re-issues the load. Not on the first: an allocation failure does not
+take the device away and disposing the sessions gives the memory back, which is the cheap fix and
+usually works.
+
+**The adapter's limits are logged once at load** — `maxBufferSize`,
+`maxStorageBufferBindingSize`, vendor and architecture. Every out-of-memory report here so far is an
+argument about numbers nobody had, and two of them were free. What is still not knowable: total
+device memory, and what else on the machine is using it. No WebGPU API exposes either, which is why
+§10.16's ceiling had to be learned by hitting it.
+
+**And the GPU path got a lane that runs in 6.8 s.** `make test-e2e-agent-smoke` drives the same page,
+loop and adapter against the smallest entry. It runs `agent-smoke.spec.ts` rather than
+`agent.spec.ts`, and the difference is the point: the thorough spec asserts the model listed the
+folder it was asked about, which is a claim about the *model*. LFM2.5 350M emits a perfect call and
+then runs `ls` on `/` (§10.20), and Qwen3.5 0.8B did the same thing on one sampled run while this was
+being written — at temperature 1.0 it is not deterministic, which is worth knowing about §10.20's
+green. The smoke spec asserts only what this project's code controls: a parseable call, exit 0 from a
+real guest, a non-empty result, prose after it, and no error events. That makes a bad small model a
+perfectly good smoke model.
+
+Unit 424 → 452. The default entry still passes `agent.spec.ts`.
