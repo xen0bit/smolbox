@@ -65,7 +65,27 @@ export type ModelResponse =
       /** True when generation was cut short by cancel() rather than by EOS. */
       stopped: boolean;
     }
-  | { type: "error"; message: string; code?: ModelErrorCode; limitTokens?: number };
+  | {
+      type: "error";
+      message: string;
+      code?: ModelErrorCode;
+      /** For `prompt-too-long`: the ceiling the worker enforced. */
+      limitTokens?: number;
+      /**
+       * For `prompt-too-long`: what the prompt actually measured.
+       *
+       * Both numbers travel because the caller counts characters and the worker
+       * counts tokens, and the conversion between them is the thing that was
+       * wrong. Given the pair, the loop can divide the prompt it sent by the
+       * tokens it turned into and get this checkpoint's real ratio for this
+       * conversation instead of the registry's estimate of 4 (models.ts
+       * CHARS_PER_TOKEN_ESTIMATE). Measured 3.85 for an LFM2.5 chat full of
+       * paths and command output, which is enough to make a refused prompt look
+       * as though it were already inside the budget it had just been refused
+       * for — so the retry re-sent it unchanged and was refused again.
+       */
+      promptTokens?: number;
+    };
 
 /**
  * Why a model request failed, when the page can do something about it.

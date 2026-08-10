@@ -18,6 +18,15 @@ import { ModelCache, type CacheEntry } from "./model-cache.ts";
 import { generationDefaults, maxPromptChars, type GenerationDefaults, type ModelEntry } from "./models.ts";
 
 const CONFIG_KEY = "smolbox.config";
+/**
+ * Prompt sizes this machine's GPU has actually died on, per model key.
+ *
+ * Separate from CONFIG_KEY because it is a different kind of fact. Everything
+ * under that key is a choice someone made in this dialog; this is a measurement
+ * the page took by hitting a wall, and it belongs to the machine rather than to
+ * the user — clearing one should not clear the other.
+ */
+const CEILINGS_KEY = "smolbox.prefill-ceilings";
 
 type Kind = "number" | "checkbox" | "text";
 type Group = "loop" | "generation" | "system";
@@ -90,10 +99,13 @@ export class Settings {
   private readonly cache = new ModelCache();
   private readonly touched = new Set<string>();
   private readonly values = new Map<string, Value>();
+  /** Learned prefill ceilings, by model key. See CEILINGS_KEY. */
+  private readonly ceilings = new Map<string, number>();
   private readonly dialog = document.getElementById("settings");
 
   constructor(private readonly host: SettingsHost) {
     this.restore();
+    this.restoreCeilings();
     this.bind();
   }
 
@@ -150,7 +162,13 @@ export class Settings {
       case "maxNewTokens":
         return entry.generation?.max_new_tokens ?? DEFAULTS.maxNewTokens;
       case "promptBudgetChars":
-        return maxPromptChars(entry);
+        // The registry's arithmetic, or whatever this machine has proved it can
+        // survive — whichever is smaller. The arithmetic is a bound on ONE
+        // allocation on one measured adapter (models.ts
+        // PREFILL_LOGITS_BUDGET_BYTES); a real device also holds the weights and
+        // the KV cache, and Firefox is stricter about the total than the
+        // Chromium the constant was measured on (PLAN §10.16).
+        return Math.min(maxPromptChars(entry), this.ceilings.get(entry.key) ?? Infinity);
       default:
         return generationDefaults(entry)[knob as keyof GenerationDefaults];
     }
@@ -224,6 +242,55 @@ export class Settings {
     }
     this.persist();
     this.apply();
+  }
+
+  /**
+   * Records a prompt budget the current model survived a device loss at.
+   *
+   * Deliberately does NOT call apply(): the loop has already lowered its own
+   * budget to this number and is mid-retry, so pushing configure() back at it
+   * from here would, for a user who has taken the prompt-budget knob over,
+   * replace the retry's budget with the larger one that just killed the device.
+   * The stored number is for the next apply() — a model switch, a reload, a new
+   * session — and the input is re-rendered so the dialog is not lying in the
+   * meantime.
+   */
+  recordDeviceCeiling(chars: number): void {
+    const entry = this.host.model();
+    const known = this.ceilings.get(entry.key);
+    // Only ever downwards. A later, larger failure says nothing new: the small
+    // number is the one that has survived, and a device that suddenly has more
+    // room is a page reload away from starting over anyway.
+    if (known !== undefined && known <= chars) {
+      return;
+    }
+    this.ceilings.set(entry.key, chars);
+    this.persistCeilings();
+    this.render(entry);
+  }
+
+  private restoreCeilings(): void {
+    try {
+      const saved = localStorage.getItem(CEILINGS_KEY);
+      if (!saved) {
+        return;
+      }
+      for (const [key, value] of Object.entries(JSON.parse(saved) as Record<string, unknown>)) {
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+          this.ceilings.set(key, value);
+        }
+      }
+    } catch (err) {
+      console.warn("[smolagent] ignoring saved prefill ceilings:", err);
+    }
+  }
+
+  private persistCeilings(): void {
+    try {
+      localStorage.setItem(CEILINGS_KEY, JSON.stringify(Object.fromEntries(this.ceilings)));
+    } catch {
+      // Private-mode storage failures must not take the page down.
+    }
   }
 
   private restore(): void {

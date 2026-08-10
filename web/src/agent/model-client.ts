@@ -22,6 +22,8 @@ export class ModelError extends Error {
     readonly code?: ModelErrorCode,
     /** For `prompt-too-long`: the ceiling the worker enforced. */
     readonly limitTokens?: number,
+    /** For `prompt-too-long`: what the prompt measured. See messages.ts. */
+    readonly promptTokens?: number,
   ) {
     super(message);
     this.name = "ModelError";
@@ -111,7 +113,7 @@ export class WorkerModelClient implements ModelClient {
       case "error": {
         // The worker does not say which request failed, so fail whichever is
         // outstanding rather than leaving a promise pending forever.
-        const err = new ModelError(msg.message, msg.code, msg.limitTokens);
+        const err = new ModelError(msg.message, msg.code, msg.limitTokens, msg.promptTokens);
         this.pendingGen?.reject(err);
         this.pendingLoad?.reject(err);
         this.pendingGen = null;

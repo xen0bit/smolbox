@@ -190,6 +190,38 @@
           "text": "Let me consider what the user is really asking for and whether"
         }
       ]
+    },
+    {
+      "name": "the GPU dies mid-prefill, then the rebuilt session answers (PLAN \u00a710.16)",
+      "when": "gpu dies",
+      "turns": [
+        {
+          "fail": {
+            "code": "device-lost",
+            "message": "the GPU rejected this run and the inference session did not survive it: Failed to download data from buffer\nThe model will be reloaded on the next message; the conversation so far is kept."
+          }
+        },
+        {
+          "text": "The session came back, so I can answer now.</think>I am smolbox, and that took a second attempt."
+        }
+      ]
+    },
+    {
+      "name": "a refusal the char estimate believed was already in budget (PLAN \u00a710.16)",
+      "when": "too long",
+      "turns": [
+        {
+          "fail": {
+            "code": "prompt-too-long",
+            "message": "prompt is 3198 tokens; LFM2.5 2.6B can prefill at most 3145",
+            "limitTokens": 3145,
+            "promptTokens": 3198
+          }
+        },
+        {
+          "text": "The history was trimmed, so this fits.</think>I am smolbox, on a shorter prompt."
+        }
+      ]
     }
   ]
 }

@@ -6,7 +6,7 @@
 // deliberate: it is the part most likely to grow subtle bugs and the part CI
 // can actually reach (PLAN §10.2).
 
-import type { ChatMessage } from "./messages.ts";
+import type { ChatMessage, ModelErrorCode } from "./messages.ts";
 import { ModelError, type ModelClient } from "./model-client.ts";
 import type { Dialect } from "./dialects/index.ts";
 import { CHARS_PER_TOKEN_ESTIMATE, type GenerationDefaults } from "./models.ts";
@@ -30,7 +30,21 @@ export interface ToolRunner {
 export type AgentEvent =
   | { kind: "user"; text: string }
   | { kind: "token"; text: string }
-  | { kind: "assistant"; text: string; raw: string; reasoning?: string }
+  | {
+      kind: "assistant";
+      text: string;
+      raw: string;
+      reasoning?: string;
+      /**
+       * How many tool calls this turn asked for.
+       *
+       * The UI needs it to tell "thought, then answered nothing" from "thought,
+       * then called a tool" — a reasoning model's tool-call turn has no prose at
+       * all, and labelling that as a model that stopped without answering
+       * describes a working turn as a failure.
+       */
+      toolCalls: number;
+    }
   | { kind: "tool-start"; call: ParsedCall }
   | {
       kind: "tool-end";
@@ -41,6 +55,21 @@ export type AgentEvent =
       request?: { cmd?: string; max_output?: number };
     }
   | { kind: "elided"; messages: number; chars: number }
+  | {
+      /**
+       * The loop lowered its own prompt budget after the model refused or the
+       * device died at `was` characters, and is retrying the turn at `chars`.
+       *
+       * Emitted rather than done silently because both cases are otherwise
+       * invisible: a `device-lost` retry rebuilds the whole session, which is
+       * tens of seconds of apparently nothing happening, and the page wants to
+       * remember the ceiling this machine actually proved (see settings.ts).
+       */
+      kind: "budget";
+      reason: ModelErrorCode;
+      was: number;
+      chars: number;
+    }
   | { kind: "stopped"; reason: "iteration-cap" | "cancelled" }
   | { kind: "error"; message: string };
 
@@ -91,6 +120,37 @@ export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dia
   // any model runs with.
   promptBudgetChars: 16_000,
 };
+
+/**
+ * How far below any budget the loop will let itself be pushed.
+ *
+ * A budget under this cannot hold a system prompt, a tool schema and one
+ * question, so shrinking past it would trade a failing turn for an incoherent
+ * one. Reaching it means the machine cannot run this checkpoint at all, which is
+ * a thing to say out loud rather than to approximate.
+ */
+export const MIN_PROMPT_BUDGET_CHARS = 1000;
+
+/**
+ * What fraction of a prompt the device died on is safe to try again.
+ *
+ * The device gives no number back — only that this prompt was too much — so the
+ * next attempt has to be a guess, and the only honest guess is "clearly less".
+ * Half, because a step small enough to fail again wastes a whole rebuild to
+ * learn nothing, and the loop only ever takes one step per turn.
+ */
+const DEVICE_LOSS_SHRINK = 0.5;
+
+/**
+ * How much of a measured ceiling a retry is allowed to aim at.
+ *
+ * The ratio it is applied to comes from one prompt, and the next one is a
+ * different mix of prose, paths and command output, so it is close rather than
+ * exact. Landing 5% under the ceiling costs a few hundred characters of history
+ * and is the difference between a retry that works and one that spends another
+ * prefill discovering the same refusal.
+ */
+const PROMPT_RETRY_MARGIN = 0.95;
 
 export class Conversation {
   private history: ChatMessage[] = [];
@@ -176,7 +236,7 @@ export class Conversation {
 
         if (calls.length === 0) {
           this.history.push({ role: "assistant", content: result.text });
-          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning });
+          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning, toolCalls: 0 });
           return;
         }
 
@@ -204,7 +264,7 @@ export class Conversation {
         // a page and then calls a tool would otherwise leave the log with
         // nothing at all between the question and the command.
         if (prose || reasoning) {
-          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning });
+          this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning, toolCalls: calls.length });
         }
 
         for (const [n, call] of calls.entries()) {
@@ -243,9 +303,9 @@ export class Conversation {
   }
 
   /**
-   * One generation, elided into budget first, retried once if that was not
-   * enough. Returns undefined when the turn is over — the error is already on
-   * the chat log by then.
+   * One generation, elided into budget first, retried once per failure the loop
+   * knows how to answer. Returns undefined when the turn is over — the error is
+   * already on the chat log by then.
    *
    * A failed generate used to propagate straight out of send(), which left the
    * user turn in the history with no reply and no visible reason, so the next
@@ -253,14 +313,28 @@ export class Conversation {
    * was dead with nothing on screen to say so. Every failure now ends the turn
    * as a visible event instead.
    *
-   * The retry is only for `prompt-too-long`, which the worker raises *before*
-   * running the model — nothing is damaged, and the worker tells us the real
-   * ceiling it measured with the real tokenizer, so the second attempt is
-   * informed rather than hopeful. Anything else ends the turn.
+   * Two codes are answerable, and each gets exactly one retry per generation:
+   *
+   *  - `prompt-too-long`: refused before the model ran, so nothing is damaged.
+   *    The worker measured the prompt with the real tokenizer and reported both
+   *    the ceiling and the count, so the retry is informed rather than hopeful.
+   *  - `device-lost`: the run took the WebGPU device with it. The worker has
+   *    already dropped the session and rebuilds it on the next request, so the
+   *    retry pays for a reload — tens of seconds — and is worth it, because the
+   *    alternative is a dead turn the user has to notice, resend, and watch fail
+   *    at the same size.
+   *
+   * Anything else ends the turn.
    */
   private async generateWithRetry(): Promise<Awaited<ReturnType<ModelClient["generate"]>> | undefined> {
-    for (let attempt = 0; ; attempt++) {
+    const retried = new Set<ModelErrorCode>();
+    for (;;) {
       this.elide();
+      // What this attempt is actually about to send, which is the only honest
+      // input to shrinking the budget: promptBudgetChars is a ceiling the prompt
+      // may be well under, and halving a ceiling nothing was touching changes
+      // nothing at all.
+      const sent = this.charCount();
       try {
         return await this.model.generate({
           messages: this.messages(),
@@ -270,23 +344,64 @@ export class Conversation {
           onToken: (t) => this.emit({ kind: "token", text: t }),
         });
       } catch (err) {
-        const retryable = err instanceof ModelError && err.code === "prompt-too-long" && attempt === 0;
-        if (retryable) {
-          const limit = (err as ModelError).limitTokens;
-          if (limit && limit > 0) {
-            this.opts = {
-              ...this.opts,
-              promptBudgetChars: Math.max(1000, limit * CHARS_PER_TOKEN_ESTIMATE - this.overheadChars()),
-            };
-          } else {
-            this.opts = { ...this.opts, promptBudgetChars: Math.max(1000, this.opts.promptBudgetChars >> 1) };
+        const code = err instanceof ModelError ? err.code : undefined;
+        if (code && !retried.has(code) && (code === "prompt-too-long" || code === "device-lost")) {
+          // Stop means stop. A device-lost retry is a model reload and another
+          // full generation — a minute of work — and starting it because the
+          // failure happened to arrive after the stop button reads as a page
+          // that ignored the button.
+          if (this.cancelled) {
+            this.emit({ kind: "stopped", reason: "cancelled" });
+            return undefined;
           }
+          retried.add(code);
+          this.shrinkBudget(code, err as ModelError, sent);
           continue;
         }
         this.emit({ kind: "error", message: err instanceof Error ? err.message : String(err) });
         return undefined;
       }
     }
+  }
+
+  /**
+   * Lowers the prompt budget after a prompt this size did not work.
+   *
+   * The invariant is the whole point: the new budget is **always** below what
+   * was just sent. Without that, the retry re-sends an identical prompt — which
+   * is what happened on a refusal at 3198 tokens against a 3145-token ceiling.
+   * The ceiling converted to 12 580 characters at the registry's estimate of
+   * 4 chars per token, the ~12 300-character prompt was already under it,
+   * `elide()` found nothing to do, and the second attempt failed exactly like
+   * the first. The estimate was the error: that conversation ran at 3.85.
+   *
+   * So the token ceiling is converted with the ratio this prompt actually
+   * measured, when the worker reported both halves of it, and the result is
+   * clamped below the failing size either way.
+   */
+  private shrinkBudget(code: ModelErrorCode, err: ModelError, sent: number): void {
+    const chars = Math.max(MIN_PROMPT_BUDGET_CHARS, Math.min(this.budgetTarget(code, err, sent), sent - 1));
+    this.opts = { ...this.opts, promptBudgetChars: chars };
+    this.emit({ kind: "budget", reason: code, was: sent, chars });
+  }
+
+  private budgetTarget(code: ModelErrorCode, err: ModelError, sent: number): number {
+    const limit = err.limitTokens;
+    // A device loss reports no ceiling — the GPU only ever says "not this much"
+    // — so the size that killed it is the only number there is.
+    if (code !== "prompt-too-long" || !limit || limit <= 0) {
+      return Math.floor(sent * DEVICE_LOSS_SHRINK);
+    }
+    const measured = err.promptTokens;
+    if (measured && measured > 0) {
+      // The ratio this conversation actually ran at, less a margin, because the
+      // retry has to land under the ceiling rather than on it.
+      return Math.floor(limit * (sent / measured) * PROMPT_RETRY_MARGIN);
+    }
+    // No measurement: fall back to the registry's estimate, and charge the tool
+    // schema twice — once as prompt text the ceiling already covers, once as
+    // margin against the estimate being generous, which is the direction it errs.
+    return limit * CHARS_PER_TOKEN_ESTIMATE - this.overheadChars();
   }
 
   // Oldest tool outputs go first, and only their bodies: the command and its

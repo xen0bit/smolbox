@@ -36,6 +36,8 @@ class WorkerError extends Error {
     message: string,
     readonly code: ModelErrorCode,
     readonly limitTokens?: number,
+    /** What the prompt measured, when the failure was about its size. */
+    readonly promptTokens?: number,
   ) {
     super(message);
   }
@@ -357,6 +359,7 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
         `Shorten the conversation or lower the prompt budget.`,
       "prompt-too-long",
       limit,
+      promptTokens,
     );
   }
 
@@ -541,7 +544,9 @@ scope.addEventListener("message", (ev: { data: ModelRequest }) => {
       post({
         type: "error",
         message: err instanceof WorkerError ? err.message : describeError(err),
-        ...(err instanceof WorkerError ? { code: err.code, limitTokens: err.limitTokens } : {}),
+        ...(err instanceof WorkerError
+          ? { code: err.code, limitTokens: err.limitTokens, promptTokens: err.promptTokens }
+          : {}),
       });
     }
   })();

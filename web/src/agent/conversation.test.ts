@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
+import {
+  type AgentEvent,
+  Conversation,
+  DEFAULTS,
+  MIN_PROMPT_BUDGET_CHARS,
+  type ToolRunner,
+} from "./conversation.ts";
 import { lfm2 } from "./dialects/lfm2.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import { ModelError } from "./model-client.ts";
@@ -300,6 +306,51 @@ describe("Conversation", () => {
     expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
   });
 
+  // Reported on Chrome, and the reason the retry above was not enough: the
+  // worker refused 3198 tokens against a 3145-token ceiling, the loop converted
+  // that ceiling at 4 chars per token into 12 580, the prompt was already under
+  // it at ~12 300, elide() found nothing to trim, and the identical prompt was
+  // refused a second time. The estimate was wrong — that chat ran at 3.85 chars
+  // per token — so the retry now uses the ratio the worker measured.
+  test("a refusal shrinks the prompt even when the char estimate says it fits", async () => {
+    const events: AgentEvent[] = [];
+    const seen: number[] = [];
+    let turn = 0;
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 12_580 },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async (req) => {
+          seen.push(req.messages.reduce((n, m) => n + m.content.length, 0));
+          turn++;
+          if (turn === 1) {
+            return { text: call("ls"), tokens: 1, ms: 0, stopped: false };
+          }
+          if (turn === 2) {
+            // The real numbers from the report. 3145 tokens is 12 580 chars at
+            // the estimate — more than the prompt that was just refused.
+            throw new ModelError("prompt is 3198 tokens", "prompt-too-long", 3145, 3198);
+          }
+          return { text: "ok", tokens: 1, ms: 0, stopped: false };
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: `exit_code: 0\n${"x".repeat(11_000)}`, exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    expect(seen).toHaveLength(3);
+    expect(seen[2]!).toBeLessThan(seen[1]!);
+    // The measured ratio, not the estimate: 3145 × (chars ÷ 3198) × 0.95.
+    const budget = convo.options().promptBudgetChars;
+    expect(budget).toBeLessThan(seen[1]!);
+    expect(budget).toBeLessThan(12_580);
+    expect(events.some((e) => e.kind === "budget" && e.reason === "prompt-too-long")).toBe(true);
+    expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
+  });
+
   test("a second prompt-too-long is reported rather than retried forever", async () => {
     const events: AgentEvent[] = [];
     let calls = 0;
@@ -320,6 +371,116 @@ describe("Conversation", () => {
     await convo.send("go");
     expect(calls).toBe(2);
     expect(events.some((e) => e.kind === "error" && /still too long/.test(e.message))).toBe(true);
+  });
+
+  // The Firefox report: the GPU ran out of memory prefilling a prompt that was
+  // inside every ceiling the loop knew about, which poisons the session — so the
+  // turn used to die, and the user had to notice and resend it.
+  test("a device loss rebuilds the session and retries the turn at half the size", async () => {
+    const events: AgentEvent[] = [];
+    const seen: number[] = [];
+    let turn = 0;
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 12_580 },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async (req) => {
+          seen.push(req.messages.reduce((n, m) => n + m.content.length, 0));
+          turn++;
+          if (turn === 1) {
+            return { text: call("ls"), tokens: 1, ms: 0, stopped: false };
+          }
+          if (turn === 2) {
+            throw new ModelError("the GPU rejected this run", "device-lost");
+          }
+          return { text: "ok", tokens: 1, ms: 0, stopped: false };
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: `exit_code: 0\n${"x".repeat(11_000)}`, exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    expect(seen).toHaveLength(3);
+    const budget = events.find((e) => e.kind === "budget");
+    // Half of what died, not half of a ceiling nothing was touching. `was`
+    // counts the serialised tool schema too, which `seen` cannot see.
+    expect(budget).toMatchObject({ reason: "device-lost", was: seen[1]! + 2 });
+    expect(convo.options().promptBudgetChars).toBe(Math.floor((seen[1]! + 2) / 2));
+    // The turn finished on its own; nothing had to be resent.
+    expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
+    expect(events.some((e) => e.kind === "error")).toBe(false);
+  });
+
+  test("a device that dies twice ends the turn instead of rebuilding forever", async () => {
+    const events: AgentEvent[] = [];
+    let calls = 0;
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => {
+          calls++;
+          throw new ModelError("the GPU rejected this run", "device-lost");
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+    // Each rebuild costs a full weight reload, so one is the whole allowance.
+    expect(calls).toBe(2);
+    expect(events.some((e) => e.kind === "error" && /rejected this run/.test(e.message))).toBe(true);
+  });
+
+  test("a stop during a failed turn is not overridden by the retry", async () => {
+    const events: AgentEvent[] = [];
+    let calls = 0;
+    // Declared first so the scripted client can reach back into it: the point
+    // of the test is a cancel that lands *during* the run that then fails.
+    let convo: Conversation;
+    convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => {
+          calls++;
+          // The stop lands while the run is in flight; the failure arrives after.
+          convo.cancel();
+          throw new ModelError("the GPU rejected this run", "device-lost");
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+    expect(calls).toBe(1);
+    expect(events.some((e) => e.kind === "stopped" && e.reason === "cancelled")).toBe(true);
+  });
+
+  test("shrinking stops at a budget that can still hold a question", async () => {
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 1200 },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => {
+          throw new ModelError("the GPU rejected this run", "device-lost");
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+    expect(convo.options().promptBudgetChars).toBe(MIN_PROMPT_BUDGET_CHARS);
   });
 
   // The tool schema is prompt text the messages never contain: the chat template
