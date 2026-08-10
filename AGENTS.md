@@ -1,7 +1,9 @@
 # AGENTS.md — smolbox
 
-Guidance for agent sessions working in this repo. Read PLAN.md for the design, research notes, and
-milestone status; it is the source of truth and is kept current.
+Guidance for agent sessions working in this repo. [PLAN.md](PLAN.md) indexes the design, research
+notes and milestone status, one file per section under `docs/plan/`; it is the source of truth and is
+kept current. When something is behaving strangely, [docs/plan/10-findings.md](docs/plan/10-findings.md)
+is the measurement log and usually already has the answer.
 
 ## What this is
 
@@ -26,7 +28,7 @@ pure and drive it with `FakeModelClient`.
 
 ## Toolchain
 
-- **Go 1.24.3** (pinned in `go.mod`; do not bump without updating PLAN.md). wazero is pinned to
+- **Go 1.24.3** (pinned in `go.mod`; do not bump without updating `docs/plan/02-research-notes.md`). wazero is pinned to
   **v1.11.0** because v1.12+ requires go ≥ 1.25. A newer local toolchain is fine — go1.26.5 builds
   the pinned module clean — but the `go.mod` directive and CI's pin are what decide.
 - **Docker 29.x** with the daemon socket at `/var/run/docker.sock` — required for `make wasm`.
@@ -507,7 +509,9 @@ is still not a usable agent. Say which of the two a registry note is talking abo
 ### Conventions
 - **Do not add comments to code unless asked.** One-line doc comments on exported Go identifiers are
   fine.
-- Keep `PLAN.md` and this file current when you learn something (measurements, gotchas, decisions).
+- Keep the plan and this file current when you learn something. A measurement, a gotcha or a bug you
+  chased goes in a new numbered subsection at the end of `docs/plan/10-findings.md`; section numbers
+  are cited from code comments as `§10.x`, so they are append-only — correct in place, never renumber.
 - Pin external tools/images; when a new dep drags the go directive up, prefer the older version that
   matches `go 1.24.3` (see wazero v1.11.0).
 - `dist/`, `bin/`, `web/dist/` are gitignored build output.
@@ -524,4 +528,4 @@ is still not a usable agent. Say which of the two a registry note is talking abo
 6. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
    (the browser must still pass the same conformance table as Go).
 7. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
-8. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.
+8. Update the plan (`docs/plan/`, usually `10-findings.md`) and this file if the change affects them.
