@@ -1650,7 +1650,9 @@ second inference backend.
 **This section records the alternative, which was surveyed first and deferred** — §10.13 shipped
 first. It was then built too (§10.15), once §10.14 established that the kernel build cannot run on
 this machine at all; the four obstacles below are exactly what it had to get through, and the
-survey's risk ordering turned out to be wrong in an instructive way.
+survey's risk ordering turned out to be wrong in an instructive way. (§10.14's premise did not
+survive: §10.17 got the kernel build running here, and this path is now the slower of the two. It
+stays as the reference implementation — every other model in the registry takes it.)
 
 The ONNX path is available: `onnx-community/gemma-4-E2B-it-ONNX` exists, and transformers.js 4.2.0
 already knows `gemma4`/`gemma4_text`, so no custom kernels are needed for it. Four things stand in
@@ -1739,6 +1741,14 @@ No Chromium here exposes `shader-f16` on any adapter behind any flag. That was
 first read as a headless limitation; §10.14 measured it properly and it is not.
 PLAN §2.11.24 again, and the same wall Qwen3 hit in §10.11.
 
+> **Superseded by §10.17 (2026-08-10).** The guard is real; the reason given for
+> it is not. The QAT checkpoint contains **no f16 tensors at all** (1869 F32,
+> 361 BF16, 182 I8, 368 U8 — counted), the guards exclude f16 *tensors* rather
+> than the op, and there IS an f32 path: every op declares
+> `typeConstraints: {T: ["float32","float16"]}`. The f16 came from three
+> hardcoded dtype choices inside the engine, which §10.17 rewrites. The entry no
+> longer declares `requiresFeatures`, and the kernel build runs on this machine.
+
 So the entry declares `requiresFeatures: ["shader-f16"]` and the page refuses
 **before fetching anything** — 2.5 GB and 7.4 s became an instant, accurate
 message. The dialect stays `verified: false` until a transcript exists, and per
@@ -1817,6 +1827,13 @@ that could not be confirmed, because the `chromium/7922` branch is absent from t
 carve-out is plausible, but it stays a hypothesis here rather than a finding.
 
 **Consequences.**
+
+> **The first bullet is wrong, and §10.17 (2026-08-10) says why.** Everything
+> measured above is sound and still reproduces on Chrome 151 — but all of it is
+> about the *adapter*, and for Gemma 4 the constraint was in the *engine*: three
+> hardcoded f16 dtype choices in its model builder, over a checkpoint with no
+> f16 in it. Rewritten to f32, the kernel build runs here, 3.4× faster than the
+> ONNX path. Qwen3 is unaffected — its f16 is a real file.
 
 - Qwen3 and Gemma 4 cannot be run in a browser on this machine *by anyone* — not
   just by CI. Both entries' `requiresFeatures` refusal is the right behavior; it
@@ -1957,6 +1974,88 @@ Separately, from the same transcript: a reasoning model's tool-call turn has no 
 page labelled every one of them *"thought for 548 chars, then stopped without answering"* — a working
 turn described as a failure, once per tool call. The `assistant` event now carries `toolCalls` and
 the summary says what actually happened.
+
+
+### 10.17 The kernel build runs here after all: §10.14 was right, its conclusion was not (2026-08-10)
+
+§10.14 established, carefully and correctly, that this machine's NVIDIA adapter does not expose
+`shader-f16` in any browser. Re-measured today against Chrome 151.0.7922.75 / driver 595.84 and it
+still holds, including under `--disable-gpu-driver-bug-workarounds`, `--ignore-gpu-blocklist`,
+`--enable-unsafe-webgpu` and `--enable-dawn-features=allow_unsafe_apis` — no flag lifts it, so it is
+not Chrome's driver-bug-workaround layer either. Nothing below revises that finding.
+
+What was wrong was the sentence after it: *"Gemma 4 cannot be run in a browser on this machine by
+anyone"*. The kernel build has been running all day.
+
+**Where the inference went wrong.** §10.13 observed that every variant of
+`com.xenova.gemma4.DenseGemv` is guarded on `shader-f16`, and explained it as *"the checkpoint's
+tensors are f16"*. The observation is true and the explanation is false. Reading the engine's own op
+manifests:
+
+- every op declares `typeConstraints: {T: ["float32", "float16"]}` — f32 is a first-class type
+  throughout, not a fallback;
+- every `shader-f16` guard has the shape
+  `(tensorDtypes.aT != "float16" and ...) or device.features.has("shader-f16")` — it excludes f16
+  **tensors**, not the op;
+- the WGSL is generated from Jinja templates that emit `enable f16;` only under
+  `{% if usesF16 %}`, where `usesF16` is itself a function of the tensor dtypes.
+
+And the checkpoint has no f16 in it. `model.safetensors` for
+`google/gemma-4-E2B-it-qat-mobile-transformers` is 2780 tensors: 1869 F32, 361 BF16, 182 I8, 368 U8.
+Not one F16. The 2.1 GB that dominates the file is U8 — the 4-bit QAT weights — and it was never
+going to be f16 whatever the adapter said.
+
+**Where the f16 actually came from: three hardcoded lines in the engine.** Not the model, not the
+kernels, not the manifests. The engine's model builder makes three dtype choices by hand while
+everything around them takes the `"float32"` default:
+
+| site | what it is |
+|---|---|
+| `per_layer_model_projection.weight` | converted BF16 → `float16` on upload (~31 MB) |
+| `g4d-ffnormed` | activation buffer allocated `float16` |
+| `g4d-gelu` | activation buffer allocated `float16` |
+
+Flip those three to `float32` and no tensor in the graph is f16, so no shader sets `usesF16`, so no
+shader emits `enable f16;`, so every `when` guard passes without the feature. Three tokens.
+
+**The fix.** `web/src/agent/kernel-f32.ts` rewrites those three sites in the bundle text, and
+`gemma-kernels.ts` imports the result from a blob URL. It applies **only** when the adapter lacks
+`shader-f16`; where the feature exists the pinned artifact is imported byte-for-byte as published,
+because f16 is genuinely faster and smaller there. The engine is a downloaded, unlicensed artifact
+(§10.13, `fetch-kernels.ts`) and exposes no dtype option on `Gemma4Mobile.load()`, so rewriting the
+fetched text is the only seam that does not involve forking it — and it leaves the file on disk
+identical to what the Space published.
+
+Each of the three rewrites must match **exactly once** or the load throws `KernelRewriteError`
+naming the site. That is deliberate: a partial rewrite would leave one f16 buffer, stream 2.5 GB onto
+the GPU and die on the first forward pass with "No supported WebGPU variant" — the exact failure this
+removes, but with a worse explanation. `kernel-f32.test.ts` runs the rewrites against the real
+540 KB artifact, so bumping `REVISION` in `fetch-kernels.ts` fails a unit test rather than a GPU run.
+
+**Measured, same spec (`tests/e2e/agent.spec.ts`), same machine, same prompts:**
+
+| | load | full spec | weights |
+|---|---|---|---|
+| `gemma4-e2b` (kernels, f32-rewritten) | **7.4 s** | **13.2 s** | **2.3 GB** |
+| `gemma4-e2b-onnx` (onnxruntime) | 12.4 s | 44.3 s | 3.6 GB |
+
+Both chose `ls`/`ls -l` on `/mnt/host` unprompted, read the real mount and answered from it; the ONNX
+run additionally noticed `link.txt` is a symlink. The engine reports
+`nvidia lovelace (subgroups)` — no f16, no subgroup-matrix — while the adapter probe in the same page
+confirms `shader-f16: false`. **The kernel build is 3.4× faster end to end on the adapter that was
+supposed to be unable to run it at all.**
+
+`requiresFeatures` is now unset on every entry. The field stays, because the failure mode it prevents
+is real; §10.13's mistake was diagnosing an engine's own dtype choice as an adapter limit. Qwen3 is
+untouched by this — its constraint is that the only ONNX export small enough for the wasm heap is a
+genuine f16 *file*, which is a question of which build exists rather than of which dtype an engine
+picked.
+
+**The lesson, since §10.14 did the hard measuring and still landed wrong.** Every measurement in
+§10.14 was sound and every one of them was about the adapter. None of them was about the engine, and
+the engine was where the constraint lived. "The device cannot do X" and "this code asked for X" look
+identical from the outside — both end in the same refusal — and the second is usually the one you can
+fix. Read what the code requests before concluding the hardware is the limit.
 
 ---
 

@@ -141,12 +141,17 @@ export interface ModelEntry {
    *
    * `dtypes` answers "which file do we load"; this answers "can this engine run
    * here at all". They are separate because an engine can have no file choice
-   * and still have hard requirements — the Gemma kernels select their WGSL
-   * variants against the device, and every variant of its dense GEMV is guarded
-   * on `shader-f16` because the checkpoint's tensors are f16. Without it the
-   * load succeeds, the weights stream onto the GPU, and the FIRST forward pass
-   * fails with "No supported WebGPU variant". Declaring it turns 2.5 GB and
-   * seven seconds into an immediate, accurate refusal.
+   * and still have hard requirements. The value of declaring one is that an
+   * engine which selects WGSL variants against the device otherwise fails late:
+   * the load succeeds, the weights stream onto the GPU, and the FIRST forward
+   * pass dies with "No supported WebGPU variant" — gigabytes and seconds spent
+   * to reach a refusal that was knowable up front.
+   *
+   * No entry currently sets it. The Gemma kernel entry did, for `shader-f16`,
+   * and that was wrong in an instructive way: the requirement was the engine's
+   * own dtype choice rather than the adapter's limit, so it could be rewritten
+   * away (see kernel-f32.ts, PLAN §10.17). Before adding one here, check which
+   * of the two you are actually looking at.
    */
   requiresFeatures?: string[];
   /** How its weights are laid out in the repo. Absent means the ONNX layout. */
@@ -322,23 +327,28 @@ export const models: ModelEntry[] = [
     dialect: "gemma4",
     backend: "gemma4-kernels",
     weights: "safetensors",
-    // Measured, not assumed: every variant of com.xenova.gemma4.DenseGemv is
-    // guarded on shader-f16 (the checkpoint's tensors are f16), so on an adapter
-    // without it the model loads happily and then has no kernel to run.
-    // No browser on this machine exposes it, on any adapter, which is why this
-    // entry cannot be exercised here at all — not by the opt-in GPU suite and
-    // not by hand. Verifying it needs different hardware (D3D12, Metal, or a
-    // Mesa-driven GPU), not a different browser: PLAN §10.14.
-    requiresFeatures: ["shader-f16"],
+    // No requiresFeatures. This entry declared `shader-f16` from M12 to §10.17
+    // on the strength of a true observation — every variant of
+    // com.xenova.gemma4.DenseGemv is guarded on it — and a false inference from
+    // it, that the checkpoint's tensors are f16 and so the guard could never
+    // pass here. The checkpoint has no f16 tensors at all (F32/BF16/I8/U8), the
+    // guards exclude f16 *tensors* rather than the op, and the engine's f16 came
+    // from three hardcoded dtype choices in its model builder. kernel-f32.ts
+    // rewrites those three on adapters that lack the feature, so this backend
+    // now runs wherever WebGPU does. PLAN §10.17.
     note: "Runs on the webml-community WebGPU kernels rather than onnxruntime. Needs `make gemma-kernels` for the engine and `make model MODEL=gemma4-e2b` for the weights.",
   },
   {
     key: "gemma4-e2b-onnx",
     label: "Gemma 4 E2B (ONNX)",
     // The same model as gemma4-e2b, on the engine everything else here uses.
-    // Two entries rather than one because they are genuinely different builds
-    // with different requirements: this one runs wherever WebGPU does, the
-    // kernel one is faster and needs shader-f16 (PLAN §10.14).
+    // Two entries rather than one because they are genuinely different builds:
+    // this one is 3.6 GB through onnxruntime, the kernel one is 2.3 GB through
+    // hand-written WGSL and measured 3.4x faster on the same spec and machine
+    // (PLAN §10.17). Both now run on any WebGPU adapter, so the choice is cost,
+    // not capability — this entry stays because onnxruntime is the path every
+    // other model here takes, and losing the comparison would cost more than
+    // keeping 3.6 GB of weights.
     repo: "onnx-community/gemma-4-E2B-it-ONNX",
     revision: "9f4bef82ea6e296bc69f8a2f5939f73af81b07a6",
     vocabSize: 262_144,
@@ -372,7 +382,7 @@ export const models: ModelEntry[] = [
       top_p: 0.95,
       max_new_tokens: 2048,
     },
-    note: "Same model as the kernel build, on onnxruntime — slower, but it does not need shader-f16. Large: ~3.6 GB at q4.",
+    note: "Same model as the kernel build, on onnxruntime — measured ~3.4x slower and ~1.3 GB larger. Kept as the reference path. Large: ~3.6 GB at q4.",
   },
 ];
 

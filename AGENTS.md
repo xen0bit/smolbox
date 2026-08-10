@@ -360,9 +360,19 @@ decodes with `skip_special_tokens: true`, which eats the very markers the dialec
 prompt and the decode come from the transformers.js tokenizer the worker already loads, and only the
 forward pass comes from the engine, via its `_model` / `_generationState` / `_eosTokenIds`
 accessors. The prefix-cache logic around it is ours and is unit-tested
-(`gemma-kernels.test.ts`) — the kernels themselves need `shader-f16`, which **no browser on this
-machine exposes**, so they cannot be run here at all (PLAN §10.13, and §10.14 for why it is not a
-headless artifact).
+(`gemma-kernels.test.ts`).
+
+**The engine runs without `shader-f16`, and `kernel-f32.ts` is why.** This adapter does not expose
+the feature and no flag makes it (PLAN §10.14 measured that properly and it still holds). But the
+engine barely needs it: its op manifests all declare `typeConstraints: {T: ["float32","float16"]}`,
+every `shader-f16` guard excludes f16 *tensors* rather than the op, its WGSL emits `enable f16;`
+only under `{% if usesF16 %}`, and the checkpoint contains no f16 at all (F32/BF16/I8/U8). The f16
+came from **three hardcoded dtype choices** in the engine's model builder, which `kernel-f32.ts`
+rewrites in the fetched text before importing it from a blob. Adapters that *do* have the feature
+still import the artifact untouched, because f16 is faster where it exists. The three rewrites must
+each match exactly once or the load fails loudly — **if you bump `REVISION` in `fetch-kernels.ts`,
+run `bun test web/src/agent/kernel-f32.test.ts`**, which applies them to the real artifact. PLAN
+§10.17.
 
 **`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
@@ -450,9 +460,10 @@ capturing a real transcript, never by reading a vendor doc — that is the M8 le
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
 and Qwen3 will not load without `shader-f16` — which, per §10.14, needs different hardware rather
-than a different browser. `gemma4` was promoted at PLAN §10.15 off five real turns of the ONNX build —
-note that the *kernel* entry shares that grammar and has still never emitted a token, so it borrows
-nothing from this. `lfm2.5` shares LFM2's verified call markers but is its
+than a different browser. (That is a real f16 *file*, so §10.17's rewrite does not reach it: the
+constraint there is which ONNX export exists, not which dtype an engine chose.) `gemma4` was
+promoted at PLAN §10.15 off five real turns of the ONNX build; §10.17 then ran the *kernel* build
+through the same spec, so both entries that share the grammar have now emitted real tool calls. `lfm2.5` shares LFM2's verified call markers but is its
 own entry because the checkpoint always reasons first: its chat template ends the generation prompt
 with a bare `<think>`, so completions open inside the scratchpad and the dialect splits it off. Its
 transcript fixture is still outstanding — the `test.todo` at the end of `lfm25.test.ts` says how to
