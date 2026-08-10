@@ -247,7 +247,7 @@
       ]
     },
     {
-      "name": "search tooling: ripgrep is installed (the Antares prompt names rg)",
+      "name": "search tooling: ripgrep is installed",
       "steps": [
         {
           "request": {
@@ -261,7 +261,7 @@
       ]
     },
     {
-      "name": "search tooling: tree is installed (the Antares prompt names tree)",
+      "name": "search tooling: tree is installed",
       "steps": [
         {
           "request": {

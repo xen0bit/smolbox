@@ -1055,8 +1055,15 @@ the text a model would read is stable enough to assert.
 | M3 | Read-only host mount under wazero + shared conformance table + Go driver | mount cases in the conformance table green — **done** (§1) |
 | M4 | Browser worker, stdio router, TS session — **spike the preopen first** | Playwright boots the VM and runs `echo hello` | **done** (§1) |
 | M5 | Sync FS bridge + browser mount | browser passes the **same** conformance table as Go — **done** (§1) |
-| M6 | `make wasm-js` emscripten target | boots in browser; passes the non-mount conformance cases; documented as no-mount — **done** (§1) |
+| M6 | `make wasm-js` emscripten target | boots in browser; passes the non-mount conformance cases; documented as no-mount — **done** (§1), **removed 2026-08-10** (see below) |
 | M7 | Tool-API docs, JSON Schema, mock caller | `make test-conformance` covers the tool surface — **done** (§1, §4.5) |
+
+> **M6 was removed from the tree on 2026-08-10**, along with Antares and `/scan/` (§11). The
+> `--to-js` build worked and passed the shared table, but it was a second runtime with no host
+> mount — the feature this project exists for — kept alive by its own make target, its own Playwright
+> config, its own CI job and its own timeout budgets. The findings it produced are still recorded
+> here and in §2.11.15–2.11.16 (the `TTY.stream_ops.poll` block, the one-byte console, the quadratic
+> `FrameDecoder` it exposed); the last of those fixed a bug in code the WASI build still uses.
 
 ---
 
@@ -2111,7 +2118,8 @@ feature at all.
 **What changed.**
 
 - `tools/quantize_onnx.py` shards on `BROWSER_INLINE_CEILING` (1 GB) rather than on protobuf's 2 GiB
-  limit. The old rule was not wrong about protobuf — it was answering the wrong question. `optimum`
+  limit. (That file was removed with Antares later the same day — see §11's note. The rule survives
+  in `INLINE_WEIGHT_CEILING_BYTES`, and the measurement is the reason it does.) The old rule was not wrong about protobuf — it was answering the wrong question. `optimum`
   emits whatever protobuf allows, which for 350M is one 1.82 GB file no browser can load, so
   `_reshard_inline` now rewrites it in place. Only ever reached in the safe range: below the ceiling
   there is nothing to do, and above 2 GiB the exporter already wrote a sidecar because it had no
@@ -2151,6 +2159,18 @@ was handed. Ask what was requested before concluding what is impossible.
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)
+
+> **Removed from the tree on 2026-08-10.** Antares, the `/scan/` localization page and the Python
+> conversion pipeline (`tools/`) are gone: `convert_antares.py`, `quantize_onnx.py`,
+> `verify_onnx.py`, `scan-main.ts`, `localize.ts`, `host-tools.ts`, `tool-profile.ts`,
+> `antares-prompt.ts`, the `antares` dialect and the two registry entries. §10.18 is why — the 1B is
+> the only build that follows the protocol, its fp16 needs `shader-f16` this machine does not have,
+> and its fp32 is 7.35 GB and did not finish loading in ten minutes. That left a page, a dialect, a
+> gated download and a Python toolchain serving a model nobody here can run.
+>
+> This section stays as the record: the granitemoehybrid→granite remap, the muP parity check, the
+> int4 measurement (0.816 logit correlation) and the fp16 converter finding are all still true, and
+> all of them cost real work to establish. Read it as history, not as a description of the tree.
 
 §9 proved a local model can drive the VM; §10 built a registry, dialects and a tool surface around
 that. This section adds a model that is *not* a general chat model: Cisco Foundation AI's **Antares**,

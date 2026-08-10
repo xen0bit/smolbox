@@ -9,8 +9,8 @@ issuing terminal commands.
 > ~2.6 s**, with the read-only host mount working under wazero and in the browser via the sync FS
 > bridge (a folder picked with the File System Access API is mounted read-only at `/mnt/host`). The
 > `smolbox` CLI (`exec`/`repl`) drives it over the framed protocol, and a shared conformance table
-> (`tests/conformance/cases.json`) pins the behaviour — **the same table passes under wazero, under
-> Chromium, and (minus the mount cases) under the emscripten `--to-js` build**, which ships too. The
+> (`tests/conformance/cases.json`) pins the behaviour — **the same table passes under wazero and
+> under Chromium**. The
 > tool-call surface is specified and tested: [`docs/tool-api.md`](docs/tool-api.md), JSON Schemas
 > generated from the Go types, and **a mock caller that runs a scripted tool-call transcript against
 > a real VM**. **M8 replaced that mock caller with a real one:** an LFM2-1.2B model running on WebGPU
@@ -62,11 +62,6 @@ one folder they explicitly chose, and cannot write to it.
   `showDirectoryPicker()`. Large directories cost nothing until read. A `remount()` picks up changes
   made on disk. Browsers without that API (Firefox, Safari) pick the folder through
   `<input type="file" webkitdirectory>` and get an equivalent handle rebuilt from the file list.
-- A second browser build (`c2w --to-js`, QEMU with a TCG JIT) is available for workloads that do not
-  need a host mount. It runs the emulated CPU **1.4–2.9× faster**, but it boots slower (~7 s against
-  ~1.8 s, on 116 MB of assets against a wizer pre-booted 108 MB) and its console is ~10× slower, so
-  it only pays off on long CPU-bound work. It passes the same conformance table minus the mount
-  cases.
 
 ### The exec API
 
@@ -110,10 +105,8 @@ resp, err := session.Exec(ctx, protocol.Request{
 - `make wasm` produces the artifact. The guest image and the toolchain that converts it live in
   **two separate Dockerfiles** (`vm/Dockerfile`, `build/Dockerfile.c2w`), so iterating on guest
   packages does not rebuild the conversion toolchain.
-- A **single shared conformance table** is executed by the Go/wazero driver and by both Playwright
-  browser drivers. Behaviour cannot silently diverge between runtimes. Cases carry a `requires` tag
-  naming what they need, so the no-mount emscripten build skips exactly the mount cases and nothing
-  else.
+- A **single shared conformance table** is executed by the Go/wazero driver and by the Playwright
+  browser driver. Behaviour cannot silently diverge between runtimes.
 - Browser tests run without a native file dialog by mounting an OPFS directory handle through the
   identical code path.
 
@@ -123,7 +116,6 @@ resp, err := session.Exec(ctx, protocol.Request{
 
 ```
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
-make wasm-js     # optional: the emscripten build -> dist/js (no host mount)
 make model       # optional: pull the LFM2 checkpoint (1.22 GB) -> dist/models, for the agent page
 make build       # build the smolbox CLI
 
@@ -133,8 +125,7 @@ make build       # build the smolbox CLI
 make web serve   # bundle and serve the browser runtime on localhost:8080
 ```
 
-The dev server hosts the WASI build at `/`, the emscripten build at `/js/` if `dist/js` exists, and
-the agent spike at `/agent/`. The agent page needs a GPU; it loads weights from `dist/models` when
+The dev server hosts the VM at `/` and the agent page at `/agent/`. The agent page needs a GPU; it loads weights from `dist/models` when
 `make model` has been run and from the Hugging Face CDN otherwise.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
@@ -167,9 +158,7 @@ The VM artifact is exercised today through `make test-integration` (boots `dist/
 wazero and runs the framed protocol matrix over the guest agent), and by hand through the `smolbox`
 CLI (`exec`/`repl`). In the browser it is exercised through `make test-e2e` (Playwright boots the
 same artifact in headless Chromium: `echo hello`, an OPFS-backed mount smoke, and the **full
-conformance table** — the browser passes the same `cases.json` as the Go driver) and, for the
-emscripten build, `make test-e2e-js` (boot smoke, a `/mnt/host` is-empty guard, and the same
-`cases.json` minus the mount cases).
+conformance table** — the browser passes the same `cases.json` as the Go driver).
 
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
 and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. Folder mounting works in
@@ -183,10 +172,6 @@ otherwise — `make test-e2e-firefox` runs that second path against a real VM in
 - Networking from inside the VM. container2wasm supports it; smolbox does not enable it. The sandbox
   is offline by design.
 - Write access to the mounted host directory. The mount is read-only, deliberately and permanently.
-- Host directory mounting in the emscripten (`--to-js`) build. That target has no such support
-  upstream, and adding it would mean wiring virtio-9p through emscripten's filesystem layer. That
-  build also has no clean shutdown — its kernel boots with `acpi=off`, so QEMU keeps running after
-  the guest halts and the session simply ends with the page.
 - Being fast at CPU-bound work. An emulated x86_64 CPU inside WebAssembly is not a performance story.
   smolbox optimises for portability and for a real Unix environment, and amortises boot cost across a
   long-lived session.

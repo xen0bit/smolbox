@@ -9,17 +9,17 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all everything build wasm wasm-js vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
-        test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
+.PHONY: all everything build wasm vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
+        test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
         test-e2e-agent-firefox \
         test-conformance lint clean
 
 # c2w runs as root in the container, so everything it writes to dist/ lands
-# root-owned — and then a later `mkdir dist/js` fails with EPERM for the user who
-# ran make. Fixing this by running the converter as --user does NOT work: with no
-# passwd entry for the uid, $HOME is / and buildx dies on `mkdir /.docker`. So
-# leave the conversion exactly as it is and hand ownership back afterwards, from
-# a root container (the only thing here with the rights to do it).
+# root-owned — and then a later write into dist/ fails with EPERM for the user
+# who ran make. Fixing this by running the converter as --user does NOT work:
+# with no passwd entry for the uid, $HOME is / and buildx dies on
+# `mkdir /.docker`. So leave the conversion exactly as it is and hand ownership
+# back afterwards, from a root container (the only thing here with the rights).
 RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IMAGE) \
 		-R $(shell id -u):$(shell id -g) /out
 
@@ -36,10 +36,6 @@ RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IM
 
 # The order is load-bearing, not cosmetic:
 #
-#   wasm-js before web        `make web` merges the emscripten page into
-#                             dist/js and *silently skips* that step when the
-#                             directory is not there yet, so the other order
-#                             leaves /js/ half-built with no error.
 #   gemma-kernels before      the kernel engine is a .js file under dist and
 #     compress                gets encoded like everything else.
 #   compress before models    weights are excluded from compression anyway, so
@@ -50,14 +46,9 @@ RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IM
 #
 # Sequential $(MAKE) calls rather than prerequisites, so that `make -jN`
 # cannot reorder the steps above into a broken build.
-#
-# `antares-onnx` is not here on purpose: it is the one target needing Python,
-# uv and an HF_TOKEN, against weights that are gated per repository and cannot
-# be fetched unattended. Run it by hand if you need it.
 everything:
 	$(MAKE) build
 	$(MAKE) wasm
-	$(MAKE) wasm-js
 	$(MAKE) web
 	$(MAKE) gemma-kernels
 	$(MAKE) compress
@@ -66,9 +57,7 @@ everything:
 	@echo "everything: dist/ is complete and encoded; 'make serve' to run it"
 
 # `all` is the conventional name for the default goal, so it is an alias rather
-# than a second, subtly different build. It used to mean `build wasm web`, which
-# had the wasm-js-before-web bug described above: it produced a dist/js with the
-# converter output but no merged page, and said so only in a passing note.
+# than a second, subtly different build.
 all: everything
 
 require-docker:
@@ -93,14 +82,6 @@ wasm: vm-image builder-image
 		$(C2W_IMAGE) --assets /assets $(VM_IMAGE) /out/smolbox.wasm
 	@$(RECLAIM_DIST)
 
-wasm-js: vm-image builder-image
-	@mkdir -p $(DIST)/js
-	docker run --rm \
-		-v /var/run/docker.sock:/var/run/docker.sock \
-		-v $(PWD)/$(DIST):/out \
-		$(C2W_IMAGE) --assets /assets --to-js $(VM_IMAGE) /out/js/
-	@$(RECLAIM_DIST)
-
 build:
 	mkdir -p $(BIN)
 	go build -o $(BIN)/smolbox ./cmd/smolbox
@@ -110,23 +91,11 @@ web:
 	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
 	cp web/index.html web/dist/index.html
 	@# The VM artifacts stay in dist/ and are served from there (web/serve.ts
-	@# resolves them via DIST_DIR); web/dist holds only the bundles. The
-	@# emscripten page is the one merge: js.html and the bundled js-main.ts are
-	@# laid next to the c2w output in dist/js, so that directory is a complete
-	@# page on its own.
-	@if [ -d "$(DIST)/js" ]; then \
-		bun build web/src/emscripten/js-main.ts --target=browser --outfile $(DIST)/js/main.js && \
-		cp web/js.html $(DIST)/js/index.html; \
-	else echo "note: dist/js not built yet; run 'make wasm-js' (M6)"; fi
-	mkdir -p web/dist/agent web/dist/scan web/dist/ort
+	@# resolves them via DIST_DIR); web/dist holds only the bundles.
+	mkdir -p web/dist/agent web/dist/ort
 	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \
 		--target=browser --outdir web/dist/agent
 	cp web/agent.html web/dist/agent/index.html
-	@# The Antares localization page. Its own entry point rather than a mode of
-	@# the chat page: the run has a budget, a termination protocol and a ranked
-	@# answer, none of which chat has (PLAN §11.5).
-	bun build web/src/agent/scan-main.ts --target=browser --outdir web/dist/scan
-	cp web/scan.html web/dist/scan/index.html
 	@# onnxruntime-web otherwise pulls these from jsdelivr at runtime; serving them
 	@# locally keeps the page pinned to the installed version and works offline.
 	@# Copy every simd-threaded variant rather than guessing: ORT picks the build
@@ -156,9 +125,6 @@ model:
 # the 3.6 GB entry must not throw away the five that would have succeeded after
 # it. The exit status still reflects the failures, so CI cannot mistake a
 # partial shelf for a full one.
-#
-# The gated Antares entries are absent because they are not downloadable at all
-# (--keys omits them); `make antares-onnx` builds those.
 models:
 	@keys=$$(bun web/fetch-model.ts --keys) || { echo "error: could not read the model registry" >&2; exit 1; }; \
 	failed=(); \
@@ -174,7 +140,7 @@ models:
 	fi; \
 	echo ""; \
 	echo "all downloadable registry entries are in $(DIST)/models"; \
-	echo "note: gemma4-e2b also needs 'make gemma-kernels'; antares needs 'make antares-onnx'"
+	echo "note: gemma4-e2b also needs 'make gemma-kernels' for the engine"
 
 # The Gemma 4 WebGPU kernel engine. Downloaded rather than vendored: the Space
 # that publishes it declares no license, so a pinned pull into gitignored dist/
@@ -183,26 +149,6 @@ models:
 # agent page imports it dynamically and says to run this when it is absent.
 gemma-kernels:
 	bun web/fetch-kernels.ts
-
-# Builds Antares into ONNX, because nobody publishes one (PLAN §11.1.5). This is
-# the only target in the repo that needs Python, uv and an HF_TOKEN; everything
-# else is Go and bun. The weights are gated, and acceptance is per repository —
-# accepting antares-1b does not grant antares-350m.
-#   make antares-onnx                     the shipping model (1B)
-#   make antares-onnx ANTARES=antares-350m the small one (cannot follow the
-#                                          protocol — see PLAN §11.10)
-ANTARES ?= antares-1b
-antares-onnx:
-	@test -f .env || { echo "error: .env not found. Copy .env.example and set HF_TOKEN."; exit 1; }
-	set -a && . ./.env && set +a && cd tools && uv run python convert_antares.py $(ANTARES)
-
-# Checks a converted build still behaves like the checkpoint it came from:
-# greedy agreement against the safetensors reference, and whether it still
-# emits tool calls under Antares' own sampling settings.
-antares-verify:
-	cd tools && uv run python verify_onnx.py \
-		--source dist/models/fdtn-ai/$(ANTARES) \
-		--onnx dist/models/fdtn-ai/$(ANTARES)-ONNX --dtype fp16
 
 # Writes a .br and a .gz beside every compressible artifact in dist/. serve.ts
 # picks them up automatically; without them it serves identity and nothing
@@ -241,10 +187,6 @@ test-e2e: web
 # only suite that exercises the <input webkitdirectory> fallback for real.
 test-e2e-firefox: web
 	bunx --bun playwright test --config tests/e2e/playwright.firefox.config.ts
-
-test-e2e-js: web
-	@test -d "$(DIST)/js" || { echo "error: $(DIST)/js missing; run 'make wasm-js' first (M6)" >&2; exit 1; }
-	bunx --bun playwright test --config tests/e2e/playwright.emscripten.config.ts
 
 # The M8 agent spike. Opt-in and not in CI: it needs a real GPU adapter (headless
 # Chromium has no software fallback for WebGPU) and the local weights.

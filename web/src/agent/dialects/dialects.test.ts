@@ -171,10 +171,10 @@ describe("the model registry", () => {
 
   // A repo that keeps its template only in chat_template.jinja loads fine and
   // then throws on the first turn, because transformers.js' tokenizer reads an
-  // inline template and nothing else. The locally-built Antares is such a repo,
-  // which is what broke the scan page.
+  // inline template and nothing else. Newer HF exports increasingly prefer the
+  // standalone file, so the URL has to follow the weights rather than assume.
   test("the chat template is read from the same place the weights are", () => {
-    const entry = modelFor("antares-1b");
+    const entry = modelFor("gemma4-e2b-onnx");
     expect(chatTemplateUrl(entry, true)).toBe(`/models/${entry.repo}/${CHAT_TEMPLATE_FILE}`);
     expect(chatTemplateUrl(entry, false)).toBe(
       `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${CHAT_TEMPLATE_FILE}`,

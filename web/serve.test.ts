@@ -27,12 +27,12 @@ beforeAll(async () => {
   await writeFile(path.join(dist, "smolbox.wasm.br"), zlib.brotliCompressSync(WASM_BODY));
   await writeFile(path.join(dist, "smolbox.wasm.gz"), zlib.gzipSync(WASM_BODY));
 
-  // Under js/, which is one of the prefixes serve.ts routes to DIST_DIR;
+  // Under kernels/, which is one of the prefixes serve.ts routes to DIST_DIR;
   // anything else resolves against the bundle directory beside serve.ts.
   const HTML = Buffer.from("<!doctype html><title>x</title>" + "<p>hello</p>".repeat(200));
-  await mkdir(path.join(dist, "js"), { recursive: true });
-  await writeFile(path.join(dist, "js", "page.html"), HTML);
-  await writeFile(path.join(dist, "js", "page.html.br"), zlib.brotliCompressSync(HTML));
+  await mkdir(path.join(dist, "kernels"), { recursive: true });
+  await writeFile(path.join(dist, "kernels", "page.html"), HTML);
+  await writeFile(path.join(dist, "kernels", "page.html.br"), zlib.brotliCompressSync(HTML));
 
   // A file with no encoded siblings, standing in for the model weights that
   // `make compress` deliberately skips.
@@ -138,7 +138,7 @@ describe("encoding negotiation", () => {
   });
 
   test("keeps text/html on an encoded page", async () => {
-    const r = await fetch(`${base}/js/page.html`, { headers: { "Accept-Encoding": "br" } });
+    const r = await fetch(`${base}/kernels/page.html`, { headers: { "Accept-Encoding": "br" } });
     expect(r.headers.get("content-encoding")).toBe("br");
     expect(r.headers.get("content-type")).toContain("text/html");
   });
@@ -155,7 +155,7 @@ describe("encoding negotiation", () => {
   // back as identity. Serving the stale variant looks like the edit never
   // happened, with nothing in the response to hint at why.
   test("ignores an encoded sibling older than the file it encodes", async () => {
-    const stale = path.join(dist, "js", "stale.js");
+    const stale = path.join(dist, "kernels", "stale.js");
     await writeFile(stale, "console.log('old');\n".repeat(100));
     await writeFile(`${stale}.br`, zlib.brotliCompressSync(Buffer.from("console.log('old');\n")));
     // Rewrite the identity file so it is strictly newer than the variant.
@@ -163,19 +163,19 @@ describe("encoding negotiation", () => {
     const fresh = "console.log('new');\n".repeat(100);
     await writeFile(stale, fresh);
 
-    const r = await fetch(`${base}/js/stale.js`, { headers: { "Accept-Encoding": "br, gzip" } });
+    const r = await fetch(`${base}/kernels/stale.js`, { headers: { "Accept-Encoding": "br, gzip" } });
     expect(r.headers.get("content-encoding")).toBeNull();
     expect(await r.text()).toBe(fresh);
   });
 
   test("serves an encoded sibling that is newer than the file it encodes", async () => {
     const body = "console.log('current');\n".repeat(100);
-    const current = path.join(dist, "js", "current.js");
+    const current = path.join(dist, "kernels", "current.js");
     await writeFile(current, body);
     await Bun.sleep(10);
     await writeFile(`${current}.br`, zlib.brotliCompressSync(Buffer.from(body)));
 
-    const r = await fetch(`${base}/js/current.js`, { headers: { "Accept-Encoding": "br" } });
+    const r = await fetch(`${base}/kernels/current.js`, { headers: { "Accept-Encoding": "br" } });
     expect(r.headers.get("content-encoding")).toBe("br");
     expect(await r.text()).toBe(body);
   });

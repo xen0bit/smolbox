@@ -37,9 +37,10 @@ export class StdinChannel {
   readonly sab: SharedArrayBuffer;
   private ints: Int32Array;
   private payload: Uint8Array;
-  // Optional main-thread hook fired after a frame is published. The emscripten
-  // (--to-js) build uses it to wake the runtime's onReadable wait via the pty;
-  // the WASI worker leaves it unset (its poll path watches the same counter).
+  // Optional main-thread hook fired after a frame is published. The WASI
+  // worker leaves it unset — its poll path watches the same counter. It exists
+  // for a transport that has to be woken rather than polled; the removed
+  // --to-js page used it to wake the runtime's onReadable wait via its pty.
   onWrite?: () => void;
 
   static create(): StdinChannel {

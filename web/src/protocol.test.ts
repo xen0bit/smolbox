@@ -134,10 +134,11 @@ describe("FrameDecoder", () => {
     expect(() => decoder.feed(big)).toThrow(ProtocolError);
   });
 
-  // The emscripten console feeds one byte per call (QEMU's 16550 UART writes
-  // per character), so a large frame arrives as ~1e6 single-byte chunks. Buffer
-  // growth and the newline scan must both stay amortized O(1) per byte; when
-  // they were not, this took minutes instead of milliseconds.
+  // A console transport can hand over one byte per call — the removed --to-js
+  // page did, because QEMU's 16550 UART writes per character — so a large frame
+  // arrives as ~1e6 single-byte chunks. Buffer growth and the newline scan must
+  // both stay amortized O(1) per byte; when they were not, this took minutes
+  // instead of milliseconds. The guarantee is worth keeping whatever feeds it.
   test("a large frame delivered one byte at a time stays linear", () => {
     const decoder = new FrameDecoder();
     const line = encodeRequest(7, { op: OpExec, cmd: "a".repeat(512 * 1024) });

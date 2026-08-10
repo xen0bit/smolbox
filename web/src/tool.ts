@@ -32,9 +32,6 @@ export interface Schema {
   additionalProperties?: Schema;
   items?: Schema;
   contentEncoding?: string;
-  /** JSON Schema `default`. Not emitted by the Go generator; used by tool profiles
-   * that reproduce another vendor's published schema (agent/tool-profile.ts). */
-  default?: unknown;
 }
 
 /**

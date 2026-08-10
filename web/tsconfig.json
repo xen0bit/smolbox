@@ -12,5 +12,5 @@
     "allowImportingTsExtensions": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "serve.ts"]
+  "include": ["src", "serve.ts", "fetch-model.ts", "fetch-kernels.ts", "precompress.ts"]
 }

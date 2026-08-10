@@ -158,8 +158,6 @@ The tool is a thin layer over one long-lived session. Worth knowing when writing
 - **`/mnt/host` is read-only**, enforced at the host filesystem boundary rather than by guest
   configuration. Writes fail with `EROFS`. Paths escaping above the mount root fail.
 - **There is no network.**
-- **The emscripten (`--to-js`) build has no host mount at all** — `/mnt/host` is empty there. The tool
-  surface is identical; only the mount is missing.
 
 Ops other than `exec` exist on the wire but are not reachable through the tool: `ping` and `info` are
 health checks for the host, and `shutdown` is how `Session.Close` ends a session.

@@ -24,7 +24,7 @@ export interface Dialect {
    *
    * Every family needs its own, because the markers that must not reach the
    * screen are exactly the ones that differ between families — a single
-   * hardcoded `<|tool_call_start|>` in the page meant Qwen and Antares streamed
+   * hardcoded `<|tool_call_start|>` in the page meant Qwen and Gemma streamed
    * their raw call syntax into the chat while LFM2 did not.
    */
   preview(raw: string): StreamPreview;

@@ -35,7 +35,7 @@ export interface ParsedTurn {
  *  - `tagged`: the model writes both `<think>` and `</think>` itself (Qwen3).
  *  - `prompt-opened`: the chat template ends the generation prompt with a bare
  *    `<think>`, so a completion starts *inside* the block and the only tag it
- *    ever emits is the close (LFM2.5, Antares).
+ *    ever emits is the close (LFM2.5).
  */
 export type ThinkStyle = "none" | "tagged" | "prompt-opened";
 
@@ -488,7 +488,7 @@ const SPECIAL_TOKENS = [
   /<\|eom_id\|>/g,
   /<\|start_header_id\|>/g,
   /<\|end_header_id\|>/g,
-  // Granite 4.0, which is what Antares is built on. Note `end_of_text` is not
+  // Granite 4.0. Note `end_of_text` is not
   // the same token as `endoftext` above — Granite spells it with underscores
   // and uses it as both BOS and EOS, so it turns up mid-stream routinely.
   /<\|end_of_text\|>/g,

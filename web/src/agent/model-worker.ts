@@ -186,14 +186,6 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   reported.clear();
   loaded = entry;
   lastLoad = { local, dtype };
-  // A locally-built checkpoint has no hub copy to fall back to, so failing here
-  // with the build command beats a 404 from deep inside transformers.js.
-  if (entry.local && !local) {
-    throw new Error(
-      `${entry.label} is built locally, not downloaded: run \`make antares-onnx\` ` +
-        `to produce dist/models/${entry.repo}, then reload.`,
-    );
-  }
   // Local weights come from dist/models via the dev server; the hub is the
   // fallback so the page still works for someone who has not run `make model`.
   env.allowLocalModels = local;
@@ -296,9 +288,8 @@ function describeLoadFailure(err: unknown, entry: ModelEntry, dtype: Dtype): Err
  * tokenizer_config.json: the standalone file is loaded by Processor, on the
  * multimodal path, and by nothing else. A repo that keeps its template only in
  * that file therefore loads fine and then throws inside apply_chat_template on
- * the first turn — which is what the locally-built Antares did on the scan page,
- * because `make antares-onnx` copies the file across verbatim and the Python
- * side of the conversion reads it (Python transformers does load it).
+ * the first turn. Python transformers *does* read the standalone file, so a
+ * checkpoint can pass every check on that side and still fail here.
  *
  * Absence is not an error: the two LFM2 repos inline their templates and never
  * reach this, and a repo with neither will fail in apply_chat_template with a
@@ -380,10 +371,10 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   });
 
   // Greedy was M8's choice so a spike's output could not change run to run, and
-  // it remains the default. It is actively wrong for some checkpoints: Antares
-  // at temperature 0 falls into repetition loops and never reaches a tool call,
-  // in the reference safetensors model as much as in the converted one
-  // (PLAN §11.10). An entry that needs sampling declares it in the registry.
+  // it remains the default. It is actively wrong for some checkpoints: Gemma 4
+  // at temperature 0 makes its first tool call and then answers <eos> forever
+  // once a result comes back (PLAN §10.15), and Antares looped instead of ever
+  // calling (§11.10, since removed). An entry that needs sampling declares it.
   // The page layers its own overrides on top, and only for the fields someone
   // actually changed — everything else keeps tracking the selected checkpoint.
   const sampling = { ...(loaded?.generation ?? { do_sample: false }), ...(req.generation ?? {}) };
