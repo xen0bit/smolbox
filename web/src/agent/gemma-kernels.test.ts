@@ -1,14 +1,13 @@
 // The half of the Gemma backend that is ours.
 //
-// The kernels need `shader-f16`, which no browser on this machine exposes — not
-// headless Chromium, not real Chrome, on no adapter and behind no flag. Dawn's
-// own report (chrome://gpu) enables it on Mesa's software Vulkan here and not on
-// the NVIDIA one, so it is a per-adapter gate rather than anything about how the
-// browser is launched; PLAN §10.14 has the measurements. The engine therefore
-// cannot run in CI, in the opt-in GPU suite, or by hand. What CAN be tested is the code
-// this project actually wrote around it: which tokens get fed to the forward
-// pass, when the KV cache is reused, when it is reset, and what cancellation
-// leaves behind. Those are the parts that would silently corrupt a conversation.
+// The engine itself needs a GPU and 2.3 GB of weights, so it belongs to the
+// opt-in suite (`SMOLBOX_MODEL=gemma4-e2b make test-e2e-agent`, PLAN §10.17).
+// What is tested here is the code this project actually wrote around it: which
+// tokens get fed to the forward pass, when the KV cache is reused, when it is
+// reset, and what cancellation leaves behind. Those are the parts that would
+// silently corrupt a conversation rather than fail, and none of them needs a
+// GPU to be wrong. The f32 rewrite that lets the engine run on an adapter
+// without `shader-f16` has its own file: kernel-f32.test.ts.
 
 import { describe, expect, test } from "bun:test";
 

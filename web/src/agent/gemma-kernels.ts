@@ -25,6 +25,8 @@
 // it exposes for the purpose. The prefix-cache bookkeeping in stream() is a
 // faithful reimplementation of what its generate() does with those same objects.
 
+import { KernelRewriteError, adapterHasShaderF16, rewriteKernelsToF32 } from "./kernel-f32.ts";
+
 /** Where `make gemma-kernels` puts the pinned bundle, served by web/serve.ts. */
 export const KERNEL_BUNDLE_PATH = "/kernels/gemma4/gemma-4-e2b.js";
 
@@ -76,17 +78,49 @@ interface KernelModule {
 }
 
 /**
- * Imports the bundle.
+ * The f32 rewrite of the bundle, once per page.
+ *
+ * A blob URL rather than a refetch on every load: the module is 540 KB and the
+ * engine is re-imported whenever someone switches models and switches back.
+ * Safe to hold because the bundle is self-contained — no `import.meta.url`, no
+ * nested imports, no DOM — so nothing in it cares that its module URL is a blob
+ * rather than a path under /kernels.
+ */
+let f32BundleUrl: string | null = null;
+
+/**
+ * Imports the bundle, adapting it to the adapter if it has to.
  *
  * The specifier is built at runtime rather than written as a literal so the
  * bundler leaves it alone: this file is compiled by `bun build` on a checkout
  * where dist/kernels does not exist, and a static import would fail there.
+ *
+ * On an adapter with `shader-f16` this is exactly the import it always was. On
+ * one without, the bundle is fetched as text, its three f16 choices rewritten
+ * to f32 (kernel-f32.ts says why that is all it takes), and the result imported
+ * from a blob. The rewrite is not applied unconditionally: f16 is faster and
+ * smaller where it exists, and leaving that path untouched means adapters that
+ * do expose the feature keep running the engine exactly as published.
  */
 async function importEngine(): Promise<KernelModule> {
   const url = KERNEL_BUNDLE_PATH;
   try {
-    return (await import(/* @vite-ignore */ url)) as unknown as KernelModule;
+    if (await adapterHasShaderF16()) {
+      return (await import(/* @vite-ignore */ url)) as unknown as KernelModule;
+    }
+    if (!f32BundleUrl) {
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`GET ${url}: ${res.status} ${res.statusText}`);
+      }
+      const rewritten = rewriteKernelsToF32(await res.text());
+      f32BundleUrl = URL.createObjectURL(new Blob([rewritten], { type: "text/javascript" }));
+    }
+    return (await import(/* @vite-ignore */ f32BundleUrl)) as unknown as KernelModule;
   } catch (err) {
+    if (err instanceof KernelRewriteError) {
+      throw err;
+    }
     throw new Error(
       `the Gemma 4 kernel engine is not on this server (${url}): run \`make gemma-kernels\` ` +
         `to download the pinned bundle, then \`make web\`. ` +
@@ -108,11 +142,11 @@ export class GemmaKernelEngine {
    * Wraps an already-built engine. The seam CI needs.
    *
    * Everything below this line is ours — the prefix-cache bookkeeping, the
-   * cancellation, the reset rules — and none of it needs a GPU to be wrong. The
-   * kernels themselves cannot be tested here at all (they require `shader-f16`,
-   * which no browser on this machine exposes — PLAN §10.14), so the least this file can do is
-   * make the part we wrote reachable, exactly as FakeModelClient does for the
-   * loop.
+   * cancellation, the reset rules — and none of it needs a GPU to be wrong, so
+   * this seam keeps it reachable without one, exactly as FakeModelClient does
+   * for the loop. The kernels themselves now DO run here (PLAN §10.17), but
+   * only under the opt-in GPU suite, which is not where a cache-reset bug
+   * should first be noticed.
    */
   static wrap(model: Gemma4Mobile): GemmaKernelEngine {
     return new GemmaKernelEngine(model);
