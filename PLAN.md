@@ -2181,6 +2181,36 @@ Four constraints decide this, and only the first is about the model being good:
 3. a tool-call grammar one of the five dialects already parses, or the honest cost of a sixth;
 4. a vocabulary small enough that the prefill ceiling leaves a usable prompt (§10.10, §10.16).
 
+**Two of those are ours to fix, and knowing which changes the search.** If we are willing to run the
+exporter, 1 and 2 stop being constraints at all: we choose the dtype and we always write a sidecar.
+That is the whole reason a checkpoint should not be dismissed for shipping only q4f16, or only one
+undivided file — those are properties of somebody's export, not of the model.
+
+What we cannot export our way out of is the **runtime**. transformers.js has to know the
+`model_type` to map a config onto a model class and drive generation; an ONNX graph for an
+architecture it has never heard of is a file it cannot instantiate. So the real gate moved from *does
+a prebuilt ONNX exist* to *is the architecture in the library's mapping* — and that is a question
+this repo can answer in one grep against the version it has pinned, before downloading anything:
+
+```
+$ grep -o '\["qwen3_5_text","[A-Za-z0-9_]*"\]' \
+    node_modules/@huggingface/transformers/dist/transformers.node.min.mjs
+["qwen3_5_text","Qwen3_5ForCausalLM"]
+```
+
+Run against `@huggingface/transformers` **4.2.0**, the version in `package.json`, every candidate
+below was filtered this way first. Supported: `llama`, `qwen3`, `qwen3_5`, `qwen3_5_text`,
+`qwen3_5_moe_text`, `lfm2`, `gemma3_text`, `granitemoehybrid`, `apertus`. Not supported, and
+therefore not a conversion job but an upstream one: `nanbeige`, `fuse3`, `bailing_hybrid`, `Motif`.
+The hub having an ONNX export of `nanbeige` does not change this — somebody built it for a runtime
+that is not ours.
+
+The other thing worth pricing before choosing: **the conversion pipeline was deleted three commits
+ago.** `ffa40f1` removed `tools/convert_antares.py`, `quantize_onnx.py`, `verify_onnx.py`,
+`tools/pyproject.toml` and `uv.lock`. Exporting anything ourselves means standing a Python toolchain
+back up. None of the recommendations below need it — a usable export already exists for each — but
+"we can build our own" currently costs a reinstated `tools/` tree, not an afternoon.
+
 Constraint 4 is the one that is easy to forget and hardest to work around, so here it is as a table —
 `1.5 GiB / (vocab × 4)`, the prompt tokens a full-sequence-logits export can take:
 
@@ -2193,6 +2223,40 @@ Constraint 4 is the one that is easy to forget and hardest to work around, so he
 | 262 144 | 1536 |
 
 **Recommended, in order.**
+
+- **`onnx-community/Qwen3.5-0.8B-Text-ONNX`** (`1e45daba…`) — the best fit found, and it exists
+  because Qwen3.5 shipped small in Feb 2026 (0.8B, 2B, 4B, 9B; Qwen3.6 in April went 27B and up, so
+  there is no smaller successor to wait for). Three things had to be true and all three are:
+  - **The architecture is first-class in the pinned runtime.** `Qwen3_5ForCausalLM` /
+    `qwen3_5_text`, mapped in 4.2.0. This was the real risk and it is worth saying why: Qwen3.5's
+    `layer_types` alternates `full_attention` with **`linear_attention`**, a recurrent state that
+    ordinarily neither exports cleanly nor caches like a KV. The library special-cases exactly this,
+    naming `qwen3_5_text` beside `qwen3_next` and `olmo_hybrid` in its cache builder. The hybrid is
+    handled, not merely tolerated.
+  - **It is the text-only export.** The headline `Qwen3.5-0.8B-ONNX` is
+    `Qwen3_5ForConditionalGeneration` and carries a vision encoder; this one is a single graph, so
+    there is no `components` list and nothing fetched that a chat never touches. q4 is a 4 KB graph
+    plus a **551 MB** sidecar — under LFM2 1.2B, for a newer model.
+  - **The 248 320 vocabulary does not bite.** By constraint 4 that is 1621 prompt tokens, which
+    would be disqualifying. But the graph takes **`logits_to_keep`** — verified by reading the
+    protobuf, the same way Gemma 4's export was checked in §10.15 rather than assumed — so it
+    materializes one row, takes `prefillLogits: "last"`, and lands on the 8192 working ceiling.
+
+  Dialect is **`hermes`**, already verified: the template writes `<tool_call>`/`</tool_call>`,
+  `<tool_response>` and `<think>`. That last one matters beyond this entry — it is the checkpoint
+  that would finally capture hermes' **uncaptured `<think>` transcript**, the gap AGENTS.md has
+  carried since §10.11 for want of a reasoning model that loads. Context 262 144.
+
+- **`onnx-community/granite-4.0-h-1b-ONNX`** (`fe3928cd…`) — **and a correction: §10.19's first pass
+  rejected this on the wrong evidence.** The repo carries no `transformers.js` tag and no
+  `library_name`, and that was read as "unsupported". The tag is missing; the support is not.
+  `granitemoehybrid` is in 4.2.0's mapping as `GraniteMoeHybridModel`, which is the check that
+  counts. Absence of a hub tag is absence of metadata, and inferring a capability from it is the
+  same species of error as §10.14's — reading a limit off the wrong layer. Its template emits
+  `<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`, which is `hermes` exactly; q4 is
+  1.019 GB sharded; vocab 100 352 (4012 tokens even the pessimistic way, and it takes
+  `logits_to_keep` too); context 131 072. IBM documents tool use as a first-class capability, which
+  none of the sub-1B candidates can say.
 
 - **`onnx-community/LFM2.5-350M-ONNX`** (`2c07371c…`) — `Lfm2ForCausalLM`, vocab 65 536, q4 is a
   4 KB graph plus a **294 MB** sidecar. Six times smaller than the current default for a model that
@@ -2218,7 +2282,12 @@ plausible from its name or its download count:
 | candidate | why not |
 |---|---|
 | `onnx-community/Bonsai-1.7B-ONNX` | 8826 downloads, the most of any recent export, and it is a trap: the base is `Bonsai-1.7B-**unpacked**`, an fp16 re-inflation of a 1-bit model whose own authors say "the 1-bit format is where all the benefits come from" and discourage this repo. No documented tool calling. |
-| `onnx-community/granite-4.0-h-1b-ONNX` | `GraniteMoeHybridForCausalLM`, and the repo carries **no `transformers.js` tag and no `library_name`** — the only candidate surveyed that does not. Sizes are fine; support is the question, and the hub's own metadata answers it. |
+| ~~`onnx-community/granite-4.0-h-1b-ONNX`~~ | **Rejected in error; now recommended above.** The missing `transformers.js` tag is missing metadata, not missing support. |
+| `Nanbeige/Nanbeige4.2-3B` | 687 likes and trending, and there are already three community ONNX exports of it — but `model_type: nanbeige` is **not in 4.2.0's mapping**. The exports are real; they are for a runtime that is not ours. Nothing we can convert our way past. |
+| `openbmb/MiniCPM5-1B` | The near miss. `model_type: llama`, so the best-supported architecture there is; 1.08B; 955 k downloads. It emits **`<function name="foo">…</function>`**, which is a sixth dialect. Worth reconsidering if a dialect is ever cheap, since everything else about it fits. |
+| `Akahsizrr/fuse-1-Lite` (`fuse3`), `Motif-Technologies/Motif-3` (`Motif`, 314 B params), `inclusionAI/Ling-3.0-flash` (`bailing_hybrid`, 127 B) | Architecture not in the mapping, and the last two are two orders of magnitude too large regardless. |
+| `XYZAILab/XYZ-Aquila-mini` | `qwen3_5_moe_text` **is** supported — and "mini" is 35 B parameters. |
+| `SupraLabs/Supra2-100M-Instruct` | `qwen3`, supported, 100 M — but `max_position_embeddings` is **2048**, shorter than a single tool result plus history. |
 | `onnx-community/Apertus-v1.1-*-Instruct-ONNX` | Tools reach the template as a pre-formatted `developer_content.formatted_tools` string, not the standard `tools=` schema list, so `apply_chat_template(tools=…)` does not populate them. Context is **4096**. |
 | `onnx-community/functiongemma-270m-it-ONNX` | Purpose-built for function calling like LFM2 1.2B Tool, 801 MB sharded q4 — but a **sixth dialect**: `<start_function_call>call:name{arg:<escape>v<escape>}<end_function_call>`, matching nothing here. Google's card says it is "not intended for use as a direct dialogue model" and expects fine-tuning. Vocab 262 144 → 1536 prompt tokens. Revisit only if a purpose-built caller is wanted enough to pay for the dialect. |
 | `emb1ter/RhymeAI-Gemma-4-E4B-v3-ONNX-WebGPU` | Publishes **q4f16 only**. Constraint 1, decided before anything is downloaded. |
@@ -2233,8 +2302,9 @@ the same file as transformers.js applies — adding the dtype is a two-line chan
 404.
 
 **Nothing here has been loaded.** This is a paper survey off model cards, `config.json`,
-`transformers.js_config` and blob sizes — which is exactly enough to *reject* on constraints 1, 2 and
-4, and not enough to *add*. AGENTS.md's rule stands: a registry entry must name a build that actually
+`transformers.js_config`, blob sizes, one grep of the pinned runtime and one read of two ONNX
+graphs' inputs — which is exactly enough to *reject* on constraints 1, 2 and 4 and on architecture
+support, and not enough to *add*. AGENTS.md's rule stands: a registry entry must name a build that actually
 loads, and `Dialect.verified` needs a transcript, not a card. Each recommendation above is a
 candidate for a `make model` pull and a real turn on `/agent/`, in that order.
 
