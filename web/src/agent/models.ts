@@ -364,6 +364,12 @@ export const models: ModelEntry[] = [
     repo: "onnx-community/LFM2.5-350M-ONNX",
     revision: "2c07371c2e84776cad597f3d813b7d306d292aea",
     vocabSize: 65_536,
+    // Declared "sequence" by omission until the load-time check said otherwise
+    // on its first real run: this export takes `num_logits_to_keep`, spelled the
+    // way transformers.js binds it. Harmless in the safe direction — it was
+    // being chunked for an allocation it never makes — and the check is why
+    // anyone found out. Verified in the graph, like the two below it.
+    prefillLogits: "last",
     dtypes: ["q4", "q4f16"],
     approxBytes: 293_813_394,
     // The card says 32 768 where config.json says 128 000. The card wins: a

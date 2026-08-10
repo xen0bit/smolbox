@@ -11,7 +11,7 @@ C2W_VERSION ?= 0.8.4
 
 .PHONY: all everything build wasm vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
-        test-e2e-agent-firefox \
+        test-e2e-agent-smoke test-e2e-agent-firefox \
         test-conformance lint clean
 
 # c2w runs as root in the container, so everything it writes to dist/ lands
@@ -193,6 +193,17 @@ test-e2e-firefox: web
 test-e2e-agent: web
 	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
 	SMOLBOX_WEBGPU=1 bunx --bun playwright test --config tests/e2e/playwright.agent.config.ts
+
+# The same GPU path on the smallest entry in the registry, in ~20 s instead of
+# ~15 minutes. This is the one to run between changes; test-e2e-agent is the one
+# to run before believing a model. See tests/e2e/playwright.agent-smoke.config.ts
+# for what it does and does not prove.
+SMOKE_MODEL ?= lfm2.5-350m
+test-e2e-agent-smoke: web
+	@test -d "$(DIST)/models/onnx-community/LFM2.5-350M-ONNX" || \
+		{ echo "error: weights missing; run 'make model MODEL=$(SMOKE_MODEL)' first" >&2; exit 1; }
+	SMOLBOX_WEBGPU=1 SMOLBOX_MODEL=$(SMOKE_MODEL) \
+		bunx --bun playwright test --config tests/e2e/playwright.agent-smoke.config.ts
 
 # The weight cache on Firefox. Separate from test-e2e-agent because reaching a
 # WebGPU adapter needs a preference there and a launch flag in Chromium, and

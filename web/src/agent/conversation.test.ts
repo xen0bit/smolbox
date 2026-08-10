@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   type AgentEvent,
+  CHARS_PER_TOKEN_ESTIMATE,
   Conversation,
   DEFAULTS,
   MIN_PROMPT_BUDGET_CHARS,
@@ -241,6 +242,56 @@ describe("Conversation", () => {
     expect(tools.some((m) => m.content.includes("exit_code: 0"))).toBe(true);
   });
 
+  // Every elision invalidates the model worker's KV cache — it can only reuse a
+  // cache whose sequence is a prefix of the new prompt, and eliding rewrites an
+  // older message. Trimming to exactly the budget meant the next tool result put
+  // the prompt straight back over it, so a long conversation elided on every
+  // single turn and the cache never survived long enough to be used.
+  test("an elision trims well under the budget rather than back onto it", async () => {
+    const budget = 6000;
+    const runner: ToolRunner = { run: async () => ({ text: `exit_code: 0\n${"x".repeat(2000)}`, exitCode: 0 }) };
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      {
+        systemPrompt: "sys",
+        tools: [],
+        dialect: lfm2,
+        ...DEFAULTS,
+        promptBudgetChars: budget,
+        maxIterations: 8,
+      },
+      new FakeModelClient([
+        {
+          name: "many",
+          turns: [
+            { text: call("a") },
+            { text: call("b") },
+            { text: call("c") },
+            { text: call("d") },
+            { text: call("e") },
+            { text: "done" },
+          ],
+        },
+      ]),
+      runner,
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    const elisions = events.filter((e) => e.kind === "elided") as Extract<AgentEvent, { kind: "elided" }>[];
+    expect(elisions.length).toBeGreaterThan(0);
+    // The property that buys the cache its life: landing under the budget, not
+    // on it. Trimming to exactly `budget` is what made this fire every turn.
+    for (const ev of elisions) {
+      expect(ev.chars).toBeLessThan(budget);
+    }
+    // Five tool results of 2000 chars against a 6000-char budget: without
+    // hysteresis that is an elision per round trip once it starts.
+    expect(elisions.length).toBeLessThan(4);
+    expect(elisions.map((e) => e.times)).toEqual(elisions.map((_, i) => i + 1));
+  });
+
   // The LFM2.5 failure: a prompt past the checkpoint's prefill ceiling killed
   // the WebGPU device, the rejection propagated straight out of send(), and the
   // page was left with a user message, no reply, and nothing on screen saying
@@ -304,6 +355,93 @@ describe("Conversation", () => {
     // 500 tokens of room, less the two characters the empty tool list costs.
     expect(convo.options().promptBudgetChars).toBe(1998);
     expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
+  });
+
+  // The refusal above is what the loop USED to need to learn its ratio. A turn
+  // that succeeds carries the same two numbers, so the budget can be right
+  // before anything is refused rather than after.
+  test("a successful turn tightens the budget to the ratio it measured", async () => {
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      {
+        systemPrompt: "s".repeat(3850),
+        tools: [],
+        dialect: lfm2,
+        ...DEFAULTS,
+        promptBudgetChars: 1_000_000,
+      },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        // 1000 prompt tokens for the ~3857 characters the loop counted: 3.857
+        // chars per token, which is §10.16's real measurement rather than the
+        // registry's estimate of 4. Against an 8192-token ceiling that is
+        // ~31 600 characters, and the estimate would have said 32 768.
+        generate: async () => ({
+          text: "ok",
+          tokens: 1,
+          ms: 0,
+          stopped: false,
+          promptTokens: 1000,
+          limitTokens: 8192,
+        }),
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    const moved = events.find((e) => e.kind === "budget") as Extract<AgentEvent, { kind: "budget" }>;
+    expect(moved?.reason).toBe("measured");
+    // Below what the 4-chars-per-token estimate would have allowed, which is the
+    // direction the estimate errs and the reason a refusal used to be the only
+    // way to find out.
+    expect(moved!.chars).toBeLessThan(8192 * CHARS_PER_TOKEN_ESTIMATE);
+    expect(convo.options().promptBudgetChars).toBe(moved!.chars);
+  });
+
+  test("a turn with no measurement leaves the budget alone", async () => {
+    // The scripted fake has no tokenizer, so it reports nothing — and a loop
+    // that invented a ratio for it would be calibrating against fiction.
+    const events: AgentEvent[] = [];
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 12_345 },
+      new FakeModelClient([{ name: "plain", turns: [{ text: "hello" }] }]),
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    expect(kinds(events)).not.toContain("budget");
+    expect(convo.options().promptBudgetChars).toBe(12_345);
+  });
+
+  test("a measurement never raises the budget", async () => {
+    // A short prompt measures a generous ratio, and believing it would talk the
+    // loop straight into the failure this exists to avoid.
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 2000 },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async () => ({
+          text: "ok",
+          tokens: 1,
+          ms: 0,
+          stopped: false,
+          promptTokens: 1,
+          limitTokens: 8192,
+        }),
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      () => {},
+    );
+
+    await convo.send("go");
+
+    expect(convo.options().promptBudgetChars).toBe(2000);
   });
 
   // Reported on Chrome, and the reason the retry above was not enough: the

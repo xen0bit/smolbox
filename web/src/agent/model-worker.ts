@@ -32,7 +32,7 @@ import {
   modelFor,
   prefillChunkTokens,
 } from "./models.ts";
-import { planPrefill } from "./prefill.ts";
+import { planPrefill, resolvePrefillLogits } from "./prefill.ts";
 
 /** A failure the page can act on. See ModelErrorCode. */
 class WorkerError extends Error {
@@ -231,6 +231,9 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // free and, worse, ids that would match a prompt built for a different
   // tokenizer.
   await dropCache();
+  // Same reasoning one field over: what the last graph said about its logits
+  // says nothing about the one about to load.
+  graphPrefillLogits = null;
   loaded = entry;
   lastLoad = { local, dtype };
   // Local weights come from dist/models via the dev server; the hub is the
@@ -276,6 +279,7 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
     } catch (err) {
       throw describeLoadFailure(err, entry, dtype);
     }
+    graphPrefillLogits = checkPrefillLogits(entry, model);
   }
 
   post({
@@ -326,6 +330,30 @@ function describeLoadFailure(err: unknown, entry: ModelEntry, dtype: Dtype): Err
       `in a browser at all` +
       (others.length > 0 ? `; a smaller quantization (${others.join(", ")}) may fit.` : "."),
   );
+}
+
+/**
+ * What the loaded graph says about its logits, which outranks the registry.
+ *
+ * Null means the question could not be asked — the kernel backend, or a session
+ * shape resolvePrefillLogits does not recognise — and the registry stands. See
+ * prefill.ts for why the graph wins when they disagree.
+ */
+let graphPrefillLogits: ModelEntry["prefillLogits"] | null = null;
+
+function checkPrefillLogits(entry: ModelEntry, m: PreTrainedModel): ModelEntry["prefillLogits"] | null {
+  const sessions = (m as unknown as { sessions?: Record<string, { inputNames?: string[] }> }).sessions;
+  const names = new Set<string>();
+  for (const session of Object.values(sessions ?? {})) {
+    for (const name of session?.inputNames ?? []) {
+      names.add(name);
+    }
+  }
+  const { actual, message } = resolvePrefillLogits(entry, [...names]);
+  if (message) {
+    post({ type: "log", message });
+  }
+  return actual;
 }
 
 /**
@@ -405,7 +433,10 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   const maxNewTokens = req.maxNewTokens ?? loaded?.generation?.max_new_tokens ?? 256;
 
   if (kernels) {
-    await generateWithKernels(req, prompt, inputs, maxNewTokens, started);
+    await generateWithKernels(req, prompt, inputs, maxNewTokens, started, {
+      promptTokens,
+      limitTokens: Number.isFinite(limit) ? limit : 0,
+    });
     return;
   }
 
@@ -450,6 +481,8 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     tokens: completion.length,
     ms: Math.round(performance.now() - started),
     stopped: stopper.interrupted,
+    promptTokens,
+    limitTokens: Number.isFinite(limit) ? limit : 0,
   });
 }
 
@@ -503,7 +536,12 @@ async function prefillAndGenerate(
   const promptIds = ((inputs.input_ids as { tolist(): (number | bigint)[][] }).tolist()[0] ?? []).map(
     Number,
   );
-  const chunk = loaded ? prefillChunkTokens(loaded) : promptIds.length;
+  // The graph outranks the registry on this one field; see graphPrefillLogits.
+  const chunk = loaded
+    ? prefillChunkTokens(
+        graphPrefillLogits ? { ...loaded, prefillLogits: graphPrefillLogits } : loaded,
+      )
+    : promptIds.length;
   const plan = planPrefill(cachedIds, promptIds, chunk);
   if (plan.drop) {
     await dropCache();
@@ -581,6 +619,8 @@ async function generateWithKernels(
   inputs: unknown,
   maxNewTokens: number,
   started: number,
+  /** The prompt guard's two numbers, so the loop can calibrate off this engine too. */
+  measured: { promptTokens: number; limitTokens: number },
 ): Promise<void> {
   const tok = tokenizer!;
   const engine = kernels!;
@@ -611,6 +651,7 @@ async function generateWithKernels(
     tokens: produced.length,
     ms: Math.round(performance.now() - started),
     stopped: cancelRequested,
+    ...measured,
   });
 }
 
