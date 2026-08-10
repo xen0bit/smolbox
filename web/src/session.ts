@@ -45,13 +45,23 @@ export const DefaultExecTimeout = 120_000;
 export class Session {
   private worker: MessageSink;
   private caps: Caps | null = null;
+  // The stdin SAB channel, handed over by the worker as a {type:"channel"}
+  // message before any wasm work starts.
   private channel: StdinChannel | null = null;
   private closed = false;
+  // Sequence numbers are assigned by the host (this class), exactly like the
+  // Go Session; the guest echoes the number back inside the response frame.
   private seq = 0;
+  // The serialization chain: each exec/close chains onto the previous one, so
+  // at most one request is on the wire at a time. This is what guarantees a
+  // new REQ batch only overwrites the SAB slot after the guest drained the
+  // previous frame. The .catch keeps a rejected request from breaking the chain.
   private queue: Promise<unknown> = Promise.resolve();
+  // Waiters keyed by seq, matched in onMessage purely by the response's seq.
   private pending = new Map<number, { resolve(r: Response): void; reject(e: Error): void }>();
   private bootWaiter: { resolve(c: Caps): void; reject(e: Error): void } | null = null;
   private closeWaiter: { resolve(): void; reject(e: Error): void } | null = null;
+  // Set from the worker's exit message; non-null means the VM is gone.
   private exitCode: number | null = null;
 
   constructor(worker: MessageSink) {
@@ -59,6 +69,7 @@ export class Session {
     worker.onmessage = (ev: MessageEvent) => this.onMessage(ev.data as WorkerMessage);
   }
 
+  // Caps returns the ready banner's caps once boot has resolved, else null.
   Caps(): Caps | null {
     return this.caps;
   }
@@ -90,14 +101,18 @@ export class Session {
     });
   }
 
-  // Exec runs a single request, serialized like the Go session's mutex.
+  // Exec runs a single request, serialized like the Go session's mutex. The
+  // returned promise rejects on a timeout, a closed session, or the module
+  // exiting first — never on a non-zero exit_code, which is a normal result.
   exec(req: Request, timeoutMs = DefaultExecTimeout): Promise<Response> {
     const run = this.queue.then(() => this.execNow(req, timeoutMs));
     this.queue = run.catch(() => undefined);
     return run;
   }
 
-  // Close sends the shutdown op and waits for the module to exit.
+  // Close sends the shutdown op and waits for the module to exit. It chains
+  // onto the queue like exec, so it runs after any in-flight request rather
+  // than racing it for the SAB slot.
   close(timeoutMs = 15_000): Promise<void> {
     const run = this.queue.then(() => this.closeNow(timeoutMs));
     this.queue = run.catch(() => undefined);
@@ -112,6 +127,8 @@ export class Session {
       return Promise.reject(new Error("vm: session not booted"));
     }
     const seq = ++this.seq;
+    // Install the waiter before writing the frame: the guest may answer almost
+    // immediately, and the write itself is synchronous into the SAB.
     return new Promise<Response>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(seq);
@@ -171,6 +188,7 @@ export class Session {
         this.bootWaiter = null;
         break;
       case "response": {
+        // Matched purely by seq; the frame and payload both carry it.
         const waiter = this.pending.get(msg.resp.seq);
         if (waiter) {
           this.pending.delete(msg.resp.seq);
@@ -179,6 +197,9 @@ export class Session {
         break;
       }
       case "exit":
+        // The module died. Reject boot (if still waiting) and every in-flight
+        // exec; a pending close resolves, because a dead VM is the outcome
+        // close() was waiting for.
         this.exitCode = msg.code;
         if (this.bootWaiter) {
           this.bootWaiter.reject(new Error(`vm: session exited before ready (code ${msg.code})`));

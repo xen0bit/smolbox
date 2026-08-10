@@ -1,3 +1,9 @@
+// The guest-side exec engine: turns an exec request into a real `sh -c` child
+// in its own process group, captures capped stdout/stderr, enforces the
+// per-call timeout with a process-group kill, and reports the child's final
+// working directory so the session cwd persists across calls. As PID 1 the
+// agent must also reap orphans a timeout kill or a backgrounded child leaves
+// behind, or they linger as zombies forever.
 package main
 
 import (
@@ -14,8 +20,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// maxOutputCeiling is the largest per-stream output cap that still fits a
+// response frame. A response carries two capped streams; each is base64'd
+// inside the JSON, and the JSON is base64'd again on the wire, so one stream
+// of N bytes costs about 9/32×N frame bytes. The 10/36 factor (~0.278) is a
+// hair more conservative than 9/32 (~0.281) and leaves ~60 KB of slack on a
+// 4 MiB frame. Keep every response under this and EncodeResponse never fails.
 const maxOutputCeiling = (protocol.MaxFrameSize - 8192) * 10 / 36
 
+// agent is the stateful request handler: the session cwd persists between
+// exec calls, everything else is per-request.
 type agent struct {
 	in  io.Reader
 	out io.Writer
@@ -30,6 +44,11 @@ func newAgent(in io.Reader, out io.Writer) *agent {
 	return &agent{in: in, out: out, cwd: cwd}
 }
 
+// exec runs one command and returns its response. The wire command is wrapped
+// so the child's own exit code is preserved and its final working directory is
+// reported back on a dedicated fd, which is what makes cwd stateful across
+// calls. Every failure below "the child ran and exited" — a bad cwd, a failed
+// spawn — is a Response with Error set, never a panic.
 func (a *agent) exec(req *protocol.Request) *protocol.Response {
 	start := time.Now()
 	resp := &protocol.Response{}
@@ -43,6 +62,9 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 	if req.Cwd != "" {
 		cwd = req.Cwd
 	}
+	// Chdir the agent itself: the child inherits the target without any
+	// shell-quoting of paths, and `cd` inside the command persists because the
+	// agent re-chdirs from a.cwd on the next call.
 	if err := os.Chdir(cwd); err != nil {
 		resp.Error = fmt.Sprintf("chdir %s: %v", cwd, err)
 		resp.ExitCode = 1
@@ -50,13 +72,22 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 		return resp
 	}
 
+	// `pwd >&3` writes the *final* top-level shell cwd to fd 3 (an ExtraFiles
+	// pipe), so a `cd` persists even when the command exits 0; a subshell `cd`
+	// does not. A command ending in exit/exec skips the pwd, leaving cwd as-is.
 	script := req.Cmd + "\nrc=$?\npwd >&3\nexit $rc\n"
 
+	// Setpgid puts sh and everything it spawns in a fresh process group, so a
+	// timeout kill(-pgid) takes down the whole tree — a runaway pipeline cannot
+	// dodge the timeout by forking.
 	cmd := exec.Command("sh", "-c", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = buildEnv(os.Environ(), req.Env)
 	cmd.Stdin = bytes.NewReader(req.Stdin)
 
+	// Output is captured per stream so it never corrupts the frame stream on
+	// the console; each buffer consumes excess writes (counting them truncated)
+	// so a chatty child blocks on neither pipe.
 	var outBuf, errBuf cappedBuffer
 	outBuf.max, errBuf.max = maxOut, maxOut
 	cmd.Stdout = &outBuf
@@ -79,6 +110,7 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 		resp.DurationMS = time.Since(start).Milliseconds()
 		return resp
 	}
+	// The parent keeps the read end; the child owns the write end (fd 3).
 	_ = cwdW.Close()
 
 	cwdCh := make(chan string, 1)
@@ -98,6 +130,8 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 			timer.Stop()
 		case <-timer.C:
 			timedOut = true
+			// Negative pid kills the whole process group; the SIGKILL exit
+			// reports 137 (128 + 9) on the wire.
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-waitCh
 		}
@@ -105,8 +139,13 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 		<-waitCh
 	}
 
+	// A timeout kill (or a backgrounded `cmd &`) orphans children to us, PID 1;
+	// drain the exited ones or they zombie forever.
 	reapOrphans()
 
+	// Learn the child's final cwd. The read is bounded because a backgrounded
+	// grandchild that inherited fd 3 would otherwise keep the pipe open and
+	// this read blocked forever; the 1s fallback force-closes it instead.
 	select {
 	case c := <-cwdCh:
 		if c != "" {
@@ -125,6 +164,9 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 	return resp
 }
 
+// exitCode maps a ProcessState to the wire's exit code: a signal death becomes
+// 128+signal (so a timeout SIGKILL reads 137), a normal exit its status, and
+// anything unrepresentable 1.
 func exitCode(ps *os.ProcessState) int {
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok {
 		if ws.Signaled() {
@@ -139,6 +181,10 @@ func exitCode(ps *os.ProcessState) int {
 	return code
 }
 
+// reapOrphans drains children that have exited since the last command. The
+// inner loop only exits on ECHILD (no children left), so a still-running
+// orphan briefly busy-spins until it dies; short-lived background jobs cost a
+// transient spin, which is why duration_ms can run long on such commands.
 func reapOrphans() {
 	for attempt := 0; attempt < 3; attempt++ {
 		for {
@@ -150,6 +196,11 @@ func reapOrphans() {
 	}
 }
 
+// buildEnv merges a per-request overlay over the agent's own environment so
+// the overlay wins. The overlay keys are stripped from the base list first
+// because execve env duplicates resolve to the child libc's *first* match —
+// appending alone would let the base value win. A guest-side `export` never
+// leaks between calls because every exec rebuilds from os.Environ().
 func buildEnv(base []string, overlay map[string]string) []string {
 	skip := make(map[string]struct{}, len(overlay))
 	for k := range overlay {
@@ -170,6 +221,9 @@ func buildEnv(base []string, overlay map[string]string) []string {
 	return env
 }
 
+// clampToFrameBudget bounds a requested output cap to the frame budget. Note
+// the clamp is silent: a request for 1.2 MiB gets 1,162,808 without setting
+// Truncated, because no truncation actually happened.
 func clampToFrameBudget(n int) int {
 	if n <= 0 {
 		return protocol.DefaultMaxOutput
@@ -180,6 +234,9 @@ func clampToFrameBudget(n int) int {
 	return n
 }
 
+// cappedBuffer is an io.Writer that holds at most `max` bytes and counts
+// overflow rather than blocking the child: Write always returns len(p) with a
+// nil error, so a stream longer than the cap never stalls on EPIPE.
 type cappedBuffer struct {
 	buf       bytes.Buffer
 	max       int
@@ -208,6 +265,12 @@ func (c *cappedBuffer) bytes() []byte {
 	return c.buf.Bytes()
 }
 
+// setConsoleRaw puts the guest console (fd 0) in raw mode in-process, avoiding
+// a busybox stty dependency. Clearing ICANON lifts the ~4096-byte canonical
+// line cap so long REQ frames read whole; clearing ECHO stops the host's REQ
+// lines from being echoed back into stdout where the host scanner would read
+// them as guest frames; clearing ICRNL/ONLCR keeps base64 and CR bytes intact.
+// Best-effort: the caller logs and continues on failure.
 func setConsoleRaw() error {
 	t, err := unix.IoctlGetTermios(0, unix.TCGETS)
 	if err != nil {

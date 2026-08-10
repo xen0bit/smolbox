@@ -205,8 +205,9 @@ describe("the model registry", () => {
   });
 });
 
-// What reaches the page when the worker throws. The scan page showed five
-// anonymous Firefox frames and no message for exactly this reason.
+// What reaches the page when the worker throws. Firefox's SpiderMonkey stack
+// shows anonymous frames and no message for exactly this reason, so the
+// message has to be prepended rather than trusted to ride the stack.
 describe("describeError", () => {
   test("a V8 stack, which already carries the message, is passed through", () => {
     const err = new Error("chat_template is not set");

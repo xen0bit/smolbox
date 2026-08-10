@@ -73,7 +73,8 @@ export class BridgeFd extends Fd {
   }
 
   // The mount is read-only at the bridge boundary: every write op returns
-  // EROFS without touching the main thread at all.
+  // EROFS without touching the main thread at all. The guest therefore sees
+  // the same "Invalid argument" a wazero WithReadOnlyDirMount surfaces.
   fd_allocate(_offset: bigint, _len: bigint): number {
     return wasi.ERRNO_ROFS;
   }
@@ -117,6 +118,11 @@ export class BridgeFd extends Fd {
     return this.preadChunked(size, offset);
   }
 
+  // Cookie protocol: 0 is `.`, 1 is `..`, then real entries start at 2. The
+  // entry list for the directory is fetched once (one readdir op) and cached
+  // on this Fd for the readdir iteration; the next cookie is the `next` field
+  // WASI expects. Inodes come from the shared deterministic inoOf(path) so
+  // d_ino agrees with filestat.ino across the two ends without shipping them.
   fd_readdir_single(cookie: bigint) {
     if (this.kind !== "dir") {
       return { ret: wasi.ERRNO_BADF, dirent: null };
@@ -235,6 +241,10 @@ export class BridgeFd extends Fd {
     if ((fs_rights_base & BigInt(wasi.RIGHTS_FD_WRITE)) !== 0n) {
       return { ret: wasi.ERRNO_ROFS, fd_obj: null };
     }
+    // Symlinks (the bridge's virtual table) resolve here, on the open path:
+    // readlink once, normalize the target against the symlink's directory
+    // (absolute targets are mount-root-relative; escapes rejected), then stat
+    // the resolved path and open that instead. Unresolvable -> ELOOP.
     let target = norm.path;
     let st = this.stat(target);
     if (st.errno !== 0) {
@@ -324,6 +334,10 @@ export class BridgeFd extends Fd {
     return wasi.ERRNO_ROFS;
   }
 
+  // A read larger than the bridge payload window is issued as repeated
+  // BRIDGE_PAYLOAD_SIZE (1 MiB) ops and concatenated. A mid-read error with
+  // partial data returns what was read rather than failing; a short chunk ends
+  // the loop (EOF).
   private preadChunked(size: number, offset: bigint): { ret: number; data: Uint8Array } {
     const parts: Uint8Array[] = [];
     let pos = offset;
@@ -358,6 +372,9 @@ export class BridgeFd extends Fd {
     return { ret: wasi.ERRNO_SUCCESS, data: out };
   }
 
+  // stat consults the opening stat (the one captured when this Fd was opened)
+  // for the path itself, avoiding a round trip on the common case; every other
+  // path goes to the main thread, whose MountHost memoizes STAT results.
   private stat(path: string): StatResponse {
     if (this.statCache && path === this.basePath) {
       return this.statCache;

@@ -111,6 +111,10 @@ worker.addEventListener("message", (ev: MessageEvent) => {
         progressEl.hidden = true;
       }
       break;
+    // The fsbridge's two messages: the worker posts the SAB once at startup
+    // (fschannel), then wakes this thread once per request (fsreq). All handle
+    // work happens here on the main thread — the worker is blocked inside
+    // wasi.start() for the VM's lifetime and cannot service these itself.
     case "fschannel":
       if (msg.sab) {
         mount.attach(msg.sab);
@@ -122,6 +126,9 @@ worker.addEventListener("message", (ev: MessageEvent) => {
   }
 });
 
+// window.__smolbox is the hook Playwright's e2e suites drive. setMount/remount
+// are main-thread-only by design: the worker cannot receive postMessage while
+// the VM runs, so mount changes never round-trip it.
 const handle: SmolboxHandle = {
   boot: (t?: number) => session.boot(t),
   exec: (req: Request, t?: number) => session.exec(req, t),

@@ -137,6 +137,9 @@ export class MountHost {
 
   // Serve one pending bridge request (called from the fsreq wake). The request
   // bytes are read synchronously before any await, so the worker cannot race.
+  // A dispatch exception becomes an EIO response rather than throwing: the
+  // worker is asleep in Atomics.wait and only the response store wakes it, so
+  // an unhandled error here would strand the guest for the full bridge timeout.
   dispatch(req: StatRequest): Promise<StatResponse>;
   dispatch(req: ReaddirRequest): Promise<ReaddirResponse>;
   dispatch(req: ReadRequest): Promise<ReadResponse>;
@@ -155,6 +158,9 @@ export class MountHost {
     }
   }
 
+  // stat resolves virtual symlinks first (no handle involved), then the mount
+  // root, then a memoized STAT; misses are not cached (a later remount can
+  // create them), hits are. A file's size comes from getFile.
   private async stat(path: string): Promise<StatResponse> {
     if (this.virtualLinks.has(path)) {
       return { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_SYMBOLIC_LINK, size: 0 };
@@ -189,6 +195,10 @@ export class MountHost {
     return st;
   }
 
+  // readdir is memoized per path. With no mount attached, the root still lists
+  // its virtual symlinks (the VM boots with an empty mount; the symlink table
+  // is registered separately from the handle). Real entries are enumerated
+  // from the handle and prefixed by this directory's virtual links.
   private async readdir(path: string): Promise<ReaddirResponse> {
     const cached = this.dirCache.get(path);
     if (cached !== undefined) {
@@ -215,6 +225,10 @@ export class MountHost {
     return { op: OpReaddir, errno: ERRNO_SUCCESS, entries: all };
   }
 
+  // read serves a byte window of a file. Chunks are cached in an LRU keyed by
+  // exact `path@offset:len`, which is what makes sequential `cat` of a large
+  // file cheap without caching the whole file. The window is clamped to the
+  // file's size; reads beyond EOF return zero bytes.
   private async read(path: string, offset: number, len: number): Promise<ReadResponse> {
     const file = await this.getFile(path);
     if (!file) {
@@ -241,6 +255,10 @@ export class MountHost {
     return { op: OpReadlink, errno: ERRNO_NOENT };
   }
 
+  // virtualInDir finds the virtual links that are direct children of a
+  // directory — a path under the prefix with no further `/`. readdir reports
+  // them as FILETYPE_SYMBOLIC_LINK, so the guest sees a symlink even though
+  // the File System Access API cannot represent one.
   private virtualInDir(parent: string): ReaddirEntry[] {
     const out: ReaddirEntry[] = [];
     const prefix = parent === "/" ? "/" : `${parent}/`;
@@ -255,6 +273,10 @@ export class MountHost {
     return out;
   }
 
+  // lookup walks a path segment by segment to a handle. The final segment
+  // accepts either kind (getFileHandle first, then getDirectoryHandle);
+  // intermediates must be directories. Results — including null misses — are
+  // memoized so a repeated missing path does not re-probe the handle.
   private async lookup(path: string): Promise<HandleLike | null> {
     const cached = this.handleCache.get(path);
     if (cached !== undefined) {
@@ -306,6 +328,10 @@ export class MountHost {
   }
 }
 
+// getEntry resolves one name to a handle of either kind, probing file first
+// then directory. The File System Access API has no "does this name exist"
+// call that returns both kinds, so this is the structural seam a fake handle
+// (unit tests) and the webkitdirectory rebuild must both satisfy.
 async function getEntry(dir: DirectoryHandleLike, name: string): Promise<HandleLike | null> {
   try {
     return await dir.getFileHandle(name);
