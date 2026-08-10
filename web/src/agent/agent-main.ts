@@ -208,7 +208,7 @@ function onEvent(ev: AgentEvent): void {
     case "assistant":
       // The parsed turn supersedes the preview: same content, but split by a
       // parser that has seen the whole completion rather than a prefix of it.
-      finishStream(ev.text, ev.reasoning ?? "");
+      finishStream(ev.text, ev.reasoning ?? "", ev.toolCalls);
       break;
     case "tool-start": {
       endStream();
@@ -253,6 +253,26 @@ function onEvent(ev: AgentEvent): void {
       bubble("note", "context")!.textContent =
         `trimmed ${ev.messages} older message(s) to stay inside this model's prompt budget (now ~${ev.chars} chars)`;
       break;
+    case "budget":
+      endStream();
+      if (ev.reason === "device-lost") {
+        // The retry is about to sit through a full reload, so say what is
+        // happening — otherwise it reads as a hang partway through an answer.
+        setStatus("rebuilding the model session after a GPU error…");
+        bubble("note", "gpu")!.textContent =
+          `the GPU ran out of memory prefilling ~${ev.was} chars of prompt, which takes the inference ` +
+          `session with it. Rebuilding it and retrying this turn with a ${ev.chars}-char budget; ` +
+          `this model will start there on this machine from now on.`;
+        // A device loss is the only hard evidence anyone has about what this
+        // GPU can really prefill — the registry's ceiling is arithmetic from a
+        // different machine. Keep it.
+        settings.recordDeviceCeiling(ev.chars);
+      } else {
+        bubble("note", "context")!.textContent =
+          `~${ev.was} chars was more prompt than this model would take; retrying the turn with a ` +
+          `${ev.chars}-char budget.`;
+      }
+      break;
     case "stopped":
       endStream();
       bubble("note", "stopped")!.textContent =
@@ -294,8 +314,15 @@ function renderStream(p: StreamPreview): void {
   scrollLog();
 }
 
-/** Replaces the live view with the parsed one and closes the bubble. */
-function finishStream(text: string, reasoning: string): void {
+/**
+ * Replaces the live view with the parsed one and closes the bubble.
+ *
+ * `toolCalls` only affects what the reasoning summary says. A reasoning model
+ * calling a tool produces a turn with no prose in it at all, which is a working
+ * turn and used to be labelled "stopped without answering" — describing the
+ * normal shape of an agentic turn as a failure, once per tool call.
+ */
+function finishStream(text: string, reasoning: string, toolCalls = 0): void {
   if (!streaming && !text && !reasoning) {
     return;
   }
@@ -312,7 +339,9 @@ function finishStream(text: string, reasoning: string): void {
     think.body.textContent = reasoning;
     think.summary.textContent = text
       ? `thought first (${reasoning.length} chars)`
-      : `thought for ${reasoning.length} chars, then stopped without answering`;
+      : toolCalls > 0
+        ? `thought for ${reasoning.length} chars, then called ${toolCalls === 1 ? "a tool" : `${toolCalls} tools`}`
+        : `thought for ${reasoning.length} chars, then stopped without answering`;
   }
   endStream();
 }

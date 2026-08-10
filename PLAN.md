@@ -1894,6 +1894,70 @@ Also fixed here, found by the run: `fetch-model.ts` had no retries, and a 3.65 G
 single transient 504 from the hub on an *optional* file. It now retries 5xx and network failures with
 backoff, while 404 and 403 return immediately — an absent optional file must not cost four attempts.
 
+### 10.16 Where §10.10's ceiling was still wrong (2026-08-09)
+
+Two reports against LFM2.5 2.6B at q4, both after several tool calls, both from inside the budget
+§10.10 installed. They are the same mistake seen from opposite sides: **a character budget is not a
+token budget, and a token budget is not a memory budget.**
+
+**Firefox — the device died at a prompt the arithmetic allowed.** Elision had just trimmed to
+~12 318 characters, comfortably under LFM2.5's 12 580-character ceiling, and the prefill still took
+the device out: `WebGPU device error(3): Out of memory`, then `Failed to download data from buffer:
+Mapping WebGPU buffer failed: Invalid buffer` out of `OrtRun`. `PREFILL_LOGITS_BUDGET_BYTES` (1.5 GiB)
+was measured in **headless Chromium**, and it bounds exactly one allocation — the logits tensor —
+while the device is also holding ~1.85 GB of weights and a KV cache that grows with the conversation.
+Firefox is stricter about the total. The constant is not wrong so much as **not knowable in advance**:
+it is a property of the browser, the adapter and what else is resident, and no arithmetic over
+`vocab_size` can produce it.
+
+**Chrome — the retry re-sent the prompt it had just been refused.** The worker measured 3198 tokens
+against its 3145-token ceiling and refused, correctly and harmlessly. The loop then converted 3145
+tokens to characters at `CHARS_PER_TOKEN_ESTIMATE` (4) → 12 580, compared it against a prompt of
+~12 300, concluded it was already inside budget, elided **nothing**, and sent the identical prompt
+again. The estimate was the bug: that conversation — paths, `find` output, exit codes — ran at
+**3.85 chars/token**, and the error is in the direction that makes a refused prompt look acceptable.
+`attempt === 0` then ended the turn on the second refusal.
+
+**The fix, in three parts.**
+
+1. **The refusal now carries both numbers.** `ModelResponse.error` gained `promptTokens` beside
+   `limitTokens`, so the loop can divide the characters it sent by the tokens they became and get the
+   real ratio for *this* conversation instead of the registry's estimate. The retry aims 5% under the
+   ceiling at that ratio (`PROMPT_RETRY_MARGIN`).
+2. **A new budget is always below the prompt that failed.** `shrinkBudget()` clamps to `sent - 1`
+   whatever the arithmetic says, where `sent` is what the attempt actually contained rather than the
+   ceiling it was allowed. This is the invariant the Chrome failure violated, and it holds for both
+   codes.
+3. **`device-lost` is retried, once, like `prompt-too-long`.** The worker already dropped the session
+   and rebuilds it on the next request (§10.10 part 4) — but nothing ever *made* a next request, so
+   the rebuild was paid for by the user's following message, which failed at the same size. The loop
+   now halves the budget to below what died and retries the turn itself: one slow turn (a reload from
+   the IndexedDB cache) instead of a dead one. Each code gets exactly one retry per generation.
+
+**And the ceiling is now learned rather than only computed.** A device loss is the only hard evidence
+anyone has about what a given GPU can really prefill, so the budget it recovered at is stored per
+model key under `smolbox.prefill-ceilings` and `Settings.defaultOf` takes the **lower** of it and the
+registry's arithmetic. The second session on a machine starts where the first one finished learning.
+It is kept apart from `smolbox.config` deliberately: that key holds choices the user made, this one
+holds a measurement the page took by hitting a wall.
+
+**Not fixed, and worth knowing.** The rebuild happens inside the model worker, on the same
+onnxruntime wasm module and therefore the same WebGPU device. That is the right bet for an
+out-of-memory error — the allocation failed, the device did not go away, and disposing the sessions
+returns the memory — but if a browser ever genuinely *loses* the device, the reload will succeed and
+the retry will fail again, and only tearing down the whole worker would help. The loop reports it
+after one retry rather than looping.
+
+Coverage, all GPU-free and in CI (`conversation.test.ts`): a refusal shrinking the prompt even when
+the char estimate says it fits (the Chrome case, with its real numbers), a device loss retried at
+half the size and completing the turn, a second device loss ending the turn instead of rebuilding
+forever, and the floor (`MIN_PROMPT_BUDGET_CHARS`) holding.
+
+Separately, from the same transcript: a reasoning model's tool-call turn has no prose in it, and the
+page labelled every one of them *"thought for 548 chars, then stopped without answering"* — a working
+turn described as a failure, once per tool call. The `assistant` event now carries `toolCalls` and
+the summary says what actually happened.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

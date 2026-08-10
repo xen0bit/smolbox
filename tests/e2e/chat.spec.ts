@@ -25,6 +25,8 @@ interface AgentEvent {
   rendered?: string;
   exitCode?: number;
   messages?: number;
+  was?: number;
+  chars?: number;
   call?: { name: string; args: Record<string, unknown> };
   request?: { cmd?: string; max_output?: number };
 }
@@ -299,6 +301,65 @@ test.describe("agent chat loop", () => {
       await expect(bubble.locator(".think-body")).toContainText("Let me consider");
       // The deliberation is not presented in the same voice as an answer.
       await expect(bubble.locator(".prose")).toHaveText("");
+    });
+  });
+
+  // PLAN §10.16. Both failures were reported against a real GPU and neither can
+  // be provoked on a runner, so the model client scripts them; everything above
+  // it — the shrunken budget, the retry, the note on the page, the ceiling that
+  // outlives the session — is the same code a real device drives.
+  test.describe("recovering from the GPU", () => {
+    const budgetInput = "#opt-history";
+    const learned = (page: import("@playwright/test").Page) =>
+      page.evaluate(() => localStorage.getItem("smolbox.prefill-ceilings"));
+
+    test("a device loss retries the turn instead of ending it", async ({ page }) => {
+      const events = await send(page, "gpu dies now");
+
+      // The turn produced an answer, from the rebuilt session.
+      expect(events.find((e) => e.kind === "assistant")?.text).toContain("second attempt");
+      // And not an error: the failure was answered, not reported.
+      expect(kinds(events)).not.toContain("error");
+
+      const budget = events.find((e) => e.kind === "budget")!;
+      expect(budget.reason).toBe("device-lost");
+      expect(budget.chars!).toBeLessThan(budget.was!);
+
+      // The page says what happened, because the retry is otherwise tens of
+      // seconds of a model reload with nothing on screen.
+      await expect(page.locator("#log .msg.note").last()).toContainText("ran out of memory");
+    });
+
+    test("the size the GPU died at is remembered for next time", async ({ page }) => {
+      const events = await send(page, "gpu dies now");
+      const budget = events.find((e) => e.kind === "budget")!;
+
+      const stored = JSON.parse((await learned(page))!) as Record<string, number>;
+      expect(stored["lfm2.5-2.6b"]).toBe(budget.chars!);
+      // The dialog shows the learned ceiling, not the registry's arithmetic.
+      await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
+
+      // And it is still there in the next session, which is the whole point:
+      // the first chat on a machine pays for the discovery, no later one does.
+      await page.reload();
+      await page.waitForFunction(() => Boolean((globalThis as AgentGlobal).__smolagent));
+      await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
+    });
+
+    test("a refusal the estimate believed was in budget still shrinks the prompt", async ({ page }) => {
+      const events = await send(page, "too long for you");
+
+      expect(events.find((e) => e.kind === "assistant")?.text).toContain("shorter prompt");
+      expect(kinds(events)).not.toContain("error");
+
+      const budget = events.find((e) => e.kind === "budget")!;
+      expect(budget.reason).toBe("prompt-too-long");
+      // 3145 tokens is 12 580 chars at the registry's estimate — more than the
+      // prompt that was just refused, which is exactly how the retry used to
+      // re-send it unchanged.
+      expect(budget.chars!).toBeLessThan(budget.was!);
+      // A refusal damaged nothing, so it teaches the machine nothing either.
+      expect(await learned(page)).toBeNull();
     });
   });
 });

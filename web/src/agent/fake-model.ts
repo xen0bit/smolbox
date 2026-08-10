@@ -10,7 +10,15 @@
 // only ever seen well-formed turns will not survive a real one (PLAN §10.8,
 // risk 17).
 
-import type { GenerateRequest, GenerateResult, LoadOptions, LoadResult, ModelClient } from "./model-client.ts";
+import type { ModelErrorCode } from "./messages.ts";
+import {
+  ModelError,
+  type GenerateRequest,
+  type GenerateResult,
+  type LoadOptions,
+  type LoadResult,
+  type ModelClient,
+} from "./model-client.ts";
 
 /** One scripted turn. `when` is matched against the last user message. */
 export interface FakeTurn {
@@ -18,6 +26,16 @@ export interface FakeTurn {
   text: string;
   /** Milliseconds to spend "generating", for testing the stop button. */
   delayMs?: number;
+  /**
+   * Fail this turn instead of answering it.
+   *
+   * The two codes the loop knows how to answer are the two things a real model
+   * does that the page has to survive, and neither can be provoked without a
+   * GPU: a refusal measured by the real tokenizer, and a device that dies
+   * mid-prefill (PLAN §10.16). Scripting them is what lets the recovery — the
+   * shrunken budget, the rebuild, the learned ceiling — run in CI.
+   */
+  fail?: { code: ModelErrorCode; message?: string; limitTokens?: number; promptTokens?: number };
 }
 
 export interface FakeScript {
@@ -55,6 +73,17 @@ export class FakeModelClient implements ModelClient {
       this.queue = [...(this.pick(user)?.turns ?? [FALLBACK])];
     }
     const turn = this.queue.shift() ?? FALLBACK;
+    if (turn.fail) {
+      // Thrown before a token is emitted, as both real failures are: the
+      // refusal happens before the forward pass, and a device that dies in
+      // prefill dies before the first token too.
+      throw new ModelError(
+        turn.fail.message ?? `scripted ${turn.fail.code}`,
+        turn.fail.code,
+        turn.fail.limitTokens,
+        turn.fail.promptTokens,
+      );
+    }
 
     // Stream in chunks so the UI's incremental path and the tool-call hold-back
     // (which must not render half a call) are genuinely exercised.
