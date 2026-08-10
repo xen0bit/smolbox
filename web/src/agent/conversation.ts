@@ -88,8 +88,8 @@ export interface ConversationOptions {
    * history, and the serialised tool schema together.
    *
    * It covers the tool schema because that is prompt text too (see
-   * overheadChars), and the thing it is protecting — the prefill allocation in
-   * models.ts — does not care which part of the prompt the tokens came from.
+   * overheadChars), and the thing it is protecting — the checkpoint's context
+   * window — does not care which part of the prompt the tokens came from.
    */
   promptBudgetChars: number;
   /**
@@ -114,10 +114,10 @@ export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dia
   perCallMaxOutput: 4096,
   maxNewTokens: 512,
   // A floor, not a recommendation: the page replaces this with the selected
-  // checkpoint's own prefill ceiling (models.ts maxPromptChars) as soon as a
-  // model is chosen. 24_000 was the old flat default and is what let LFM2.5
-  // prefill itself to death, so it is deliberately no longer the largest number
-  // any model runs with.
+  // checkpoint's own ceiling (models.ts maxPromptChars) as soon as a model is
+  // chosen. It stays low because this value is what a loop with no model
+  // selected runs with, and the one thing worse than a short prompt is a long
+  // one sent to a checkpoint nobody has checked the context window of.
   promptBudgetChars: 16_000,
 };
 
@@ -453,7 +453,7 @@ export class Conversation {
    * run_terminal_command alone is ~2.3 KB, and a user who enables several
    * template tools can add ten times that to a prompt the budget still believes
    * is empty. Counting it is what makes promptBudgetChars mean "the prompt",
-   * which is what the prefill ceiling in models.ts is actually about.
+   * which is what the ceiling in models.ts is actually about.
    */
   private overheadChars(): number {
     if (this.toolsCache?.tools !== this.opts.tools) {

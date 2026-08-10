@@ -265,8 +265,11 @@ function onEvent(ev: AgentEvent): void {
           `session with it. Rebuilding it and retrying this turn with a ${ev.chars}-char budget; ` +
           `this model will start there on this machine from now on.`;
         // A device loss is the only hard evidence anyone has about what this
-        // GPU can really prefill — the registry's ceiling is arithmetic from a
-        // different machine. Keep it.
+        // GPU can really hold — the registry's ceiling is a context window, and
+        // chunked prefill was supposed to have made this unreachable. Reaching
+        // it means the residency this page cannot measure (weights, KV cache,
+        // whatever else is on the adapter) is the binding constraint here. Keep
+        // the number.
         settings.recordDeviceCeiling(ev.chars);
       } else {
         bubble("note", "context")!.textContent =
