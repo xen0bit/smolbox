@@ -2156,6 +2156,88 @@ attributing a failure to the layer that reported it. `std::bad_alloc` from onnxr
 onnxruntime's limit any more than a `shader-f16` refusal was the GPU's; it is the shape of what it
 was handed. Ask what was requested before concluding what is impossible.
 
+### 10.19 Qwen3 1.7B removed, and what the hub has to replace it (2026-08-10)
+
+§10.18 established that **no** published build of `onnx-community/Qwen3-1.7B-ONNX` loads in a
+browser. An entry whose every dtype makes `pickDtype` return undefined is a menu item nobody can
+order: the page renders it, the reader picks it, and the only thing that happens is a refusal. It is
+now removed. The rules it motivated are not — `inlineBytes`, `INLINE_WEIGHT_CEILING_BYTES` and the
+two-reason shape of `dtypeBlockers()` are all still there, exercised by a synthetic fixture in
+`models.test.ts` rather than by a shipped entry, which is where a rule about *any* build belongs.
+`oversizedF16Entry()` keeps Qwen3's measured 1.43 GB so the assertions read in real numbers.
+
+Registry: 6 entries → **5**. Unit tests 410 → 410 (the qwen3 cases were rewritten, not dropped).
+
+**Kept deliberately: Qwen2.5 0.5B Instruct.** It loads — 786 MB, measured, and the only entry the
+IndexedDB cache e2e runs against — it just is not a good agent (§10.11). "Does not load" and "loads
+and is bad" are different removals and only the first one happened here.
+
+#### The survey: what is on the hub now, against these constraints
+
+Four constraints decide this, and only the first is about the model being good:
+
+1. a dtype that is not f16, since no adapter here exposes `shader-f16` (§10.14, §10.17);
+2. either a `.onnx_data` sidecar **or** a single `.onnx` under ~1 GB (§10.18);
+3. a tool-call grammar one of the five dialects already parses, or the honest cost of a sixth;
+4. a vocabulary small enough that the prefill ceiling leaves a usable prompt (§10.10, §10.16).
+
+Constraint 4 is the one that is easy to forget and hardest to work around, so here it is as a table —
+`1.5 GiB / (vocab × 4)`, the prompt tokens a full-sequence-logits export can take:
+
+| `vocab_size` | prompt tokens |
+|---|---|
+| 65 536 | 6144 |
+| 100 352 | 4012 |
+| 131 072 | 3072 |
+| 151 936 | 2650 |
+| 262 144 | 1536 |
+
+**Recommended, in order.**
+
+- **`onnx-community/LFM2.5-350M-ONNX`** (`2c07371c…`) — `Lfm2ForCausalLM`, vocab 65 536, q4 is a
+  4 KB graph plus a **294 MB** sidecar. Six times smaller than the current default for a model that
+  still writes real tool calls. **Its dialect is `lfm2`, not `lfm2.5`** — the card documents Pythonic
+  calls between `<|tool_call_start|>` and `<|tool_call_end|>`, which is exactly `lfm2.ts`, and its
+  chat template ends the generation prompt with a bare `<|im_start|>assistant\n` where the 2.6B ends
+  with `assistant\n<think>`. It does not reason, so `lfm2.5`'s prompt-opened `splitThinking` would be
+  wrong on it. This is §10.2's rule paying out again: the name says 2.5, the grammar says 2. Card
+  sampling: temperature 0.1, top-k 50, repetition penalty 1.05. Card says 32 768 context where
+  `config.json` says 128 000 — believe the card.
+- **`onnx-community/Qwen3-0.6B-Instruct-ONNX`** (`54250909…`) — `Qwen3ForCausalLM`, the verified
+  `hermes` grammar (`<tool_call>`, `<tool_response>`, `<think>`), and the one candidate that would
+  **close the gap AGENTS.md still records**: `hermes`'s `<think>` path is uncaptured because Qwen2.5
+  does not reason and Qwen3 1.7B could not be run. This one reasons and does load. The catch is
+  constraint 2 — `transformers.js_config` is null, so there is **no sidecar**, and q4 is a single
+  997 MB file, 3 MB under the ceiling that `std::bad_alloc` sits behind. That margin is not a
+  margin. List `q8` (754 MB, `model_quantized.onnx`) first and treat q4 as the gamble it is. Vocab
+  151 936 → 2650 prompt tokens.
+
+**Considered and rejected, with the reason** — these are the useful half, because each one looks
+plausible from its name or its download count:
+
+| candidate | why not |
+|---|---|
+| `onnx-community/Bonsai-1.7B-ONNX` | 8826 downloads, the most of any recent export, and it is a trap: the base is `Bonsai-1.7B-**unpacked**`, an fp16 re-inflation of a 1-bit model whose own authors say "the 1-bit format is where all the benefits come from" and discourage this repo. No documented tool calling. |
+| `onnx-community/granite-4.0-h-1b-ONNX` | `GraniteMoeHybridForCausalLM`, and the repo carries **no `transformers.js` tag and no `library_name`** — the only candidate surveyed that does not. Sizes are fine; support is the question, and the hub's own metadata answers it. |
+| `onnx-community/Apertus-v1.1-*-Instruct-ONNX` | Tools reach the template as a pre-formatted `developer_content.formatted_tools` string, not the standard `tools=` schema list, so `apply_chat_template(tools=…)` does not populate them. Context is **4096**. |
+| `onnx-community/functiongemma-270m-it-ONNX` | Purpose-built for function calling like LFM2 1.2B Tool, 801 MB sharded q4 — but a **sixth dialect**: `<start_function_call>call:name{arg:<escape>v<escape>}<end_function_call>`, matching nothing here. Google's card says it is "not intended for use as a direct dialogue model" and expects fine-tuning. Vocab 262 144 → 1536 prompt tokens. Revisit only if a purpose-built caller is wanted enough to pay for the dialect. |
+| `emb1ter/RhymeAI-Gemma-4-E4B-v3-ONNX-WebGPU` | Publishes **q4f16 only**. Constraint 1, decided before anything is downloaded. |
+| `nicolasembleton/LFM2.5-2.6B-ToolACE-n3000-ONNX` | A ToolACE tool-calling tune of the current default, which is the interesting idea here — published **fp32 only, 11.8 GB**. |
+| `onnx-community/LFM2-8B-A1B-ONNX`, `LFM2-24B-A2B-ONNX` | q4 is 5.3 GB across three shards, and up. |
+
+**One worth a second look: `LiquidAI/LFM2.5-230M-ONNX`** (`c6f46e4e…`, vendor-published, same
+provenance argument that chose Liquid's own 2.6B build). Vocab 65 536, q4 a **211 MB** sidecar. It
+also ships **`q4f32`** (403 MB), and that is a name this registry cannot currently express: `Dtype`
+is `q4 | q4f16 | fp16 | q8 | fp32` and `DTYPE_SUFFIX` has no `_q4f32`. §10.18's lesson about naming
+the same file as transformers.js applies — adding the dtype is a two-line change, guessing it is a
+404.
+
+**Nothing here has been loaded.** This is a paper survey off model cards, `config.json`,
+`transformers.js_config` and blob sizes — which is exactly enough to *reject* on constraints 1, 2 and
+4, and not enough to *add*. AGENTS.md's rule stands: a registry entry must name a build that actually
+loads, and `Dialect.verified` needs a transcript, not a card. Each recommendation above is a
+candidate for a `make model` pull and a real turn on `/agent/`, in that order.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

@@ -4,7 +4,7 @@
 // thing that loads them cannot disagree.
 //
 //   bun web/fetch-model.ts                        # the default entry
-//   bun web/fetch-model.ts qwen3-1.7b             # a specific one
+//   bun web/fetch-model.ts lfm2-1.2b-tool         # a specific one
 //   bun web/fetch-model.ts gemma4-e2b-onnx --dtype q4   # a non-default build
 //   bun web/fetch-model.ts --list
 //   bun web/fetch-model.ts --keys              # downloadable keys, for `make models`

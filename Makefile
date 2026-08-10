@@ -109,7 +109,7 @@ web:
 # Pulls a registry checkpoint into dist/models (gitignored). The agent page
 # prefers it and falls back to the HF CDN when it is absent.
 #   make model                  the default entry (LFM2.5 2.6B, 1.85 GB)
-#   make model MODEL=qwen3-1.7b a specific one
+#   make model MODEL=lfm2-1.2b-tool  a specific one
 #   make model MODEL=--list     what is on offer
 #   make model MODEL="gemma4-e2b-onnx --dtype q4"   a build other than the
 #     entry's preferred one, for an adapter that cannot run the preferred one
