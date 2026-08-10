@@ -14,6 +14,24 @@ import {
   weightFiles,
 } from "./models.ts";
 
+/**
+ * A build that is both oversized-inline and f16-gated.
+ *
+ * Qwen3 1.7B was the registry's live example of this until it was removed as
+ * unloadable (§10.19), and the two-reason path is exactly the one that must not
+ * rot with whatever is shipped today — an earlier cut reported only the feature
+ * and sent the reader after a GPU that would not help. Its measured q4f16 size
+ * is kept because the assertions read in GB and the number should stay a real
+ * one.
+ */
+function oversizedF16Entry() {
+  return {
+    ...modelFor("lfm2-1.2b-tool"),
+    dtypes: ["q4f16" as const],
+    inlineBytes: { q4f16: 1_426_069_098 },
+  };
+}
+
 describe("model registry", () => {
   test("every entry declares the fields the page cannot work without", () => {
     for (const m of models) {
@@ -164,12 +182,15 @@ describe("pickDtype", () => {
   });
 
   test("skips a build too large to load with its weights inline", () => {
-    // Qwen3 publishes every variant as one undivided .onnx and the smallest is
-    // still 1.43 GB, so no adapter can run it — the feature it also wants is
-    // beside the point (PLAN §10.18).
-    const qwen3 = modelFor("qwen3-1.7b");
-    expect(pickDtype(qwen3, new Set())).toBeUndefined();
-    expect(pickDtype(qwen3, new Set(["shader-f16"]))).toBeUndefined();
+    // Synthetic, for the same reason as the f16-only case above: Qwen3 1.7B was
+    // this rule's live example until it was removed as unloadable (§10.19), and
+    // the rule has to outlive whichever entry happens to trip it. Shaped like
+    // that one — every variant a single undivided .onnx, the smallest still
+    // 1.43 GB — so no adapter can run it and the feature it also wants is beside
+    // the point (PLAN §10.18).
+    const oversized = oversizedF16Entry();
+    expect(pickDtype(oversized, new Set())).toBeUndefined();
+    expect(pickDtype(oversized, new Set(["shader-f16"]))).toBeUndefined();
   });
 
   test("a bigger dtype wins when it is the one that runs everywhere", () => {
@@ -191,7 +212,7 @@ describe("dtypeBlockers", () => {
   });
 
   test("names the size, and says a different GPU will not help", () => {
-    const reasons = dtypeBlockers(modelFor("qwen3-1.7b"), "q4f16", new Set(["shader-f16"]));
+    const reasons = dtypeBlockers(oversizedF16Entry(), "q4f16", new Set(["shader-f16"]));
     expect(reasons).toHaveLength(1);
     expect(reasons[0]).toContain("1.43 GB");
     expect(reasons[0]).toContain("external data");
@@ -199,10 +220,10 @@ describe("dtypeBlockers", () => {
   });
 
   test("reports BOTH when a dtype is oversized and needs a feature", () => {
-    // Qwen3's q4f16 is the case that matters: reporting only shader-f16 sends
-    // the reader after a GPU that would not fix it. Size leads, because it is
-    // the reason no hardware change can answer.
-    const reasons = dtypeBlockers(modelFor("qwen3-1.7b"), "q4f16", new Set());
+    // The case that matters: reporting only shader-f16 sends the reader after a
+    // GPU that would not fix it. Size leads, because it is the reason no
+    // hardware change can answer.
+    const reasons = dtypeBlockers(oversizedF16Entry(), "q4f16", new Set());
     expect(reasons).toHaveLength(2);
     expect(reasons[0]).toContain("1.43 GB");
     expect(reasons[1]).toContain("shader-f16");

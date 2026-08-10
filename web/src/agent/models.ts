@@ -256,41 +256,6 @@ export const models: ModelEntry[] = [
     note: "Verifies the dialect, not the workflow: it emits correct call syntax but usually invents a tool name instead of using the one it has.",
   },
   {
-    key: "qwen3-1.7b",
-    label: "Qwen3 1.7B",
-    repo: "onnx-community/Qwen3-1.7B-ONNX",
-    revision: "cc6a06a21d614e9b8e92a6adfab1074d4e7d2438",
-    // The largest vocabulary here, so the tightest prompt budget.
-    vocabSize: 151_936,
-    // ONE candidate, and no build of this checkpoint loads in a browser — which
-    // is not what this entry said until §10.18. Every variant is published as
-    // one undivided .onnx, and all four were measured on a 16 GB RTX 4070 Ti
-    // SUPER:
-    //
-    //   q4 (2.147 GB) — transformers.js reads a weight file into a single
-    //     Uint8Array before onnxruntime sees it: "RangeError: Array buffer
-    //     allocation failed" out of readResponse.
-    //   q8 (1.742 GB, model_quantized.onnx) — reads fine, then onnxruntime
-    //     cannot build a session inside the wasm heap: "Can't create a session.
-    //     ERROR_CODE: 6, std::bad_alloc".
-    //   q4f16 (1.43 GB) — the SAME std::bad_alloc. This entry previously said
-    //     q4f16 "does" load and was held back only by shader-f16. It was never
-    //     measured; it does not. A GPU that exposed the feature would not help.
-    //
-    // So the blocker is the inline-weight ceiling, not the adapter, and
-    // `inlineBytes` below is what makes pickDtype say so. Unblocking this needs
-    // a re-export with external data (a `.onnx_data` sidecar) — the move that
-    // turned a 1.82 GB unloadable export into an 8-second load (PLAN §10.18) —
-    // not a different GPU and not a different dtype.
-    dtypes: ["q4f16"],
-    inlineBytes: { q4f16: 1_426_069_098 },
-    approxBytes: 1_430_000_000,
-    // 40960 at the pinned revision, not the 32768 this entry claimed.
-    contextTokens: 40_960,
-    dialect: "hermes",
-    note: "Emits <think> blocks. Unloadable in a browser: every published build is one file too large for the wasm heap. Needs a re-export with external data.",
-  },
-  {
     key: "gemma4-e2b",
     label: "Gemma 4 E2B (QAT mobile, WebGPU kernels)",
     // The checkpoint the kernel engine is built for: safetensors, no ONNX
@@ -483,8 +448,11 @@ export function modelFor(key: string): ModelEntry {
  * All of them, not the first, because the two causes are independent and need
  * opposite responses: a missing adapter feature means try another machine, an
  * oversized inline file means the build needs re-exporting and no machine will
- * help. Qwen3's q4f16 has both, and reporting only the feature — as an earlier
- * cut of this did — sends the reader hunting for a GPU that would not fix it.
+ * help. Qwen3 1.7B's q4f16 had both — reporting only the feature, as an earlier
+ * cut of this did, sent the reader hunting for a GPU that would not fix it. That
+ * entry has since been removed as unloadable (§10.19), but a build with both
+ * problems is the case this shape exists for, so both paths stay covered by
+ * synthetic fixtures in models.test.ts rather than by whatever is shipped today.
  */
 export function dtypeBlockers(
   entry: ModelEntry,

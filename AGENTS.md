@@ -400,10 +400,12 @@ Four things that are easy to get wrong here, all covered by `web/serve.test.ts`:
 Two failures live here and neither is visible from a model card. transformers.js reads a weight file
 into **one `Uint8Array`** before onnxruntime sees it, so a checkpoint published as a single large
 `.onnx` with no external data blob dies in `readResponse`; and a file that does read can still fail
-`std::bad_alloc` when ORT builds the session inside the wasm heap. Qwen3 1.7B hits both (q4 at
-2.147 GB, q8 at 1.742 GB) and is therefore listed with **q4f16 only** — `pickDtype` returning
-undefined and the page saying so beats a 2 GB download that fails nine frames deep. Do not add a
-dtype back "for headless" without loading it.
+`std::bad_alloc` when ORT builds the session inside the wasm heap. Qwen3 1.7B hit both (q4 at
+2.147 GB, q8 at 1.742 GB) and its last candidate, q4f16 at 1.43 GB, hit the second as well — so
+**every** published build failed and the entry was removed at §10.19. `pickDtype` returning undefined
+and the page saying so beats a 2 GB download that fails nine frames deep, but an entry where that is
+the answer for every dtype is a menu item nobody can order: prefer removing it and recording why. Do
+not add a dtype back "for headless" without loading it.
 
 `weightFiles()` mirrors transformers.js' `DEFAULT_DTYPE_SUFFIX_MAPPING` and is **not** the identity:
 `q8` is `model_quantized.onnx`, `fp32` is a bare `model.onnx`. The fetcher and the loader must name
@@ -434,9 +436,10 @@ capturing a real transcript, never by reading a vendor doc — that is the M8 le
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
 and **no published build of Qwen3 1.7B loads in a browser at all** — every variant is one undivided
-`.onnx` and the smallest is 1.43 GB, over the inline-weight ceiling (§10.18). This entry used to
-blame `shader-f16`; that was never measured and is not the binding constraint, so a GPU exposing the
-feature would not capture this transcript. A re-export with external data would. `gemma4` was
+`.onnx` and the smallest is 1.43 GB, over the inline-weight ceiling (§10.18), which is why that entry
+is gone (§10.19). It used to blame `shader-f16`; that was never measured and is not the binding
+constraint, so a GPU exposing the feature would not capture this transcript. A re-export with
+external data would, as would any reasoning checkpoint in the hermes grammar that ships sharded. `gemma4` was
 promoted at PLAN §10.15 off five real turns of the ONNX build; §10.17 then ran the *kernel* build
 through the same spec, so both entries that share the grammar have now emitted real tool calls. `lfm2.5` shares LFM2's verified call markers but is its
 own entry because the checkpoint always reasons first: its chat template ends the generation prompt
