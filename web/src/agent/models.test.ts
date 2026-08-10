@@ -5,6 +5,7 @@ import {
   CHARS_PER_TOKEN_ESTIMATE,
   MAX_EXTERNAL_DATA_SHARDS,
   PREFILL_LOGITS_BUDGET_BYTES,
+  dtypeBlockers,
   models,
   maxPromptChars,
   maxPromptTokens,
@@ -157,5 +158,61 @@ describe("pickDtype", () => {
   test("returns undefined when nothing on offer runs here", () => {
     expect(pickDtype(modelFor("antares-1b"), new Set())).toBeUndefined();
     expect(pickDtype(modelFor("antares-1b"), new Set(["shader-f16"]))).toBe("fp16");
+  });
+
+  test("skips a build too large to load with its weights inline", () => {
+    // Qwen3 publishes every variant as one undivided .onnx and the smallest is
+    // still 1.43 GB, so no adapter can run it — the feature it also wants is
+    // beside the point (PLAN §10.18).
+    const qwen3 = modelFor("qwen3-1.7b");
+    expect(pickDtype(qwen3, new Set())).toBeUndefined();
+    expect(pickDtype(qwen3, new Set(["shader-f16"]))).toBeUndefined();
+  });
+
+  test("prefers Antares 350M's fp32, the build that needs no adapter feature", () => {
+    // The sharded fp32 is the whole point of §10.18: it is bigger than fp16 and
+    // it is chosen first anyway, because it is the one that runs everywhere.
+    expect(pickDtype(modelFor("antares-350m"), new Set())).toBe("fp32");
+    expect(pickDtype(modelFor("antares-350m"), new Set(["shader-f16"]))).toBe("fp32");
+  });
+});
+
+describe("dtypeBlockers", () => {
+  test("names the adapter feature when that is the only thing missing", () => {
+    const reasons = dtypeBlockers(modelFor("antares-1b"), "fp16", new Set());
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain("shader-f16");
+    expect(reasons[0]).not.toContain("external data");
+  });
+
+  test("names the size, and says a different GPU will not help", () => {
+    const reasons = dtypeBlockers(modelFor("qwen3-1.7b"), "q4f16", new Set(["shader-f16"]));
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain("1.43 GB");
+    expect(reasons[0]).toContain("external data");
+    expect(reasons[0]).toContain("not a different GPU");
+  });
+
+  test("reports BOTH when a dtype is oversized and needs a feature", () => {
+    // Qwen3's q4f16 is the case that matters: reporting only shader-f16 sends
+    // the reader after a GPU that would not fix it. Size leads, because it is
+    // the reason no hardware change can answer.
+    const reasons = dtypeBlockers(modelFor("qwen3-1.7b"), "q4f16", new Set());
+    expect(reasons).toHaveLength(2);
+    expect(reasons[0]).toContain("1.43 GB");
+    expect(reasons[1]).toContain("shader-f16");
+  });
+
+  test("is empty for a dtype that runs", () => {
+    expect(dtypeBlockers(modelFor("lfm2-1.2b-tool"), "q4", new Set())).toEqual([]);
+    expect(dtypeBlockers(modelFor("antares-350m"), "fp32", new Set())).toEqual([]);
+  });
+
+  test("only entries with inlineBytes can be blocked on size", () => {
+    // A checkpoint with a .onnx_data sidecar streams and has no inline ceiling.
+    // Gemma 4's ONNX build is 3.6 GB and loads, so it must never be filtered.
+    const gemma = modelFor("gemma4-e2b-onnx");
+    expect(gemma.inlineBytes).toBeUndefined();
+    expect(dtypeBlockers(gemma, "q4", new Set())).toEqual([]);
   });
 });
