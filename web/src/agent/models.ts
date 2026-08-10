@@ -154,6 +154,20 @@ export interface ModelEntry {
    * of the two you are actually looking at.
    */
   requiresFeatures?: string[];
+  /**
+   * Per-dtype size of the single `.onnx` file, for builds with no sidecar.
+   *
+   * Only needed where a build keeps its weights INLINE in the graph file. A
+   * checkpoint with a `.onnx_data` sidecar streams and has no such limit — Gemma
+   * 4's 3.6 GB loads fine — so those entries leave this unset.
+   *
+   * Present so {@link pickDtype} can skip a build the browser cannot load,
+   * exactly as it skips f16 on an adapter without the feature. Both are the same
+   * question ("can this environment run this file?") and both are better
+   * answered before the download than after it. See
+   * {@link INLINE_WEIGHT_CEILING_BYTES}.
+   */
+  inlineBytes?: Partial<Record<Dtype, number>>;
   /** How its weights are laid out in the repo. Absent means the ONNX layout. */
   weights?: WeightLayout;
   /**
@@ -167,6 +181,32 @@ export interface ModelEntry {
 
 /** Quantizations that need `shader-f16` on the adapter. */
 export const F16_DTYPES: ReadonlySet<Dtype> = new Set<Dtype>(["q4f16", "fp16"]);
+
+/**
+ * The largest `.onnx` a browser can load with its weights inline.
+ *
+ * Two walls stacked, and neither is the GPU. transformers.js reads a weight file
+ * into ONE Uint8Array before onnxruntime sees any of it, and onnxruntime then
+ * builds the session inside the wasm heap. Measured here, all single-file
+ * (PLAN §10.18):
+ *
+ * | file | result |
+ * |---|---|
+ * | 786 MB — Qwen2.5 0.5B q4 | loads and runs |
+ * | 1.43 GB — Qwen3 1.7B q4f16 | `Can't create a session`, std::bad_alloc |
+ * | 1.74 GB — Qwen3 1.7B q8 | std::bad_alloc |
+ * | 1.82 GB — Antares 350M fp32 | std::bad_alloc |
+ * | 2.15 GB — Qwen3 1.7B q4 | `RangeError` out of readResponse |
+ *
+ * Set between the largest that works and the smallest that does not. It is a
+ * property of the runtime rather than of this machine — nothing here scales with
+ * GPU memory, which is why a 16 GB card does not move it.
+ *
+ * The fix for a build over this line is a sidecar, not a smaller quantization:
+ * the same 1.82 GB Antares graph re-saved with external data loads in 8.0 s and
+ * generates. `tools/quantize_onnx.py` now shards on this rule.
+ */
+export const INLINE_WEIGHT_CEILING_BYTES = 1_000_000_000;
 
 export const models: ModelEntry[] = [
   {
@@ -237,10 +277,10 @@ export const models: ModelEntry[] = [
     revision: "cc6a06a21d614e9b8e92a6adfab1074d4e7d2438",
     // The largest vocabulary here, so the tightest prompt budget.
     vocabSize: 151_936,
-    // ONE candidate, and the only entry here that offers no non-f16 path. Both
-    // alternatives were measured on a 16 GB RTX 4070 Ti SUPER and both fail
-    // before a single token, because this checkpoint publishes every variant as
-    // one undivided .onnx:
+    // ONE candidate, and no build of this checkpoint loads in a browser — which
+    // is not what this entry said until §10.18. Every variant is published as
+    // one undivided .onnx, and all four were measured on a 16 GB RTX 4070 Ti
+    // SUPER:
     //
     //   q4 (2.147 GB) — transformers.js reads a weight file into a single
     //     Uint8Array before onnxruntime sees it: "RangeError: Array buffer
@@ -248,18 +288,22 @@ export const models: ModelEntry[] = [
     //   q8 (1.742 GB, model_quantized.onnx) — reads fine, then onnxruntime
     //     cannot build a session inside the wasm heap: "Can't create a session.
     //     ERROR_CODE: 6, std::bad_alloc".
+    //   q4f16 (1.43 GB) — the SAME std::bad_alloc. This entry previously said
+    //     q4f16 "does" load and was held back only by shader-f16. It was never
+    //     measured; it does not. A GPU that exposed the feature would not help.
     //
-    // Listing either would be offering a choice that cannot work. q4f16
-    // (1.43 GB) does, so it is the entry — and because it needs `shader-f16`,
-    // which no browser on this machine exposes (PLAN §2.11.24, §10.14),
-    // pickDtype returns undefined here and the page says so instead of failing
-    // deep inside ORT. That is the honest shape of this checkpoint in a browser.
+    // So the blocker is the inline-weight ceiling, not the adapter, and
+    // `inlineBytes` below is what makes pickDtype say so. Unblocking this needs
+    // a re-export with external data (a `.onnx_data` sidecar) — the thing that
+    // turned Antares 350M from unloadable into an 8-second load (PLAN §10.18) —
+    // not a different GPU and not a different dtype.
     dtypes: ["q4f16"],
+    inlineBytes: { q4f16: 1_426_069_098 },
     approxBytes: 1_430_000_000,
     // 40960 at the pinned revision, not the 32768 this entry claimed.
     contextTokens: 40_960,
     dialect: "hermes",
-    note: "Emits <think> blocks. Needs shader-f16: its other builds are single files too large for the wasm heap, so there is no fallback.",
+    note: "Emits <think> blocks. Unloadable in a browser: every published build is one file too large for the wasm heap. Needs a re-export with external data.",
   },
   {
     key: "antares-1b",
@@ -275,6 +319,16 @@ export const models: ModelEntry[] = [
     // scores 0.943 logit correlation on the Granite base model it came from —
     // better than onnx-community's own published q4 — and 0.816 on Antares,
     // which costs it the tool-call protocol entirely (PLAN §11.10).
+    //
+    // fp32 is deliberately NOT offered, unlike its 350M sibling. The build
+    // produces one (it is the parity reference) and it is correctly sharded, so
+    // it would load — but at 7.35 GB it did not finish doing so in ten minutes
+    // here, against 8.0 s for 350M's 1.82 GB (PLAN §10.18). Listing a dtype that
+    // technically works and practically hangs is worse than not listing it.
+    // This entry therefore still needs shader-f16, and is the one model in the
+    // registry that does. See §10.18 for the two ways out, both unmeasured: an
+    // int8 build (int4 is known to destroy it; int8 is untested), or a machine
+    // whose adapter exposes the feature.
     dtypes: ["fp16"],
     approxBytes: 3_676_884_858,
     contextTokens: 131_072,
@@ -290,8 +344,18 @@ export const models: ModelEntry[] = [
     repo: "fdtn-ai/antares-350m-ONNX",
     revision: "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
     vocabSize: 100_352,
-    dtypes: ["fp16"],
-    approxBytes: 911_780_067,
+    // fp32 first, and it is the only entry here that prefers it. Not a quality
+    // choice — it is the one build of this model that runs on an adapter without
+    // shader-f16, which fp16 by definition cannot. It became loadable when
+    // `make antares-onnx` started sharding on the browser's ceiling rather than
+    // protobuf's: the same 1.82 GB graph is unloadable inline and loads in 8.0 s
+    // with a sidecar (PLAN §10.18). Verified end to end at fp32 here — 8.0 s
+    // load, coherent generation.
+    //
+    // fp16 stays second and wins wherever the feature exists: half the bytes,
+    // and 0.999514 logit correlation against this same fp32 reference.
+    dtypes: ["fp32", "fp16"],
+    approxBytes: 1_821_708_714,
     contextTokens: 32_768,
     dialect: "antares",
     local: true,
@@ -492,14 +556,46 @@ export function modelFor(key: string): ModelEntry {
 }
 
 /**
- * The first candidate dtype the adapter can run.
+ * Every reason a dtype cannot run here. Empty means it can.
  *
- * Returns undefined when none are supported, which is a real outcome worth
- * surfacing rather than falling back to something that will fail deep inside
- * onnxruntime with an opaque message.
+ * All of them, not the first, because the two causes are independent and need
+ * opposite responses: a missing adapter feature means try another machine, an
+ * oversized inline file means the build needs re-exporting and no machine will
+ * help. Qwen3's q4f16 has both, and reporting only the feature — as an earlier
+ * cut of this did — sends the reader hunting for a GPU that would not fix it.
+ */
+export function dtypeBlockers(
+  entry: ModelEntry,
+  dtype: Dtype,
+  adapterFeatures: ReadonlySet<string>,
+): string[] {
+  const reasons: string[] = [];
+  const inline = entry.inlineBytes?.[dtype];
+  // Size first: it is the one no hardware change can answer, so it is the one
+  // that should lead.
+  if (inline !== undefined && inline > INLINE_WEIGHT_CEILING_BYTES) {
+    reasons.push(
+      `${dtype} is a single ${(inline / 1e9).toFixed(2)} GB .onnx, over the ` +
+        `${(INLINE_WEIGHT_CEILING_BYTES / 1e9).toFixed(1)} GB a browser can load with weights ` +
+        `inline — it needs re-exporting with external data, not a different GPU`,
+    );
+  }
+  if (F16_DTYPES.has(dtype) && !adapterFeatures.has("shader-f16")) {
+    reasons.push(`${dtype} needs the shader-f16 WebGPU feature, which this adapter does not expose`);
+  }
+  return reasons;
+}
+
+/**
+ * The first candidate dtype this environment can actually run.
+ *
+ * Returns undefined when none are, which is a real outcome worth surfacing
+ * rather than falling back to something that will fail deep inside onnxruntime
+ * with an opaque message — `std::bad_alloc` after a 1.4 GB download being the
+ * case that motivated the size half of this (PLAN §10.18).
  */
 export function pickDtype(entry: ModelEntry, adapterFeatures: ReadonlySet<string>): Dtype | undefined {
-  return entry.dtypes.find((d) => !F16_DTYPES.has(d) || adapterFeatures.has("shader-f16"));
+  return entry.dtypes.find((d) => dtypeBlockers(entry, d, adapterFeatures).length === 0);
 }
 
 // Files every transformers.js model needs, and the ones that only some repos

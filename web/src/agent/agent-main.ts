@@ -17,6 +17,7 @@ import {
   DEFAULT_MODEL_KEY,
   type Dtype,
   type ModelEntry,
+  dtypeBlockers,
   modelFor,
   models,
   pickDtype,
@@ -552,9 +553,13 @@ const handle: SmolagentHandle = {
     }
     const dtype = pickDtype(entry, features);
     if (!dtype) {
-      throw new Error(
-        `${entry.label}: none of its quantizations (${entry.dtypes.join(", ")}) run on this adapter`,
-      );
+      // Each dtype says why it was skipped rather than the set saying "no".
+      // The two causes need opposite responses — a missing adapter feature
+      // means try another machine, an oversized inline file means the build
+      // needs re-exporting and no machine will help (PLAN §10.18) — and a
+      // reader cannot tell them apart from "none of these run here".
+      const why = entry.dtypes.flatMap((d) => dtypeBlockers(entry, d, features));
+      throw new Error(`${entry.label} cannot run here: ${why.join("; ")}`);
     }
     if (!dialect.verified) {
       bubble("note", "unverified dialect")!.textContent =

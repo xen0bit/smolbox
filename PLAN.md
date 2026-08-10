@@ -2057,6 +2057,97 @@ the engine was where the constraint lived. "The device cannot do X" and "this co
 identical from the outside — both end in the same refusal — and the second is usually the one you can
 fix. Read what the code requests before concluding the hardware is the limit.
 
+
+### 10.18 The other models: it was never f16, it was the inline-weight ceiling (2026-08-10)
+
+§10.17 fixed the Gemma kernel build by rewriting three dtype choices. The obvious next question is
+whether the same move helps the rest of the registry. **It does not, and finding out why turned up a
+different constraint that was blocking more models than f16 ever was.**
+
+**Does onnxruntime actually need `shader-f16`, or is skipping f16 builds our own policy?** The same
+question §10.17 turned on, asked of the ONNX path. Measured by relaxing `pickDtype` and loading
+anyway:
+
+| build | what happened |
+|---|---|
+| Qwen2.5 0.5B **q4f16** (483 MB) | **loads**, then the first forward pass dies: `Program Gather requires f16 but the device does not support it` (`shader_helper.cc:401`) |
+| Antares 350M **fp16** | refused before loading, by transformers.js `session.js:71` → `isWebGpuFp16Supported()`, which is `adapter.features.has('shader-f16')` |
+
+So the answer is **yes, genuinely required** — unlike the Gemma kernels, where f16 was a choice made
+over a checkpoint that contained none. `F16_DTYPES` is correct and fires at the right moment.
+
+One nuance worth keeping: transformers.js guards only **pure `fp16`**, not `q4f16`. Without our own
+gate a q4f16 entry would download, load, and die mid-conversation. Our policy is stricter than the
+library's and needs to stay that way.
+
+**The finding that mattered.** Two entries never reached the f16 question at all:
+
+| build | result |
+|---|---|
+| Qwen3 1.7B q4f16 — 1.43 GB, one file | `Can't create a session`, `std::bad_alloc` |
+| Antares 350M fp32 — 1.82 GB, one file | `std::bad_alloc` |
+
+Both die on **allocation**, before any shader runs. transformers.js reads a weight file into one
+`Uint8Array` before onnxruntime sees it, and onnxruntime then builds the session inside the wasm
+heap. Neither wall scales with GPU memory, which is why a 16 GB card does not move them. Measured
+inline sizes, all single-file:
+
+| file | result |
+|---|---|
+| 786 MB — Qwen2.5 0.5B q4 | loads and runs |
+| 1.43 GB — Qwen3 1.7B q4f16 | `std::bad_alloc` |
+| 1.74 GB — Qwen3 1.7B q8 | `std::bad_alloc` |
+| 1.82 GB — Antares 350M fp32 | `std::bad_alloc` |
+| 2.15 GB — Qwen3 1.7B q4 | `RangeError` out of `readResponse` |
+
+**And the fix is a sidecar, not a smaller model.** The same 1.82 GB Antares graph, re-saved with its
+weights in `model.onnx_data`, **loads in 8.0 s and generates** — verified end to end: load 8.0 s, VM
+boot, 17 tokens of coherent text. Checkpoints with external data have no such ceiling; Gemma 4's
+ONNX build streams 3.6 GB here without complaint.
+
+That makes **Antares 350M the first Antares to run on this machine**, at fp32, needing no adapter
+feature at all.
+
+**What changed.**
+
+- `tools/quantize_onnx.py` shards on `BROWSER_INLINE_CEILING` (1 GB) rather than on protobuf's 2 GiB
+  limit. The old rule was not wrong about protobuf — it was answering the wrong question. `optimum`
+  emits whatever protobuf allows, which for 350M is one 1.82 GB file no browser can load, so
+  `_reshard_inline` now rewrites it in place. Only ever reached in the safe range: below the ceiling
+  there is nothing to do, and above 2 GiB the exporter already wrote a sidecar because it had no
+  choice, so the in-memory round trip that would be reckless on a >2 GiB graph never happens.
+- `ModelEntry.inlineBytes` + `INLINE_WEIGHT_CEILING_BYTES` let `pickDtype` skip a build the browser
+  cannot load, exactly as it skips f16 without the feature. Same question, same place, answered
+  before the download rather than 1.4 GB into it.
+- `dtypeBlockers()` returns **every** reason, not the first. Qwen3's q4f16 is both oversized and
+  f16-gated, and an earlier cut of this reported only `shader-f16` — which sends the reader after a
+  GPU that would not fix it. Size leads, because it is the reason no hardware change answers.
+- Antares 350M is `dtypes: ["fp32", "fp16"]`, the only entry that prefers fp32. Not a quality
+  judgement: it is the build that runs everywhere.
+
+**Corrected: the Qwen3 entry was wrong.** It said q4 and q8 fail on allocation but *"q4f16 (1.43 GB)
+does [work], so it is the entry"*, held back only by `shader-f16`. That was never measured. q4f16
+fails identically, so **no published build of Qwen3 1.7B loads in a browser** and a GPU exposing the
+feature would not change it. AGENTS.md §Dialects said the same thing about why `hermes`'s `<think>`
+path is uncaptured; both now say the real reason. Unblocking Qwen3 needs a re-export with external
+data — the Antares move, applied to someone else's repo.
+
+**Still open: Antares 1B.** The good one — the one that follows the protocol. Its fp16 (3.67 GB) is
+correctly sharded and needs `shader-f16`, which this adapter lacks. Its fp32 (7.35 GB) is also
+correctly sharded and *would* load, but did not finish doing so in ten minutes here against 8.0 s for
+350M's 1.82 GB, so it is deliberately **not** offered — a dtype that technically works and
+practically hangs is worse than no dtype. It is now the only entry in the registry that requires
+`shader-f16`. Two ways out, both unmeasured: an **int8** build (int4 is known to destroy this model —
+0.816 logit correlation, and it loses the tool-call protocol — but int8 was never tried), or a
+machine whose adapter exposes the feature.
+
+**The pattern, for the third time in three sections.** §10.14 measured the adapter and concluded the
+model could not run. §10.17 found the constraint was the engine's dtype choice. §10.18 found that for
+two more models it was neither — it was how the file was laid out on disk. Each time the error was
+attributing a failure to the layer that reported it. `std::bad_alloc` from onnxruntime is not
+onnxruntime's limit any more than a `shader-f16` refusal was the GPU's; it is the shape of what it
+was handed. Ask what was requested before concluding what is impossible.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

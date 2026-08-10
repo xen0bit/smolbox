@@ -32,6 +32,29 @@ import onnx
 # itself grows a little when quantized nodes are added.
 EXTERNAL_DATA_THRESHOLD = 1_900_000_000
 
+# The ceiling that actually matters, and it is not protobuf's.
+#
+# A browser fails on an inline checkpoint long before 2 GiB, for two stacked
+# reasons: transformers.js reads a weight file into ONE Uint8Array before
+# onnxruntime sees any of it, and onnxruntime then builds the session inside the
+# wasm heap. Measured on this machine (PLAN §10.18), all single-file:
+#
+#     786 MB  (Qwen2.5 0.5B q4)      loads and runs
+#   1.43 GB  (Qwen3 1.7B q4f16)      Can't create a session, std::bad_alloc
+#   1.74 GB  (Qwen3 1.7B q8)         Can't create a session, std::bad_alloc
+#   1.82 GB  (Antares 350M fp32)     Can't create a session, std::bad_alloc
+#   2.15 GB  (Qwen3 1.7B q4)         RangeError, out of readResponse
+#
+# The same 1.82 GB graph re-saved with its weights in a sidecar loads in 8.0 s
+# and generates. So sharding is not a protobuf workaround here — it is what
+# makes a mid-size checkpoint loadable in a browser at all.
+#
+# Set between the largest inline file measured to work and the smallest measured
+# to fail. Sharding a graph that would have fitted costs one extra HTTP request
+# and nothing else, so erring low is close to free; erring high produces a
+# multi-gigabyte download that ends in std::bad_alloc.
+BROWSER_INLINE_CEILING = 1_000_000_000
+
 TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -51,24 +74,28 @@ def _human(n: int) -> str:
     return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.1f} MB"
 
 
-def _graph_exceeds_protobuf_limit(model: onnx.ModelProto) -> bool:
-    """Whether this graph must use external data.
+def _needs_sidecar(model: onnx.ModelProto) -> bool:
+    """Whether this graph should keep its weights in a sidecar.
 
-    `ByteSize()` does not merely report a large number past 2 GiB — it raises
-    EncodeError, because protobuf cannot serialize the message at all. So the
-    exception *is* the signal, and catching it is the check rather than a
-    fallback. 1B hits this; 350M does not.
+    Two independent reasons, and the second is the one that bites first:
+
+    - protobuf cannot serialize past 2 GiB at all. `ByteSize()` does not merely
+      report a large number there — it raises EncodeError, so the exception *is*
+      the signal and catching it is the check rather than a fallback. 1B hits
+      this; 350M does not.
+    - a browser cannot load an inline graph anywhere near that large, which is
+      what BROWSER_INLINE_CEILING records.
     """
     try:
-        return model.ByteSize() >= EXTERNAL_DATA_THRESHOLD
+        return model.ByteSize() >= min(EXTERNAL_DATA_THRESHOLD, BROWSER_INLINE_CEILING)
     except Exception:
         return True
 
 
 def _save(model: onnx.ModelProto, path: Path) -> int:
-    """Save, spilling weights to a sidecar only when the graph needs it."""
+    """Save, spilling weights to a sidecar when the graph needs it."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if _graph_exceeds_protobuf_limit(model):
+    if _needs_sidecar(model):
         data_name = f"{path.name}_data"
         onnx.save_model(
             model,
@@ -148,14 +175,49 @@ def _normalise_external_data_name(path: Path) -> None:
 
 
 def _needs_external(src: Path) -> bool:
-    """Whether the fp16 result will still exceed protobuf's inline limit.
+    """Whether the fp16 result should spill its weights to a sidecar.
 
-    fp16 halves the weights, so a graph only needs a sidecar if it was more than
-    twice the threshold to begin with. Checked against the source files on disk
-    because the converted graph does not exist yet.
+    fp16 halves the weights, so the result is predicted from the source files on
+    disk — the converted graph does not exist yet. Measured against
+    BROWSER_INLINE_CEILING rather than protobuf's limit: the question is not
+    "can this be serialized" but "can a browser load it", and the second wall is
+    the lower one by more than a gigabyte.
     """
     total = src.stat().st_size + sum(f.stat().st_size for f in src.parent.glob(f"{src.name}_data"))
-    return total / 2 >= EXTERNAL_DATA_THRESHOLD
+    return total / 2 >= BROWSER_INLINE_CEILING
+
+
+def _reshard_inline(path: Path) -> bool:
+    """Move an inline graph's weights into a sidecar, in place.
+
+    The exporter emits whatever protobuf allows, which for a mid-size model is
+    one 1–2 GB file that no browser can load (see BROWSER_INLINE_CEILING). This
+    rewrites it into `model.onnx` + `model.onnx_data` without touching a weight
+    value.
+
+    Only ever reached in the safe range. Below the ceiling there is nothing to
+    do; above 2 GiB the exporter already wrote a sidecar, because protobuf gave
+    it no choice. So the round trip through memory that would be reckless on a
+    >2 GiB graph — it cannot be serialized at all — never happens here.
+
+    Returns whether it did anything.
+    """
+    sidecar = path.parent / f"{path.name}_data"
+    if sidecar.exists() or path.stat().st_size < BROWSER_INLINE_CEILING:
+        return False
+    log(f"{path.name}: {_human(path.stat().st_size)} inline — moving weights to a sidecar")
+    model = onnx.load(str(path))
+    onnx.save_model(
+        model,
+        str(path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=sidecar.name,
+        size_threshold=1024,
+        convert_attribute=False,
+    )
+    log(f"{path.name}: {_human(path.stat().st_size)} graph + {_human(sidecar.stat().st_size)} data")
+    return True
 
 
 def assemble(*, source: Path, granite: Path, onnx_raw: Path, out: Path) -> None:
@@ -194,6 +256,13 @@ def assemble(*, source: Path, granite: Path, onnx_raw: Path, out: Path) -> None:
     for src_file in sorted(onnx_raw.glob("model.onnx*")):
         shutil.copy2(src_file, onnx_dir / src_file.name)
         total += src_file.stat().st_size
+    # The exporter shards only when protobuf forces it, which leaves 350M as one
+    # 1.82 GB file — over the browser's ceiling by nearly a gigabyte, and the
+    # reason fp32 was unloadable rather than merely large (PLAN §10.18). Doing
+    # it here rather than asking optimum for it keeps the rule in one place and
+    # applies it to any future model this pipeline exports.
+    _reshard_inline(fp32)
+    total = fp32.stat().st_size + sum(f.stat().st_size for f in onnx_dir.glob("model.onnx_data"))
     log(f"model.onnx: {_human(total)}"
         f"{' (external data)' if (onnx_dir / 'model.onnx_data').exists() else ''}")
     variants["fp32"] = fp32

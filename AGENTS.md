@@ -401,6 +401,24 @@ being first in the file, so adding a target above it cannot silently change what
 `antares-onnx` is excluded: it is the one target needing Python, uv and an `HF_TOKEN`, against
 per-repository gated weights that cannot be fetched unattended.
 
+### A weight file's *layout* decides whether a browser can load it, not just its size
+transformers.js reads a weight file into ONE `Uint8Array` before onnxruntime sees it, and
+onnxruntime then builds the session inside the wasm heap. So an inline `.onnx` fails around
+1–1.4 GB — `std::bad_alloc`, or a `RangeError` past ~2 GB — while a checkpoint with a
+`.onnx_data` sidecar streams and has no such ceiling (Gemma 4's ONNX build is 3.6 GB and loads).
+Neither wall scales with GPU memory.
+
+Two consequences, both measured in PLAN §10.18:
+
+- **`tools/quantize_onnx.py` shards on `BROWSER_INLINE_CEILING` (1 GB), not on protobuf's 2 GiB.**
+  `optimum` emits whatever protobuf allows, which left Antares 350M as one 1.82 GB file that could
+  not load. Re-saved with a sidecar it loads in 8.0 s. **If you add a model to this pipeline, do not
+  restore the protobuf rule** — it answers a different question.
+- **`ModelEntry.inlineBytes` is how the page refuses one up front.** `pickDtype` skips a build over
+  the ceiling exactly as it skips f16 without the feature, and `dtypeBlockers()` reports *every*
+  reason rather than the first — an oversized f16 build has two, and naming only `shader-f16` sends
+  the reader after a GPU that would not help. Set it only for builds with no sidecar.
+
 **Compression is pre-computed, never on the fly.** `make compress` (`web/precompress.ts`) writes a
 `.br` and a `.gz` beside each compressible artifact; `web/serve.ts` picks one by `Accept-Encoding`,
 preferring brotli, and serves identity when no sibling exists — so the target is optional and a
@@ -459,9 +477,10 @@ would cap that model's prompt at ~1400 tokens for memory it does not allocate.
 capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
-and Qwen3 will not load without `shader-f16` — which, per §10.14, needs different hardware rather
-than a different browser. (That is a real f16 *file*, so §10.17's rewrite does not reach it: the
-constraint there is which ONNX export exists, not which dtype an engine chose.) `gemma4` was
+and **no published build of Qwen3 1.7B loads in a browser at all** — every variant is one undivided
+`.onnx` and the smallest is 1.43 GB, over the inline-weight ceiling (§10.18). This entry used to
+blame `shader-f16`; that was never measured and is not the binding constraint, so a GPU exposing the
+feature would not capture this transcript. A re-export with external data would. `gemma4` was
 promoted at PLAN §10.15 off five real turns of the ONNX build; §10.17 then ran the *kernel* build
 through the same spec, so both entries that share the grammar have now emitted real tool calls. `lfm2.5` shares LFM2's verified call markers but is its
 own entry because the checkpoint always reasons first: its chat template ends the generation prompt
