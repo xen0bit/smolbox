@@ -92,10 +92,12 @@ resp, err := session.Exec(ctx, protocol.Request{
 - The model never chooses the *operation*: `op` is not in the tool's schema, and a call that sets it
   is rejected before the session sees it. A model cannot talk its own sandbox into `shutdown`.
 - A WebGPU model in the page calls it, reads the folder the user picked, and reports back, through a
-  chat interface with a multi-turn loop, a model picker, and tools you can add yourself. **Working
-  as of M8**: `LFM2-1.2B-Tool` on WebGPU via transformers.js, in its own worker, loading in ~4 s and
-  answering in ~3.6 s end to end. The model emits its native Pythonic call syntax, which the page
-  parses alongside JSON.
+  chat interface with a multi-turn loop, a curated model registry, and tools you can add yourself.
+  Each registry entry is pinned to a checkpoint revision and tagged with the dialect its calls
+  actually use — LFM2's native Pythonic syntax, the Hermes/Qwen `<tool_call>` JSON form, Gemma 4's
+  own grammar — parsed alongside plain JSON. **Working as of M8–M11**: local models on WebGPU via
+  transformers.js, and a native WebGPU kernel engine for Gemma 4, in their own worker, loading in
+  ~4–7 s. The loop is exercised in CI against a scripted model; real models are run by hand.
 - The tool surface is fully specified and tested against a mock caller **before** any model is
   wired in — the model is a consumer of a proven API, not a prerequisite for it. See
   [docs/tool-api.md](docs/tool-api.md).
@@ -115,8 +117,9 @@ resp, err := session.Exec(ctx, protocol.Request{
 ## Getting started
 
 ```
+make everything  # the whole served set: wasm, web, gemma-kernels, compress, models
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
-make model       # optional: pull the LFM2 checkpoint (1.22 GB) -> dist/models, for the agent page
+make model       # optional: pull the default checkpoint (LFM2.5 2.6B) -> dist/models, for the agent page
 make build       # build the smolbox CLI
 
 ./bin/smolbox exec --mount ./testdata/mount -- ls -la /mnt/host
@@ -124,6 +127,10 @@ make build       # build the smolbox CLI
 
 make web serve   # bundle and serve the browser runtime on localhost:8080
 ```
+
+`make everything` (alias `make all`, or just `make`) includes an ~11 GB weight pull as its last,
+resumable step — `make model MODEL=<key>` pulls a single registry entry, `make model MODEL=--list`
+shows them.
 
 The dev server hosts the VM at `/` and the agent page at `/agent/`. The agent page needs a GPU; it loads weights from `dist/models` when
 `make model` has been run and from the Hugging Face CDN otherwise.
@@ -138,12 +145,12 @@ docker run --rm -p 8080:8080 -v $PWD/dist:/data:ro smolbox/serve:dev
 ```
 
 `HOST`, `PORT` and `DIST_DIR` configure the bind address, the port, and the `dist/`
-directory the server reads its artifacts from (smolbox.wasm, the `js/` build, the
-weights and the Gemma kernel engine) — `/data` in the image, `dist/` beside the
-source tree otherwise. Mounting a host `dist/` over `/data` replaces all of them
-at once. The build bakes in `dist/smolbox.wasm` and `dist/js` when the build
-context already has them and skips them when it does not — `make wasm` cannot run
-inside a container build, since it needs the host's Docker socket.
+directory the server reads its artifacts from (smolbox.wasm, the model weights and
+the Gemma kernel engine) — `/data` in the image, `dist/` beside the source tree
+otherwise. Mounting a host `dist/` over `/data` replaces them all at once. The
+build bakes in `dist/smolbox.wasm` when the build context already has it and
+skips it when it does not — `make wasm` cannot run inside a container build,
+since it needs the host's Docker socket.
 
 Toolchain: **Go 1.24+** for the CLI, **Docker** for the conversion, and **bun** for the web tooling
 (bundling, unit tests, typecheck, and the dev server). Run `bun install` once to fetch the web

@@ -1,16 +1,25 @@
 # The smolbox tool API
 
-smolbox exposes exactly one tool to a model: **`run_terminal_command`**. It runs a shell command
-inside the VM and returns the exit code, stdout, and stderr. Everything else an agent might want —
-listing a directory, reading a file, searching a tree — is a command, not another tool.
+smolbox exposes exactly one tool to a model by default: **`run_terminal_command`**. It runs a shell
+command inside the VM and returns the exit code, stdout, and stderr. Everything else an agent might
+want — listing a directory, reading a file, searching a tree — is a command, not another tool. That
+default is a deliberate prompt-budget decision: a single tool definition costs ~2300 characters of
+system prompt on every turn, and each additional tool both grows that cost and adds a selection
+decision a small model can get wrong.
+
+There is an opt-in extension mechanism (["Beyond the one tool"](#beyond-the-one-tool)) for
+templates, but it preserves the invariant that matters: **however many tools a session exposes, a
+tool call always compiles to an exec `Request`, and `op` is unreachable from every one of them.**
 
 This document is the specification of that surface. The JSON Schemas under [`schema/`](schema/) are
 **generated from the Go types** in `internal/protocol`, so they cannot describe a shape the wire does
 not have; the tables below are checked against those schemas by a unit test.
 
-There is no model in smolbox yet (that is the WebGPU work). The surface is specified and tested
-against a mock caller first, so when a model arrives it is a consumer of a proven API rather than the
-thing that discovers the API's bugs.
+The surface was specified and tested against a mock caller *before* any model existed, so the models
+that now drive it (local WebGPU checkpoints through the `/agent/` page, via the curated registry in
+`web/src/agent/models.ts`) are consumers of a proven API rather than the thing that discovered its
+bugs. Adding a model never changes this file: a model is a consumer of the surface, and the model
+can never choose the op.
 
 ---
 
@@ -164,6 +173,27 @@ health checks for the host, and `shutdown` is how `Session.Close` ends a session
 
 ---
 
+## Beyond the one tool
+
+The agent page's tool registry (`web/src/agent/tool-registry.ts`) merges three sources:
+
+1. **The exec tool** — `run_terminal_command` above, always present.
+2. **Built-in templates** — narrow tools generated from the same anti-drift machinery:
+   `list_dir`, `read_file`, `search_files` (see `builtin-tools.json`). They are opt-in per session
+   because each one is prompt real estate on every turn.
+3. **User-defined templates** — created in the UI as a name, description, typed parameters, and a
+   shell template such as `grep -rn {pattern} /mnt/host`, defined in Go (`internal/tool/template.go`)
+   and validated in the browser against its generated schema (`template-tool.schema.json`).
+
+Whatever the source, a call compiles to a `protocol.Request` with `op` fixed to exec — **more tools
+never mean more ways into the guest**. Interpolated arguments are shell-quoted by default
+(`{param:raw}` opts out), which is a correctness measure today and the boundary if a restricted mode
+ever removes the raw tool. A user template grants a model nothing it does not already have while
+`run_terminal_command` is exposed; that stops being true the moment the raw tool is removed, which is
+why quoting is the default rather than a retrofit.
+
+---
+
 ## Generated files
 
 | File | Is |
@@ -173,6 +203,8 @@ health checks for the host, and `shutdown` is how `Session.Close` ends a session
 | [`schema/caps.schema.json`](schema/caps.schema.json) | the ready banner's capability object |
 | [`schema/run_terminal_command.anthropic.json`](schema/run_terminal_command.anthropic.json) | the tool, Anthropic dialect |
 | [`schema/run_terminal_command.openai.json`](schema/run_terminal_command.openai.json) | the tool, OpenAI dialect |
+| [`schema/template-tool.schema.json`](schema/template-tool.schema.json) | the format a user-defined tool must satisfy |
+| [`schema/builtin-tools.json`](schema/builtin-tools.json) | the narrow tools shipped with smolbox, as definitions |
 
 Regenerate with:
 

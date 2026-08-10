@@ -64,6 +64,8 @@ function decodeUtf8(b: Uint8Array): string {
   return new TextDecoder().decode(b);
 }
 
+// Chunked so a max-size frame (~5.3 MB base64) does not overflow the argument
+// limit of String.fromCharCode or build one enormous intermediate string.
 function encodeBase64(bytes: Uint8Array): string {
   let bin = "";
   const CHUNK = 0x8000;
@@ -116,6 +118,10 @@ export function encodeReady(caps: Caps): Uint8Array {
   return encodeFrame(readyPrefix, undefined, JSON.stringify(caps));
 }
 
+// On the wire, stdin is base64 ([]byte in Go). In this TS type, a Uint8Array is
+// already-encoded bytes and a string is plain text — both are base64'd here.
+// The tool layer decodes its base64 string argument to a Uint8Array first so it
+// is not double-encoded (see web/src/tool.ts decodeArgs).
 export function encodeRequest(seq: number, req: Request): Uint8Array {
   const wire: Record<string, unknown> = { ...req };
   if (req.stdin instanceof Uint8Array) {
@@ -152,6 +158,10 @@ export function decodeResponse(frame: Frame): Response {
   };
 }
 
+// decodeBytes tolerates the wire's "stdout": null (a silent command sends a
+// nil []byte, which JSON renders as null — the generated schema types the
+// field ["string","null"]): anything that is not a base64 string flattens to
+// "". A malformed frame, by contrast, throws.
 function decodeBytes(v: unknown): string {
   if (typeof v !== "string") {
     return "";

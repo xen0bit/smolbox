@@ -1,3 +1,8 @@
+// Command smolbox is the host CLI over a wazero-booted VM: `smolbox exec` runs
+// one command and prints its result, `smolbox repl` is an interactive session.
+// It is a thin transport — it boots a Session, mounts host dirs read-only at
+// /mnt/host, and speaks the protocol through it; all framing lives in
+// internal/protocol and internal/vm.
 package main
 
 import (
@@ -28,6 +33,8 @@ flags:
   --cwd <dir>         working directory for the command (exec only)
 `
 
+// multiFlag is a repeatable flag: each occurrence appends a value, so both
+// --mount and --env accumulate.
 type multiFlag []string
 
 func (m *multiFlag) String() string { return strings.Join(*m, ",") }
@@ -99,6 +106,8 @@ func cmdExec(args []string) int {
 		env[k] = v
 	}
 
+	// Pipe stdin through to the command only when stdin is not a terminal;
+	// interactive exec would otherwise block forever waiting for a full read.
 	var stdin []byte
 	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 		b, err := io.ReadAll(os.Stdin)
@@ -128,6 +137,8 @@ func cmdExec(args []string) int {
 	if resp.Error != "" {
 		fmt.Fprintf(os.Stderr, "smolbox exec: %s\n", resp.Error)
 	}
+	// Mirror timeout(1): the host's own timeout maps to 124, while a guest-side
+	// timeout kill reports 137 on the wire.
 	if resp.TimedOut {
 		return 124
 	}
@@ -194,6 +205,10 @@ func cmdRepl(args []string) int {
 	return 0
 }
 
+// toMounts maps every --mount value onto the fixed guest path /mnt/host. The
+// GuestPath field exists on hostfs.Mount and the vm honors it, but the CLI has
+// no per-mount guest-path flag, so multiple --mount flags would overlap in the
+// guest rather than compose.
 func toMounts(dirs []string) []hostfs.Mount {
 	mounts := make([]hostfs.Mount, 0, len(dirs))
 	for _, d := range dirs {
@@ -202,6 +217,8 @@ func toMounts(dirs []string) []hostfs.Mount {
 	return mounts
 }
 
+// defaultWasmPath prefers dist/smolbox.wasm beside the repo, then relative to
+// the executable (for `make build` installs), then the bare repo-relative name.
 func defaultWasmPath() string {
 	if _, err := os.Stat("dist/smolbox.wasm"); err == nil {
 		return "dist/smolbox.wasm"

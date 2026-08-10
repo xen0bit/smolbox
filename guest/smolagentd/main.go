@@ -1,3 +1,9 @@
+// Command smolagentd is the guest agent: the container entrypoint (PID 1)
+// that owns the console and speaks the framed protocol to the host. It is a
+// static linux/amd64 Go binary baked into the VM image, replacing the shell
+// entrypoint of the M1 harness. It tracks the session cwd, reaps orphaned
+// children (it is PID 1), and answers exec/ping/info/shutdown requests until
+// the host sends shutdown.
 package main
 
 import (
@@ -18,6 +24,11 @@ func main() {
 	}
 }
 
+// run is the agent's main loop: raw the console, announce the ready banner,
+// then answer request frames until shutdown. The console is put in raw mode
+// first so REQ frames longer than a canonical-mode line (~4096 bytes) read
+// whole and our own writes are not echoed back into the stream where the host
+// would mistake them for guest traffic.
 func (a *agent) run() error {
 	if err := setConsoleRaw(); err != nil {
 		fmt.Fprintf(os.Stderr, "smolagentd: raw console mode (continuing): %v\n", err)
@@ -42,12 +53,17 @@ func (a *agent) run() error {
 			return nil
 		}
 	}
+	// A scan-ending non-EOF error (e.g. an oversized inbound line) is fatal to
+	// the agent and therefore to the whole VM: the host sees the session die.
 	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
 	return nil
 }
 
+// handleFrame dispatches one request. It returns true when the request was
+// shutdown, ending the run loop (the guest exits and the host's close path
+// completes).
 func (a *agent) handleFrame(fr protocol.Frame) bool {
 	var req protocol.Request
 	if err := fr.DecodeRequest(&req); err != nil {
@@ -70,11 +86,17 @@ func (a *agent) handleFrame(fr protocol.Frame) bool {
 	return false
 }
 
+// info answers the `info` op, whose "cwd:" line the browser terminal parses
+// out of stdout to keep its prompt in sync with the guest.
 func (a *agent) info() *protocol.Response {
 	out := fmt.Sprintf("smolbox agent v%s\ncwd: %s\n", protocol.Version, a.cwd)
 	return &protocol.Response{ExitCode: 0, Stdout: []byte(out)}
 }
 
+// reply stamps the request's seq back into the response and writes it. If the
+// response's own encoding fails (past the frame budget despite the guest's
+// maxOutputCeiling), it is replaced with a minimal error frame rather than
+// left unanswered — a response the host never sees would hang the Exec.
 func (a *agent) reply(seq int, resp *protocol.Response) {
 	resp.Seq = seq
 	line, err := protocol.EncodeResponse(seq, resp)
