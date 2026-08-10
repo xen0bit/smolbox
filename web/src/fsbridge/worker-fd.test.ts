@@ -11,7 +11,7 @@ import {
   FILETYPE_REGULAR_FILE,
   FILETYPE_SYMBOLIC_LINK,
 } from "./protocol.ts";
-import { FakeChannel, fixtureTree } from "./test-util.ts";
+import { FAKE_MTIME_MS, FakeChannel, fixtureTree } from "./test-util.ts";
 import { BridgeFd, createBridgeFd } from "./worker-fd.ts";
 
 function root(): BridgeFd {
@@ -235,5 +235,39 @@ describe("BridgeFd fdstat and prestat", () => {
     expect(root().fd_fdstat_get().fdstat?.fs_filetype).toBe(FILETYPE_DIRECTORY);
     const file = root().path_open(0, "hello.txt", 0, 0n, 0n, 0).fd_obj as BridgeFd;
     expect(file.fd_fdstat_get().fdstat?.fs_filetype).toBe(FILETYPE_REGULAR_FILE);
+  });
+});
+
+// Two fields the shim's Filestat constructor does not take, both of which
+// escape the bridge when they are left at their defaults: a mtime of 0 reaches
+// the guest as `Jan  1  1970` on every entry — which a model then reports to the
+// user as the file's creation date (PLAN §10.21) — and an nlink of 0 is a
+// number no filesystem produces, which fts reads as a subdirectory count.
+describe("BridgeFd filestat metadata", () => {
+  test("a file carries its modification time, in nanoseconds", () => {
+    const { ret, fd_obj } = root().path_open(0, "hello.txt", 0, 0n, 0n, 0);
+    expect(ret).toBe(ERRNO_SUCCESS);
+    const { filestat } = fd_obj!.fd_filestat_get();
+    expect(filestat!.mtim).toBe(BigInt(FAKE_MTIME_MS) * 1_000_000n);
+    // atim and ctim repeat it rather than staying at the epoch: this filesystem
+    // knows one timestamp, and answering 1970 for the other two would make
+    // `ls -lu` and `find -newer` confidently wrong.
+    expect(filestat!.atim).toBe(filestat!.mtim);
+    expect(filestat!.ctim).toBe(filestat!.mtim);
+  });
+
+  test("nothing reports a link count of zero", () => {
+    const dir = root();
+    expect(dir.fd_filestat_get().filestat!.nlink).toBe(1n);
+    const { fd_obj } = dir.path_open(0, "hello.txt", 0, 0n, 0n, 0);
+    expect(fd_obj!.fd_filestat_get().filestat!.nlink).toBe(1n);
+  });
+
+  test("an entry with no known time is left unknown rather than dated to 1970", () => {
+    // Directories have no File and therefore no date. Absent is honest; an
+    // invented one sorts wrongly where a missing one sorts last.
+    const { fd_obj } = root().path_open(0, "sub", 0, 0n, 0n, 0);
+    expect(fd_obj!.fd_filestat_get().filestat!.mtim).toBe(0n);
+    expect(fd_obj!.fd_filestat_get().filestat!.nlink).toBe(1n);
   });
 });

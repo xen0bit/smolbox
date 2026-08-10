@@ -85,6 +85,30 @@ export interface StatResponse {
   errno: number;
   filetype?: number;
   size?: number;
+  /**
+   * Last modification, in milliseconds since the epoch. Absent means unknown.
+   *
+   * The File System Access API hands this over for free — every `File` carries
+   * `lastModified` — and dropping it was visible all the way out at the other
+   * end of the product: the guest saw `Jan 1 1970` on every entry, `ls -lt` and
+   * `find -newer`/`-mtime` had nothing to sort or compare, and a model reading
+   * `ls -la` told the user their files were created in 1970. Which it did, in
+   * both of the runs recorded in PLAN §10.21.
+   *
+   * Directories have no `File` and therefore no timestamp: absent is honest, and
+   * an invented one would sort wrongly rather than not at all.
+   */
+  mtimeMs?: number;
+  /**
+   * Hard link count, or 1 meaning "this filesystem does not count links".
+   *
+   * WASI has a `nlink` field and the shim's Filestat constructor hardcodes it to
+   * **0**, which is not a number any filesystem reports and which tools do read:
+   * fts (so `find`, `ls -R`) sizes a directory's remaining subdirectories as
+   * `nlink - 2`, and the conventional way to say "do not do that arithmetic" is
+   * to report 1. Zero is in nobody's contract.
+   */
+  nlink?: number;
 }
 
 export interface ReaddirResponse {

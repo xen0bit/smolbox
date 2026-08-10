@@ -2529,6 +2529,74 @@ rebuild after a device loss happens on the same onnxruntime module and therefore
 device, so a browser that genuinely *loses* the device will reload successfully and fail again. Only
 tearing down the worker would help, and that is its own change.
 
+### 10.22 The mount was dating every file to 1970, and a theory that did not survive (2026-08-10)
+
+Found while looking for the cause of §10.20's two `KNOWN GAP` cases, and worth recording in that
+order because the search failed and the finding is real anyway.
+
+**What is actually wrong.** `browser_wasi_shim`'s `Filestat` constructor takes `(ino, filetype,
+size)` and hardcodes everything else: `nlink = 0n`, `atim = mtim = ctim = 0n`. `toFilestat` in
+`worker-fd.ts` used it as-is, and `StatResponse` had nowhere to put the missing fields anyway. So
+every entry under `/mnt/host` reached the guest dated to the epoch:
+
+```
+d--------- 1 root root    0 Jan  1  1970 .
+---------- 0 root root   21 Jan  1  1970 hello.txt
+l--------- 0 root root    0 Jan  1  1970 link.txt -> hello.txt
+d--------- 0 root root    0 Jan  1  1970 sub
+```
+
+This is **browser-only**: under wazero the mount is a real OS directory through
+`WithReadOnlyDirMount`, so nlink and the timestamps are the file's own. Which is why no conformance
+case caught it — the shared table ran green on the side that was broken because it was green on the
+side that was not.
+
+And it left the product. Both GPU runs recorded in §10.21 have the model telling the user their files
+were "created on Jan 1, 1970", because that is what `ls -la` said. `ls -lt`, `find -newer` and
+`find -mtime` had nothing to work with either.
+
+**The fix is free.** The File System Access API hands `lastModified` over on every `File`, and
+`getFile()` was already being called for the size. `StatResponse` gained `mtimeMs` and `nlink`;
+`toFilestat` sets `mtim`, and sets `atim`/`ctim` to the same value rather than leaving them at zero,
+because this filesystem knows one timestamp and answering "epoch" for the other two is confidently
+wrong where repeating what we know is merely imprecise. Directories have no `File` and therefore no
+date: absent, not invented — a fabricated mtime sorts wrongly where a missing one sorts last.
+
+`nlink` is now 1 everywhere, which is a claim rather than a count: there are no hard links here to
+count, and 1 is the conventional way to tell fts not to derive a subdirectory count from it. **0 is
+in nobody's contract**, which is the whole reason it was worth changing.
+
+**The theory that did not survive.** The reason nlink was looked at at all: fts sizes a directory's
+remaining subdirectories as `st_nlink - 2`, and `0 - 2` is exactly the shape of a `find` that does
+not recurse — §10.20's first `KNOWN GAP`. It was a good theory and it is wrong. With nlink reported
+as 1 and real mtimes flowing, **all 22 conformance cases still pass in both drivers, including both
+`KNOWN GAP` cases**: `find` still does not recurse and `ls -R` still exits 1. §10.20's diagnosis
+stands — it is `d_type`, and the WASI dirents this bridge emits already carry the right one
+(`fd_readdir_single` passes `e.type` straight through), so the loss is inside container2wasm's guest
+driver rather than anywhere in this repo. Not fixable here without patching and rebuilding the VM.
+
+Also not fixable: the `---------` mode column. WASI `filestat` has no mode field at all, so there is
+nothing to send; c2w synthesises it.
+
+**Pinned** by a new conformance case — `find /mnt/host/hello.txt -newermt 2001-01-01` and an
+`ls -l --time-style=+%Y` that must not say 1970 — which passes in both drivers now and was checked to
+**fail** in the browser with the fix reverted, because a new test that would have passed anyway pins
+nothing. Conformance 47 → 48. Unit 452 → 455.
+
+**Three things checked and deliberately left alone**, recorded so the next person does not re-derive
+them:
+
+- *The duplicate weight-fetch hack* (`model-worker.ts`) is not dead code now that IndexedDB serves
+  weights. On a warm load the pre-pass issues no network GET at all; on a cold load it is still the
+  only reason each weight file is fetched once. `model-cache.spec.ts` already asserts both halves.
+- *The kernel path's quadratic decode* was re-measured against `max_new_tokens: 2048` rather than the
+  256 its "irrelevant at these lengths" comment was written for. ~2.1M token-positions per turn, a
+  couple of seconds of CPU against a generation whose GPU work runs into minutes. Still the wrong
+  thing to optimise, now for a stated reason.
+- *`MountHost`'s caches never expire*, so a file edited on disk mid-session stays stale inside the
+  guest until the folder is picked again. That is the price of not re-stat'ing on every syscall, and
+  `cat` of a large file is hundreds of syscalls. Documented on the class rather than changed.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

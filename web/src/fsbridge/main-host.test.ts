@@ -12,7 +12,7 @@ import {
   ReaddirResponse,
   createBridgeSab,
 } from "./protocol.ts";
-import { FakeDirectoryHandle, fixtureTree } from "./test-util.ts";
+import { FAKE_MTIME_MS, FakeDirectoryHandle, fixtureTree } from "./test-util.ts";
 
 const mountTree: Record<string, string | Record<string, string>> = {
   "hello.txt": "hello from the mount\n",
@@ -36,6 +36,11 @@ describe("MountHost.dispatch", () => {
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_REGULAR_FILE,
       size: "hello from the mount\n".length,
+      // Both of these used to be dropped on the floor, and both are visible from
+      // inside the guest: mtime as `Jan  1  1970` on every entry, nlink as a 0
+      // that fts reads as a subdirectory count. See StatResponse.
+      mtimeMs: FAKE_MTIME_MS,
+      nlink: 1,
     });
   });
 
@@ -163,6 +168,11 @@ describe("MountHost.serve over the SAB", () => {
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_REGULAR_FILE,
       size: "hello from the mount\n".length,
+      // Both of these used to be dropped on the floor, and both are visible from
+      // inside the guest: mtime as `Jan  1  1970` on every entry, nlink as a 0
+      // that fts reads as a subdirectory count. See StatResponse.
+      mtimeMs: FAKE_MTIME_MS,
+      nlink: 1,
     });
     const rd = (await roundTrip(host, worker, { op: "readdir", path: "/" })) as ReaddirResponse;
     expect(new Set((rd.entries ?? []).map((e) => e.name))).toEqual(new Set(["hello.txt", "sub"]));

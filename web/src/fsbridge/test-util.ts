@@ -18,8 +18,20 @@ import {
   ReaddirEntry,
 } from "./protocol.ts";
 
+/**
+ * A fixed date for every fake file: 2026-08-10T00:00:00Z.
+ *
+ * Deliberately not `Date.now()` and deliberately not 0. Not now, because an
+ * assertion against a moving value has to be written loosely enough to pass
+ * whatever it is handed; not 0, because 0 is exactly the wrong answer this
+ * bridge used to give and a test that cannot tell it from a right one is not
+ * covering anything.
+ */
+export const FAKE_MTIME_MS = 1_786_060_800_000;
+
 export class FakeBlob implements BlobLike {
   readonly size: number;
+  readonly lastModified = FAKE_MTIME_MS;
 
   constructor(private data: Uint8Array) {
     this.size = data.length;
@@ -134,6 +146,8 @@ export class FakeChannel implements BridgeClient {
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_REGULAR_FILE,
       size: new TextEncoder().encode(e.content).length,
+      mtimeMs: FAKE_MTIME_MS,
+      nlink: 1,
     };
   }
 

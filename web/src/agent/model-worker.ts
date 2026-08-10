@@ -81,6 +81,14 @@ const modelCache = new ModelCache();
 // gets the bytes, and only one request leaves the browser. A response somebody
 // has already claimed is not shareable, so that case falls straight through to a
 // fresh fetch and behaves exactly as it did before.
+//
+// Re-examined after the IndexedDB cache landed, on the theory that the cache
+// might have made this dead code. It has not, and the split is worth knowing: on
+// a WARM load the real read is served from IndexedDB and the pre-pass issues no
+// network GET at all (model-cache.spec.ts asserts zero weight bodies on the
+// second load), so this does nothing. On a COLD load it is still the only reason
+// each weight file is fetched once — which the same spec asserts, by requiring
+// the GETs to be unique.
 const SHARE_WINDOW_MS = 60_000;
 const shared = new Map<string, Promise<Response>>();
 const nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
@@ -610,8 +618,13 @@ async function prefillAndGenerate(
  * Decoding is incremental and deliberately keeps special tokens: the engine's
  * own generate() drops them, and they are exactly what the dialect parses.
  * Decoding the whole completion each step and taking the new suffix is what its
- * generate() does too — it is quadratic in the token count and irrelevant at
- * these lengths.
+ * generate() does too, and it is quadratic in the token count.
+ *
+ * Re-checked when max_new_tokens went from 256 to 2048, since "irrelevant at
+ * these lengths" was written for the smaller number: a 2048-token turn decodes
+ * ~2.1M token-positions in total, which is a couple of seconds of CPU spread
+ * across a generation whose GPU work is measured in minutes. Still the wrong
+ * thing to optimise, but now for a stated reason rather than an assumed one.
  */
 async function generateWithKernels(
   req: Extract<ModelRequest, { type: "generate" }>,

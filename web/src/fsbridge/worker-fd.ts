@@ -50,8 +50,31 @@ function resolveLink(symPath: string, target: string): string | null {
   return norm.errno === wasi.ERRNO_SUCCESS ? norm.path : null;
 }
 
+/**
+ * Fills in the three fields the shim's Filestat constructor does not take.
+ *
+ * `new wasi.Filestat(ino, filetype, size)` leaves `nlink` at 0 and all three
+ * timestamps at 0, and both defaults are wrong in ways that leave the bridge and
+ * reach the user: every entry under the mount dated to `Jan 1 1970` — which a
+ * model duly reported to the user as the file's creation date (PLAN §10.21) —
+ * and a link count no filesystem reports, which fts reads as a subdirectory
+ * count. See StatResponse for both.
+ *
+ * atim and ctim follow mtim rather than staying at zero: this filesystem knows
+ * one timestamp, and answering "epoch" for the other two would make `ls -lu` and
+ * `find -newer` confidently wrong where repeating what we know is merely
+ * imprecise.
+ */
 function toFilestat(st: StatResponse, path: string): wasi.Filestat {
-  return new wasi.Filestat(inoOf(path), st.filetype ?? 0, BigInt(st.size ?? 0));
+  const filestat = new wasi.Filestat(inoOf(path), st.filetype ?? 0, BigInt(st.size ?? 0));
+  filestat.nlink = BigInt(st.nlink ?? 1);
+  if (st.mtimeMs !== undefined) {
+    const ns = BigInt(Math.round(st.mtimeMs)) * 1_000_000n;
+    filestat.mtim = ns;
+    filestat.atim = ns;
+    filestat.ctim = ns;
+  }
+  return filestat;
 }
 
 export type BridgeFdKind = "dir" | "file";

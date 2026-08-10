@@ -11,16 +11,22 @@ import {
   OpStat,
 } from "./fsbridge/protocol.ts";
 import { directoryHandleFromFiles, type PickedFile } from "./mount-tree.ts";
+import { FAKE_MTIME_MS } from "./fsbridge/test-util.ts";
 
 // A stand-in for a browser File: a Blob with a name and the relative path an
 // <input webkitdirectory> pick carries.
 function pickedFile(relativePath: string, content: string): PickedFile {
   const bytes = new TextEncoder().encode(content);
-  const blob = new Blob([bytes]) as unknown as PickedFile;
-  return Object.assign(blob, {
-    name: relativePath.split("/").pop() ?? relativePath,
-    webkitRelativePath: relativePath,
+  // A real `File` rather than a `Blob` with properties bolted on, because the
+  // two fields that matter here — `name` and `lastModified` — are readonly
+  // getters on File and cannot be assigned after the fact. The date is not
+  // decoration: dropping it is what put `Jan  1  1970` on every entry the guest
+  // saw, and this is the Firefox path (`<input webkitdirectory>` rather than
+  // showDirectoryPicker), so it has to carry one too.
+  const file = new File([bytes], relativePath.split("/").pop() ?? relativePath, {
+    lastModified: FAKE_MTIME_MS,
   });
+  return Object.assign(file as unknown as PickedFile, { webkitRelativePath: relativePath });
 }
 
 async function names(dir: Awaited<ReturnType<typeof directoryHandleFromFiles>>): Promise<string[]> {
@@ -97,12 +103,15 @@ describe("MountHost over a picked file list", () => {
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_REGULAR_FILE,
       size: 6,
+      mtimeMs: FAKE_MTIME_MS,
+      nlink: 1,
     });
     expect(await host.dispatch({ op: OpStat, path: "/sub" })).toEqual({
       op: OpStat,
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_DIRECTORY,
       size: 0,
+      nlink: 1,
     });
     expect((await host.dispatch({ op: OpStat, path: "/nope" })).errno).toBe(ERRNO_NOENT);
   });
