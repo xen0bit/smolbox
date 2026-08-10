@@ -169,8 +169,18 @@ export class Settings {
         // the KV cache, and Firefox is stricter about the total than the
         // Chromium the constant was measured on (PLAN §10.16).
         return Math.min(maxPromptChars(entry), this.ceilings.get(entry.key) ?? Infinity);
-      default:
-        return generationDefaults(entry)[knob as keyof GenerationDefaults];
+      default: {
+        const value = generationDefaults(entry)[knob as keyof GenerationDefaults];
+        // Every knob in CONTROLS is a scalar the user can type into, so this
+        // branch only ever sees one. `eos_token_id` is the exception that
+        // proves it: it lives in GenerationDefaults because the worker spreads
+        // that straight into generate(), but it is a fact about where the
+        // checkpoint's turns end, not a preference — there is no widget for it
+        // and handing the user one would be an invitation to truncate every
+        // turn. Narrowed rather than cast so adding another list-valued field
+        // cannot silently reach the panel.
+        return Array.isArray(value) ? undefined : value;
+      }
     }
   }
 

@@ -28,6 +28,48 @@ import {
 
 export const builtinTemplates = builtinArtifact as TemplateTool[];
 
+/**
+ * JSON Schema *document* keys, which a tool's `parameters` is not.
+ *
+ * `$schema` declares which dialect a standalone schema document is written in
+ * and `title` names it. Both are meaningful in `docs/schema/*.json`, which are
+ * documents someone validates against; neither is meaningful inside a
+ * `function.parameters` fragment, where the model is being told what arguments
+ * exist. They are removed here rather than at the source because the published
+ * artifacts are a contract — `TestArtifactsAreCurrent` pins them to the Go
+ * types — and this is the only path that ends up as prompt text.
+ *
+ * Measured, not tidied (PLAN §10.20). LFM2.5 350M given the unstripped schema
+ * opened its call with `$schema="https://json-schema.org/draft/2020-12/schema"`
+ * as the first argument and never emitted `cmd` at all: at that size the model
+ * transcribes the schema's keys instead of filling them in, and `$schema` is
+ * the first key it sees. The parser then died on `$` before any of it could be
+ * called wrong. Bigger models ignore these two keys; small ones copy them.
+ */
+const SCHEMA_DOC_KEYS = ["$schema", "title"] as const;
+
+/**
+ * One definition with the document metadata removed.
+ *
+ * Copies rather than mutates: `openaiTool()` returns a fresh object each call
+ * but `templateToolDefinition` need not, and a registry that quietly edited its
+ * inputs would be a bug that only shows up on the second call.
+ */
+function stripSchemaMetadata(def: OpenAITool): OpenAITool {
+  const { parameters } = def.function;
+  if (!parameters || !SCHEMA_DOC_KEYS.some((k) => k in parameters)) {
+    return def;
+  }
+  const cleaned: Record<string, unknown> = { ...parameters };
+  for (const key of SCHEMA_DOC_KEYS) {
+    delete cleaned[key];
+  }
+  return {
+    ...def,
+    function: { ...def.function, parameters: cleaned as OpenAITool["function"]["parameters"] },
+  };
+}
+
 /** Per-session defaults applied to every call that does not set them itself. */
 export interface SessionDefaults {
   timeout_ms?: number;
@@ -146,7 +188,7 @@ export class ToolRegistry {
         out.push(templateToolDefinition(tool));
       }
     }
-    return out;
+    return out.map(stripSchemaMetadata);
   }
 
   /**

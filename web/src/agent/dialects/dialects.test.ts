@@ -157,7 +157,20 @@ describe("the model registry", () => {
   // unknown name is ignored rather than rejected — so a typo would look like
   // the checkpoint misbehaving.
   test("declared sampling settings are ones the runtime implements", () => {
-    const known = new Set(["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "max_new_tokens"]);
+    // eos_token_id is checked the same way as the rest — it is a real
+    // GenerationConfig field, verified against the bundle before being added
+    // (PLAN §10.20) — even though it is a correctness override rather than a
+    // preference. The point of this list is that generate() ignores what it
+    // does not know, and that is true of stop tokens as much as temperature.
+    const known = new Set([
+      "do_sample",
+      "temperature",
+      "top_p",
+      "top_k",
+      "repetition_penalty",
+      "max_new_tokens",
+      "eos_token_id",
+    ]);
     for (const m of models) {
       for (const k of Object.keys(m.generation ?? {})) {
         expect(known.has(k), `${m.key} declares an unknown sampling field: ${k}`).toBe(true);

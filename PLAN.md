@@ -2308,6 +2308,154 @@ support, and not enough to *add*. AGENTS.md's rule stands: a registry entry must
 loads, and `Dialect.verified` needs a transcript, not a card. Each recommendation above is a
 candidate for a `make model` pull and a real turn on `/agent/`, in that order.
 
+### 10.20 Running the survey's picks: three bugs between a good model and a working one (2026-08-10)
+
+§10.19 was paper. This is what happened when the three recommendations were added to the registry,
+pulled with `make model` and driven through `agent.spec.ts` on the real GPU. **Qwen3.5 0.8B now
+works end to end.** Getting there cost three fixes, and not one of them was the thing the survey was
+worried about — the architecture support, the sizes and the prefill arithmetic were all fine exactly
+as predicted. Everything that broke was in the seam between our prompt and their tokenizer.
+
+#### 1. We were sending the model a JSON Schema `$schema` URL, and the small one copied it
+
+LFM2.5 350M's very first turn:
+
+```
+<|tool_call_start|>[run_terminal_command($schema="https://json-schema.org/draft/2020-12/schema",
+cwd="/mnt/host", env={"key": "value"}, stdin="", timeout_ms=0, max_output=0)]<|tool_call_end|>
+```
+
+`error: expected an identifier at 22`. The dialect was right, the markers were right, and the call
+was garbage: the model had transcribed the *schema's keys* instead of filling them in, starting with
+the first key it saw. `$schema` and `title` are JSON Schema **document** metadata that `tool.ts` puts
+in `inputSchema`, and `openaiTool()` hands the whole object over as `function.parameters`. Note
+`env={"key": "value"}` — there is no such example anywhere in the schema; it read
+`additionalProperties: {type: string}` and invented a specimen.
+
+`ToolRegistry.definitions()` now strips both keys. It is done there rather than at the source because
+`docs/schema/*.json` are published documents where `$schema` belongs and `TestArtifactsAreCurrent`
+pins them to the Go types; `definitions()` is the only path that becomes prompt text. Same turn,
+after the strip:
+
+```
+<|tool_call_start|>[run_terminal_command(cmd="ls")]<|tool_call_end|>
+```
+
+**This was never a 350M problem.** Every model in the registry has been paying for that URL in every
+prompt of every turn; the small one just failed loudly enough to show it.
+
+#### 2. Qwen3.5's `<tool_call>` markers are hermes'. Its body is not.
+
+The entry shipped as `dialect: "hermes"` on the strength of reading the chat template, which writes
+`<tool_call>`, `<tool_response>` and `<think>`. What the model emits:
+
+```
+<tool_call>
+<function=run_terminal_command>
+<parameter=cmd>
+ls /mnt/host
+</parameter>
+</function>
+</tool_call>
+```
+
+Outer markers identical, body XML rather than JSON — `tool call body is not valid JSON: Unexpected
+token '<'`. This is the `qwen3_coder` format, and the **model card names it**: it tells vLLM and
+SGLang users to pass `--tool-call-parser qwen3_coder`. The information was there; the inference from
+markers to grammar was wrong. That is §10.2's rule holding for the third time, and the sharpest
+version of it yet — LFM2 was documentation contradicting behaviour and LFM2.5-350M was a *name*
+implying a dialect, but this one had the right markers and still the wrong grammar.
+
+New `qwen3.5` dialect, `verified: true` off the captured turn. Two details are load-bearing and both
+came from the transcript rather than from thinking about it:
+
+- **The model emitted one more `</parameter>` than it opened.** The fixture keeps the duplicate, and
+  the non-greedy match tolerates it, because a real model did this on the first turn ever run.
+- **The XML wire has no types, and `decodeArgs` is strict.** `cmd` must arrive a string and
+  `max_output` a real integer, so values are JSON-parsed with a fall back to the raw text —
+  `1024` becomes a number, `ls /mnt/host` stays a string.
+
+#### 3. The export's stop token was the base model's, so the model wrote the user's next message
+
+With the XML parsing, the call was right and the run still failed. The model finished its turn, and
+then kept going:
+
+```
+</tool_call><|im_end|>\n<|im_start|>user\n<think>\n\n</think>\n\n<tool_call>…
+<|im_start|>user\n<tool_response>\nFilesystem type: filesystem\nName: /mnt/host\nSize: 506MB…
+```
+
+It wrote the user's turn, a second call, and a **fabricated `<tool_response>`** full of invented
+output. That reads like hallucination. It is two integers:
+
+| where | says |
+|---|---|
+| `generation_config.json` | `eos_token_id: 248044` |
+| `tokenizer.json` | `248044` is `<\|endoftext\|>` |
+| `tokenizer_config.json` | `eos_token: <\|im_end\|>` |
+| `tokenizer.json` | `<\|im_end\|>` is **248046** |
+
+The export carried the **base** model's EOS into a chat checkpoint. Nothing in a conversation emits
+`<|endoftext|>`, so generation ran to `max_new_tokens` every time. `GenerationDefaults` gains
+`eos_token_id` (checked against the bundle first, as that interface requires) and the entry sets
+248046, read out of this checkpoint's own tokenizer.
+
+#### What each model actually did
+
+| entry | load | tool call | verdict |
+|---|---|---|---|
+| **Qwen3.5 0.8B (text)** | 3.0 s | `ls -la /mnt/host` | **passes `agent.spec.ts`** — right path, real output, answered from it |
+| **Granite 4.0 H 1B** | 5.2 s | `ls -R /mnt/host`, `cwd=/mnt/host` | correct call and correct answer; spec red for a reason on our side — below |
+| LFM2.5 350M | 1.6 s | `ls` | parses, reaches the guest, exit 0 — then ignores the path it was given and lists `/` |
+
+LFM2.5 350M is Qwen2.5 0.5B's finding one step further along (§10.11): the syntax is right *and* the
+call now executes, but the target is wrong, and it then described the root filesystem as if it were
+the user's folder. Registry note says so. It stays for the same reason Qwen2.5 does — it is 294 MB
+and it exercises the loop.
+
+#### 4. Granite found a bug in the mount, not in itself
+
+Granite behaved best of the three: it is the only entry so far to set `cwd` as well as `cmd`, it
+reached for `ls -R`, and it wrapped `arguments` as a JSON *string* rather than an object — which
+`parseCallBody` already accepted, so `hermes` was the right dialect after all. It then answered
+correctly, naming `hello.txt`, `link.txt` and `sub`.
+
+`agent.spec.ts` still failed it, on `expect(step.exitCode).toBe(0)`. Run outside any model:
+
+```
+$ ls -R /mnt/host          # exit 1
+/mnt/host:
+hello.txt  link.txt  sub
+
+/mnt/host/sub:
+nested.txt
+
+ls: cannot open directory '/mnt/host/hello.txt': Not a directory
+ls: cannot open directory '/mnt/host/sub/nested.txt': Not a directory
+```
+
+**The listing is complete and correct; only the exit code is wrong.** This is §10.x's missing
+`d_type` again, and the first guess about it here was wrong in an instructive way: `ls -R` was
+assumed to fail like `find` does, silently not recursing. It does the opposite. Without `d_type` it
+cannot tell a file from a directory, so it `opendir()`s *everything* — which is why it recurses
+correctly — and banks one `ENOTDIR` per regular file, exiting 1. `find` trusts `d_type` and gives up;
+`ls` distrusts it and brute-forces. Same missing field, opposite symptoms, and only one of them was
+pinned.
+
+Now both are: a second `KNOWN GAP` case sits beside the `find` one, asserting exit 1, a complete
+listing, and `Not a directory` on stderr. Conformance 46 → **47**.
+
+The wider point is about what a model is for here. Three entries were driven through one prompt, and
+the best-behaved of them went straight at a gap in the mount that eighteen months of hand-written
+conformance cases had left uncovered — because a person writing cases writes the commands they
+already know work, and a model reaches for the command that is *right*.
+
+**The pattern across all three.** Every failure was a place where we believed a file over a
+transcript: the schema we send, the grammar we inferred from markers, the stop token the export
+declared. §10.19 could reject candidates from metadata because the constraints it checked were
+*mechanical* — a byte count, an architecture string, a graph input. Nothing about behaviour survived
+contact, and nothing about behaviour was knowable without the GPU.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)
