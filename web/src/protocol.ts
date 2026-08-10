@@ -194,10 +194,12 @@ function parseSeqFrame(line: Uint8Array, prefix: string, kind: FrameKind): Frame
 // the Go Scanner does.
 // Growth and scanning are both amortized O(1) per byte: the buffer doubles
 // instead of reallocating per chunk, and `scanned` remembers how far the
-// newline search already got. The emscripten console feeds this one byte at a
-// time (QEMU's 16550 UART writes per character), so a decoder that recopied and
-// rescanned the pending line on every chunk turned a 1 MiB response into
-// minutes of quadratic work.
+// newline search already got. That is not a micro-optimization: the removed
+// --to-js page fed this one byte at a time (QEMU's 16550 UART writes per
+// character), and a decoder that recopied and rescanned the pending line on
+// every chunk turned a 1 MiB response into minutes of quadratic work. Keep it
+// amortized O(1) per byte — any console-side transport can hand over small
+// chunks.
 const initialCapacity = 4096;
 
 export class FrameDecoder {

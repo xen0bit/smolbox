@@ -44,12 +44,10 @@ if (args.includes("--list")) {
   process.exit(0);
 }
 
-// One key per line on stdout, for `make models` to loop over. The local entries
-// are omitted rather than listed and skipped by the caller: whether a key can be
-// downloaded is a property of the registry, and this is the only place that
-// reads it.
+// One key per line on stdout, for `make models` to loop over. Every registry
+// entry is downloadable, so this is the whole list.
 if (args.includes("--keys")) {
-  process.stdout.write(`${models.filter((m) => !m.local).map((m) => m.key).join("\n")}\n`);
+  process.stdout.write(`${models.map((m) => m.key).join("\n")}\n`);
   process.exit(0);
 }
 
@@ -57,14 +55,6 @@ if (args.includes("--keys")) {
 const flagValues = new Set(args.filter((a, i) => args[i - 1]?.startsWith("--")));
 const key = args.find((a) => !a.startsWith("--") && !flagValues.has(a));
 const entry = modelFor(key ?? DEFAULT_MODEL_KEY);
-if (entry.local) {
-  // No ONNX build of these exists on the hub and the source weights are gated,
-  // so there is nothing here to download (PLAN §11.1.5). Say which command does
-  // produce them rather than emitting a wall of 404s.
-  say(`${entry.key} is built locally, not downloaded.`);
-  say(`  run: make antares-onnx ANTARES=${entry.repo.split("/").pop()?.replace("-ONNX", "")}`);
-  process.exit(1);
-}
 // The first candidate dtype is the one the page prefers, so it is the default
 // to pull. `--dtype` exists because "preferred" is a property of the adapter,
 // not of this machine: an entry can lead with q4f16 and be downloaded here as

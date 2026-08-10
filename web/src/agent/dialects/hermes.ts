@@ -37,8 +37,8 @@ export function parseTurn(raw: string): ParsedTurn {
     calls.push(...parseCallBody(body));
   }
   // Qwen3 emits reasoning inside <think>…</think> ahead of its answer, writing
-  // both tags itself — unlike LFM2.5 and Antares, whose templates open the block
-  // in the prompt. It is not prose for the user and must not be shown as such.
+  // both tags itself — unlike LFM2.5, whose template opens the block in the
+  // prompt. It is not prose for the user and must not be shown as such.
   const { text, reasoning } = splitThinking(stripSpecialTokens(rest), "tagged");
   return { text: text.trim(), reasoning: reasoning.trim(), calls };
 }

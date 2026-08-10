@@ -1,7 +1,7 @@
 // The live view of a partial completion, per dialect.
 //
 // This is the half of the chat UI that CI can reach. The page used to hold one
-// hardcoded `<|tool_call_start|>` for every family, so Qwen, Antares and Llama
+// hardcoded `<|tool_call_start|>` for every family, so Qwen, Gemma and Llama
 // streamed their raw call syntax into the log as if it were prose, and LFM2.5
 // streamed its entire scratchpad as the answer and then replaced it when the
 // turn finished. Both are "the parsing looks wonky but still works" from the
@@ -11,7 +11,6 @@ import { describe, expect, test } from "bun:test";
 
 import { splitThinking } from "../parse.ts";
 import { dialects } from "./index.ts";
-import { antares } from "./antares.ts";
 import { hermes } from "./hermes.ts";
 import { lfm2 } from "./lfm2.ts";
 import { lfm25 } from "./lfm25.ts";
@@ -22,7 +21,6 @@ const partial: Record<string, string> = {
   lfm2: 'Let me look. <|tool_call_start|>[run_terminal_command(cmd="ls',
   "lfm2.5": 'thinking</think>Let me look. <|tool_call_start|>[run_terminal_command(cmd="ls',
   hermes: 'Let me look. <tool_call>{"name": "run_terminal_command", "argum',
-  antares: 'thinking</think>Let me look. <tool_call>{"name": "terminal", "comm',
   llama: 'Let me look. <|python_tag|>{"name": "run_terminal_command"',
   gemma4: 'Let me look. <|tool_call>call:run_terminal_command{cmd:<|"|>ls',
 };
@@ -59,7 +57,6 @@ const complete: Record<string, string> = {
   lfm2: 'Let me look. <|tool_call_start|>[run_terminal_command(cmd="ls")]<|tool_call_end|>',
   "lfm2.5": 'thinking</think>Let me look. <|tool_call_start|>[run_terminal_command(cmd="ls")]<|tool_call_end|>',
   hermes: 'Let me look. <tool_call>{"name": "run_terminal_command", "arguments": {"cmd": "ls"}}</tool_call>',
-  antares: 'thinking</think>Let me look. <tool_call>{"name": "terminal", "command": "ls"}</tool_call>',
   llama: 'Let me look. <|python_tag|>{"name": "run_terminal_command", "arguments": {"cmd": "ls"}}<|eom_id|>',
   gemma4: 'Let me look. <|tool_call>call:run_terminal_command{cmd:<|"|>ls<|"|>}<tool_call|>',
 };
@@ -68,7 +65,6 @@ const prose: Record<string, string> = {
   lfm2: "There are three files.",
   "lfm2.5": "counting them</think>There are three files.",
   hermes: "<think>counting them</think>There are three files.",
-  antares: "counting them</think>There are three files.",
   llama: "There are three files.",
   gemma4: "<|channel>thought\ncounting them<channel|>There are three files.",
 };
@@ -92,12 +88,6 @@ describe("reasoning is previewed as reasoning, never as the answer", () => {
     const p = hermes.preview("<think>counting</think>There are three.");
     expect(p.reasoning).toBe("counting");
     expect(p.text).toBe("There are three.");
-  });
-
-  test("Antares reasons before every call, and the reasoning is not the answer", () => {
-    const p = antares.preview("I should search the repo</think>");
-    expect(p.reasoning).toBe("I should search the repo");
-    expect(p.text).toBe("");
   });
 
   test("a family with no reasoning channel reports none", () => {

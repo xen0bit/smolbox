@@ -183,8 +183,6 @@
       <nav>
         <a href="/" aria-current="page">VM</a>
         <a href="/agent/">chat</a>
-        <a href="/scan/">scan</a>
-        <a href="/js/">js</a>
       </nav>
     </header>
 
@@ -204,17 +202,13 @@
       <code>ArrowUp</code> and <code>Ctrl+L</code> all work.
     </p>
     <p>
-      This is the WASI build: it runs under wazero and in the browser, and it is
-      the one that can mount a host folder read-only at <code>/mnt/host</code>.
-      The faster emscripten build lives at <a href="/js/">/js/</a> and has
-      <strong>no host mount</strong>.
+      This is the WASI build: the same <code>dist/smolbox.wasm</code> runs under
+      wazero and in the browser, and it can mount a host folder read-only at
+      <code>/mnt/host</code>.
     </p>
     <p>
       <strong>Also here:</strong> <a href="/agent/">/agent/</a> is a chat UI with
-      a local model driving this VM, and <a href="/scan/">/scan/</a> runs Cisco's
-      Antares over a folder you pick to suggest files that may contain a given
-      CWE. Both need <code>make model</code> or <code>make antares-onnx</code>
-      first.
+      a local model driving this VM. It needs <code>make model</code> first.
     </p>
 
     <script type="module" src="/main.js"></script>

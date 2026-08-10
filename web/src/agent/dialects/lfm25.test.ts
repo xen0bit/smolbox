@@ -79,9 +79,9 @@ describe("parseTurn: the reasoning channel", () => {
   });
 });
 
-// Every case above is constructed. lfm2.test.ts has "a real captured turn" and
-// antares.test.ts has its own, because that fixture is what `verified: true`
-// asserts — the dialect was promoted ahead of this one, so this is the debt.
+// Every case above is constructed. lfm2.test.ts has "a real captured turn",
+// because that fixture is what `verified: true` asserts — the dialect was
+// promoted ahead of this one, so this is the debt.
 //
 // To take the capture: `make model MODEL=lfm2.5-2.6b`, `make serve`, open
 // /agent/, pick LFM2.5 2.6B, mount a folder, ask something that needs the tool,

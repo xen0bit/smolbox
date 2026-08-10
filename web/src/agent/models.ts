@@ -29,16 +29,16 @@ export type Dtype = "q4" | "q4f16" | "fp16" | "q8" | "fp32";
  * Sampling settings a checkpoint needs to behave as trained.
  *
  * M8 chose greedy decoding so a spike's output would not change run to run, and
- * that was right for a spike. It is wrong for Antares: at temperature 0 both
- * sizes fall into repetition loops and never reach a tool call — the reference
- * safetensors model does it too, so it is the checkpoint's property, not the
- * runtime's (PLAN §11.10). An entry that needs sampling has to say so.
+ * that was right for a spike. It is wrong for some checkpoints: Gemma 4 at
+ * temperature 0 makes its first tool call perfectly and then answers <eos>
+ * forever once a result comes back (PLAN §10.15). An entry that needs sampling
+ * has to say so.
  *
- * `frequency_penalty` is deliberately absent. Antares specifies 0.3, and
- * transformers.js has no additive frequency penalty — only a multiplicative
- * `repetition_penalty`, which is a different function. Recording the gap beats
- * substituting a lookalike. `repetition_penalty` itself is here because LFM2.5
- * asks for exactly that function, at 1.1 — no substitution involved.
+ * `frequency_penalty` is deliberately absent: transformers.js has no additive
+ * frequency penalty, only a multiplicative `repetition_penalty`, which is a
+ * different function. Recording the gap beats substituting a lookalike.
+ * `repetition_penalty` itself is here because LFM2.5 asks for exactly that
+ * function, at 1.1 — no substitution involved.
  *
  * Every field is spread straight into `model.generate()`, so a name that
  * transformers.js does not implement would be silently ignored. Only add one
@@ -99,14 +99,6 @@ export interface ModelEntry {
   contextTokens: number;
   dialect: DialectName;
   note?: string;
-  /**
-   * Built locally by `make antares-onnx` rather than downloadable.
-   *
-   * No ONNX build of Antares exists anywhere and the source weights are gated
-   * (PLAN §11.1.5), so `make model` cannot help. The UI needs this to say "run
-   * the build" instead of offering a download that would 404.
-   */
-  local?: boolean;
   /** Sampling this checkpoint needs. Absent means the page's defaults are fine. */
   generation?: GenerationDefaults;
   /** Which engine runs it. Absent means transformers.js, as everything did. */
@@ -170,13 +162,6 @@ export interface ModelEntry {
   inlineBytes?: Partial<Record<Dtype, number>>;
   /** How its weights are laid out in the repo. Absent means the ONNX layout. */
   weights?: WeightLayout;
-  /**
-   * The task this model is for, when it is not general chat.
-   *
-   * Antares is trained for exactly one job with a fixed termination protocol;
-   * offering it in a chat box without saying so produces confident nonsense.
-   */
-  task?: "chat" | "localize";
 }
 
 /** Quantizations that need `shader-f16` on the adapter. */
@@ -195,7 +180,7 @@ export const F16_DTYPES: ReadonlySet<Dtype> = new Set<Dtype>(["q4f16", "fp16"]);
  * | 786 MB — Qwen2.5 0.5B q4 | loads and runs |
  * | 1.43 GB — Qwen3 1.7B q4f16 | `Can't create a session`, std::bad_alloc |
  * | 1.74 GB — Qwen3 1.7B q8 | std::bad_alloc |
- * | 1.82 GB — Antares 350M fp32 | std::bad_alloc |
+ * | 1.82 GB — a single-file fp32 export | std::bad_alloc |
  * | 2.15 GB — Qwen3 1.7B q4 | `RangeError` out of readResponse |
  *
  * Set between the largest that works and the smallest that does not. It is a
@@ -203,8 +188,8 @@ export const F16_DTYPES: ReadonlySet<Dtype> = new Set<Dtype>(["q4f16", "fp16"]);
  * GPU memory, which is why a 16 GB card does not move it.
  *
  * The fix for a build over this line is a sidecar, not a smaller quantization:
- * the same 1.82 GB Antares graph re-saved with external data loads in 8.0 s and
- * generates. `tools/quantize_onnx.py` now shards on this rule.
+ * that same 1.82 GB graph, re-saved with external data, loaded in 8.0 s and
+ * generated.
  */
 export const INLINE_WEIGHT_CEILING_BYTES = 1_000_000_000;
 
@@ -294,8 +279,8 @@ export const models: ModelEntry[] = [
     //
     // So the blocker is the inline-weight ceiling, not the adapter, and
     // `inlineBytes` below is what makes pickDtype say so. Unblocking this needs
-    // a re-export with external data (a `.onnx_data` sidecar) — the thing that
-    // turned Antares 350M from unloadable into an 8-second load (PLAN §10.18) —
+    // a re-export with external data (a `.onnx_data` sidecar) — the move that
+    // turned a 1.82 GB unloadable export into an 8-second load (PLAN §10.18) —
     // not a different GPU and not a different dtype.
     dtypes: ["q4f16"],
     inlineBytes: { q4f16: 1_426_069_098 },
@@ -304,69 +289,6 @@ export const models: ModelEntry[] = [
     contextTokens: 40_960,
     dialect: "hermes",
     note: "Emits <think> blocks. Unloadable in a browser: every published build is one file too large for the wasm heap. Needs a re-export with external data.",
-  },
-  {
-    key: "antares-1b",
-    label: "Antares 1B (vulnerability localization)",
-    // Built by `make antares-onnx`, not downloaded. The revision pins the
-    // SOURCE checkpoint the local build came from, which is the only thing that
-    // makes a locally-built artifact reproducible.
-    repo: "fdtn-ai/antares-1b-ONNX",
-    revision: "10417eb35641b32e7141157db19c76eb545193b6",
-    vocabSize: 100_352,
-    // fp16 only, and that is a measured decision rather than an omission.
-    // Antares' RL-tuned weights are quantization-hostile: this repo's quantizer
-    // scores 0.943 logit correlation on the Granite base model it came from —
-    // better than onnx-community's own published q4 — and 0.816 on Antares,
-    // which costs it the tool-call protocol entirely (PLAN §11.10).
-    //
-    // fp32 is deliberately NOT offered, unlike its 350M sibling. The build
-    // produces one (it is the parity reference) and it is correctly sharded, so
-    // it would load — but at 7.35 GB it did not finish doing so in ten minutes
-    // here, against 8.0 s for 350M's 1.82 GB (PLAN §10.18). Listing a dtype that
-    // technically works and practically hangs is worse than not listing it.
-    // This entry therefore still needs shader-f16, and is the one model in the
-    // registry that does. See §10.18 for the two ways out, both unmeasured: an
-    // int8 build (int4 is known to destroy it; int8 is untested), or a machine
-    // whose adapter exposes the feature.
-    dtypes: ["fp16"],
-    approxBytes: 3_676_884_858,
-    contextTokens: 131_072,
-    dialect: "antares",
-    local: true,
-    task: "localize",
-    generation: { do_sample: true, temperature: 0.3, top_p: 1.0, max_new_tokens: 4096 },
-    note: "Built locally: run `make antares-onnx`. 3.7 GB at fp16 — the largest entry by far.",
-  },
-  {
-    key: "antares-350m",
-    label: "Antares 350M (does not follow the protocol)",
-    repo: "fdtn-ai/antares-350m-ONNX",
-    revision: "cdf6d054fa5f491553ccb1704269cbd1954c6c6e",
-    vocabSize: 100_352,
-    // fp32 first, and it is the only entry here that prefers it. Not a quality
-    // choice — it is the one build of this model that runs on an adapter without
-    // shader-f16, which fp16 by definition cannot. It became loadable when
-    // `make antares-onnx` started sharding on the browser's ceiling rather than
-    // protobuf's: the same 1.82 GB graph is unloadable inline and loads in 8.0 s
-    // with a sidecar (PLAN §10.18). Verified end to end at fp32 here — 8.0 s
-    // load, coherent generation.
-    //
-    // fp16 stays second and wins wherever the feature exists: half the bytes,
-    // and 0.999514 logit correlation against this same fp32 reference.
-    dtypes: ["fp32", "fp16"],
-    approxBytes: 1_821_708_714,
-    contextTokens: 32_768,
-    dialect: "antares",
-    local: true,
-    task: "localize",
-    generation: { do_sample: true, temperature: 0.3, top_p: 1.0, max_new_tokens: 4096 },
-    // Listed rather than dropped because "we tried the small one" is worth
-    // recording where someone will look for it: at fp32, temperature 0 and 0.3,
-    // against the exact CLI prompt, it produces fluent reasoning and then loops
-    // without ever emitting a tool call (PLAN §11.10). Its conversion is
-    // verified; its behaviour is not usable.
-    note: "Converts and runs, but never emits a tool call. Kept for comparison — use 1B.",
   },
   {
     key: "gemma4-e2b",
@@ -618,8 +540,7 @@ export const LOCAL_MODEL_PATH = "/models/";
  * transformers.js only reads an inline `chat_template` — the standalone file is
  * loaded by Processor (multimodal) and never by AutoTokenizer, so a repo that
  * ships only this one makes apply_chat_template throw. Newer HF exports prefer
- * the standalone file, which is why the locally-built Antares has it and the
- * two LFM2 repos do not.
+ * the standalone file; the two LFM2 repos do not have it.
  */
 export const CHAT_TEMPLATE_FILE = "chat_template.jinja";
 

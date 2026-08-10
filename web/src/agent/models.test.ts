@@ -156,8 +156,11 @@ describe("pickDtype", () => {
   });
 
   test("returns undefined when nothing on offer runs here", () => {
-    expect(pickDtype(modelFor("antares-1b"), new Set())).toBeUndefined();
-    expect(pickDtype(modelFor("antares-1b"), new Set(["shader-f16"]))).toBe("fp16");
+    // Synthetic rather than a registry entry: no shipped model is f16-only now,
+    // and the rule should outlive whichever ones are.
+    const f16Only = { ...modelFor("lfm2-1.2b-tool"), dtypes: ["q4f16" as const] };
+    expect(pickDtype(f16Only, new Set())).toBeUndefined();
+    expect(pickDtype(f16Only, new Set(["shader-f16"]))).toBe("q4f16");
   });
 
   test("skips a build too large to load with its weights inline", () => {
@@ -169,17 +172,19 @@ describe("pickDtype", () => {
     expect(pickDtype(qwen3, new Set(["shader-f16"]))).toBeUndefined();
   });
 
-  test("prefers Antares 350M's fp32, the build that needs no adapter feature", () => {
-    // The sharded fp32 is the whole point of §10.18: it is bigger than fp16 and
-    // it is chosen first anyway, because it is the one that runs everywhere.
-    expect(pickDtype(modelFor("antares-350m"), new Set())).toBe("fp32");
-    expect(pickDtype(modelFor("antares-350m"), new Set(["shader-f16"]))).toBe("fp32");
+  test("a bigger dtype wins when it is the one that runs everywhere", () => {
+    // Order in `dtypes` is a claim about preference, and pickDtype honours it
+    // even when the preferred build is the larger one — being loadable on any
+    // adapter beats being small (PLAN §10.18).
+    const fp32First = { ...modelFor("lfm2-1.2b-tool"), dtypes: ["fp32" as const, "q4f16" as const] };
+    expect(pickDtype(fp32First, new Set())).toBe("fp32");
+    expect(pickDtype(fp32First, new Set(["shader-f16"]))).toBe("fp32");
   });
 });
 
 describe("dtypeBlockers", () => {
   test("names the adapter feature when that is the only thing missing", () => {
-    const reasons = dtypeBlockers(modelFor("antares-1b"), "fp16", new Set());
+    const reasons = dtypeBlockers(modelFor("lfm2-1.2b-tool"), "q4f16", new Set());
     expect(reasons).toHaveLength(1);
     expect(reasons[0]).toContain("shader-f16");
     expect(reasons[0]).not.toContain("external data");
@@ -205,7 +210,7 @@ describe("dtypeBlockers", () => {
 
   test("is empty for a dtype that runs", () => {
     expect(dtypeBlockers(modelFor("lfm2-1.2b-tool"), "q4", new Set())).toEqual([]);
-    expect(dtypeBlockers(modelFor("antares-350m"), "fp32", new Set())).toEqual([]);
+    expect(dtypeBlockers(modelFor("lfm2-1.2b-tool"), "q4f16", new Set(["shader-f16"]))).toEqual([]);
   });
 
   test("only entries with inlineBytes can be blocked on size", () => {

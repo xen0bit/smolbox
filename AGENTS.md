@@ -14,8 +14,9 @@ directory read-only at `/mnt/host`. An on-device LLM on WebGPU drives it through
 Milestone status: **M0 (scaffolding), M1 (wasm build + wazero boot), M2 (guest agent + session +
 CLI), M3 (read-only host mount under wazero + shared conformance table), M4 (browser worker +
 stdio router + TS session, preopen spike proven), M5 (sync FS bridge + browser mount + browser
-conformance driver), M6 (emscripten `--to-js` target + its conformance driver), and M7 (tool-API
-docs, generated JSON Schema, mock caller) done — every milestone in PLAN §6 is complete.**
+conformance driver) and M7 (tool-API docs, generated JSON Schema, mock caller) done — every
+milestone in PLAN §6 is complete. M6 (the emscripten `--to-js` page) was built and has since been
+removed; PLAN §6 keeps the record.**
 Component 2 has started: **M8 (the WebGPU tool-call spike) is done** — a local LFM2 model on WebGPU
 drives a real VM through the M7 tool surface, which needed **no changes** to serve it (PLAN §9).
 **M9 (chat UI + multi-turn loop), M10 (model registry + dialects) and M11 (customizable tools) are
@@ -41,34 +42,32 @@ pure and drive it with `FakeModelClient`.
 
 | Command | Purpose |
 |---|---|
-| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm wasm-js web gemma-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
+| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm web gemma-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
 | `make lint` | golangci-lint (v2) + `bunx --bun tsc --noEmit` |
 | `make test` | Go unit tests (no Docker) |
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
 | `make builder-image` | build `smolbox/c2w-builder:dev` from `build/Dockerfile.c2w` |
 | `make wasm` | convert the guest to `dist/smolbox.wasm` (needs Docker) |
-| `make wasm-js` | convert the guest to `dist/js/` via `c2w --to-js` (emscripten/QEMU, **no host mount**) |
 | `make test-integration` | boot `dist/smolbox.wasm` under wazero, session-lifecycle tests only |
 | `make test-conformance` | run the shared `tests/conformance/cases.json` table through the wazero driver, **plus the mock caller** (M7) |
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
-| `make web` / `make serve` | bundle browser worker + page into `web/dist`; merge the emscripten page into `dist/js`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
+| `make web` / `make serve` | bundle browser worker + page into `web/dist`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
 | `make compress` | write a `.br` + `.gz` beside every compressible artifact in `dist/` and `web/dist`; `web/serve.ts` serves them by negotiation and falls back to identity when absent |
 | `make test-web` | `bun test web` (protocol + session + fsbridge + tool-surface + serve negotiation unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
-| `make test-e2e-js` | Playwright: boots `dist/js` at `/js/` — boot smoke, the no-mount guard, and the non-mount conformance cases (M6) |
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
-| `make models` | pull **every** downloadable registry entry (~11 GB); keeps going past a failure and reports at the end. Gated/local entries (Antares) are excluded |
+| `make models` | pull **every** downloadable registry entry; keeps going past a failure and reports at the end |
 | `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
-`dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`; M6 adds `make test-e2e-js`
-(needs `dist/js`). M8's `make test-e2e-agent` is **not** part of the gate — it needs a GPU and
-1.22 GB of weights, so run it by hand when touching `web/src/agent/`.
+`dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`. M8's `make test-e2e-agent` is
+**not** part of the gate — it needs a GPU and 1.22 GB of weights, so run it by hand when touching
+`web/src/agent/`.
 
 ## How the VM is built (the two Dockerfiles)
 
@@ -157,42 +156,6 @@ shared"). The fsbridge `.slice()`s request/response bytes out of the SAB before 
 ends (PLAN §2.11.13); the READ payload window is copied with `TypedArray.prototype.slice`, which
 already allocates a non-shared buffer.
 
-### The emscripten (`--to-js`) page: everything is on the main thread
-`web/js.html` + `web/src/emscripten/` is a second page at `/js/` sharing the whole protocol stack
-(`protocol.ts`, `stdio.ts`, `session.ts`) and differing only in the console transport. QEMU's
-`main()` runs on a pthread, but every PTY-touching syscall is in `out.js`'s `proxiedFunctionTable`,
-so `Module['pty']` (`ProtocolPty`) is called on the page — which is why `js-main.ts` can hold the
-`Session` directly and feed it a fake `MessageSink` instead of a worker. Host → guest still goes
-through the same `StdinChannel`; `StdinChannel.onWrite` fires `ProtocolPty.notifyInput()` to wake
-the runtime's pending `onReadable`, and `onReadable` fires immediately via `queueMicrotask` when
-data is already buffered (the lost-wakeup guard). No fsbridge: this target is no-mount.
-
-### The emscripten `TTY.stream_ops.poll` override is mandatory, not cosmetic
-c2w's `out.js` ships a PTY-aware `TTY`, so it looks like it needs no patching — but its `poll`
-calls `PTY_askToWaitAgain` whenever the pty has no input, and the enclosing `PTY_wrapPoll` parks the
-QEMU pthread on `Atomics.wait` until somebody types. With a programmatic console nobody ever does,
-so the VM produces **zero output** and looks dead. `js-main.ts` replaces it in `preRun` with the
-same mask minus the block — `(pty.readable ? 1 : 0) | (pty.writable ? 4 : 0)`; keeping POLLOUT is a
-deliberate improvement on upstream's `1 : 0`. **Leave `TTY.stream_ops.read` blocking**: that is what
-suspends `fd_read` between exec calls. (PLAN §2.11.15.)
-
-### The emscripten console delivers one byte at a time
-QEMU's emulated 16550 UART writes a single byte per `fd_write`, each a `proxyToMainThread` hop.
-That caps console throughput at ~35 kB/s (the WASI build does ~345 kB/s) and it is structural — do
-not chase it. It also means **any console-side buffer must be amortized O(1) per byte**: this is
-what exposed the quadratic `FrameDecoder` (rebuffering *and* rescanning the pending line on every
-chunk), which turned a 1 MiB response into a >300 s hang. (PLAN §2.11.16.)
-
-### The emscripten build has no clean teardown
-c2w's init runs `poweroff -f`, but the kernel is booted with `acpi=off`, so the guest cannot power
-the machine off and QEMU keeps emulating a halted CPU. `Module['onExit']` never fires (verified past
-90 s), and the command line is baked into the restored `vm.state` snapshot, so it cannot be changed.
-`js-main.ts` therefore does not call `Session.close()`: it sends `shutdown` as a plain request and
-treats the reply as the end of the session. Do not "fix" this by extending the close timeout.
-Relatedly, the generated `arg-module.js` always emits `-netdev socket,connect=127.0.0.1:8888`, so
-the page logs a failed WebSocket at boot — that is upstream's no-network mode (the socket is only
-used when `Module['websocket'].url` is set, which smolbox never does). Cosmetic; leave it.
-
 ### Browser poll_oneoff: never let a wait go unbounded
 `waitMs` is only ever shrunk by a *clock* subscription, so a guest poll carrying only fd-read
 subscriptions has nothing to bound it. Sleeping until stdin arrives is fatal during boot — the host
@@ -205,9 +168,8 @@ Do not raise it back for "efficiency". (PLAN §2.11.19.)
 `wasi.start()` blocks the worker, so no timer can fire there — the WASI boot watchdog rides the
 `poll_oneoff` loop and posts a stall report every 5 s after 20 s without a banner. **Silence in
 those reports is the signal**: it means `poll_oneoff` stopped returning and the worker is parked.
-The emscripten page uses a plain `setInterval` (its main thread is free); `writes=0` there means the
-guest never reached its first serial write, i.e. a regressed TTY poll override. `tests/e2e/harness.ts`
-appends the last 40 console lines to any boot failure so CI logs carry the evidence. If you touch
+`tests/e2e/harness.ts` appends the last 40 console lines to any boot failure so CI logs carry the
+evidence. If you touch
 the poll or console paths, keep these reports working — a boot hang that reproduces only on CI is
 otherwise close to undebuggable. (PLAN §2.11.20.)
 
@@ -289,9 +251,8 @@ chat template only from `chat_template` inside `tokenizer_config.json`.** The st
 `chat_template.jinja` is loaded by `Processor`, on the multimodal path, and by nothing else — while
 Python `transformers` prefers the standalone file. So a checkpoint that ships only the file passes
 every build-time check (they all run under Python), loads on the page, and then throws inside
-`apply_chat_template` on the first turn. `make antares-onnx` writes both, and the worker fetches the
-standalone file as a fallback when the tokenizer has no inline template, which covers repos built
-before that.
+`apply_chat_template` on the first turn. The worker fetches the standalone file as a fallback when
+the tokenizer has no inline template, which covers those repos.
 
 ### The prompt budget is a GPU allocation, not a preference
 Every ONNX export here emits **full-sequence** logits (`[batch, sequence_length, vocab_size]`), so a
@@ -331,7 +292,7 @@ template-only session safe. Exposure is opt-in — a definition is ~0.5–2.3 KB
 ### A dialect owns the live view too, not just the parse
 `Dialect.preview(raw)` is the mid-stream half of `parseTurn`: prose so far, reasoning so far, and
 whether a tool-call block has opened and not yet closed. It exists because the page used to hold one
-hardcoded `<|tool_call_start|>`, so Qwen, Antares and Llama streamed their raw call syntax into the
+hardcoded `<|tool_call_start|>`, so Qwen, Gemma and Llama streamed their raw call syntax into the
 chat log as prose while LFM2 did not — the markers that must not reach the screen are exactly the
 ones that differ per family. Adding a dialect means adding both functions; `preview.test.ts` runs
 every registered dialect through the same partial-turn table.
@@ -340,8 +301,7 @@ Reasoning is **separated, not discarded**. `ParsedTurn.reasoning` carries it, th
 it under the answer, and a turn that never left the scratchpad says so instead of rendering a page of
 first-person deliberation as the reply. `splitThinking` knows three shapes: `none`, `tagged` (the
 model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
-`<think>`, so the completion starts inside the block — LFM2.5, Antares). The localize page joins the
-two channels back together, because there the deliberation *is* the content it displays.
+`<think>`, so the completion starts inside the block — LFM2.5).
 
 ### There are two inference engines now, and only one interface
 `ModelEntry.backend` picks between them. `transformers` is onnxruntime-web through
@@ -379,7 +339,7 @@ run `bun test web/src/agent/kernel-f32.test.ts`**, which applies them to the rea
 allocating 2.5 GB. That looks like a bug in the engine and is not.
 
 **`web/serve.ts` caches with validators, never `immutable`.** No URL here is content-addressed —
-`make web`/`make wasm`/`make wasm-js` rewrite the bundles and the VM in place, and
+`make web`/`make wasm` rewrite the bundles and the VM in place, and
 model/gemma-kernels re-pull weights — so every file is served with an `ETag` (`size-mtime`) and
 `Last-Modified`, and a matching `If-None-Match`/`If-Modified-Since` returns 304. Non-HTML gets
 `Cache-Control: public, max-age=86400` (a revisit within the day costs nothing; after that it is a
@@ -389,17 +349,13 @@ it every load; the page shows a `<progress>` bar fed by the worker's download st
 (`web/src/worker.ts` `fetchWasm`) while it does. The `If-Modified-Since` comparison floors the mtime
 to whole seconds — HTTP dates have no sub-second precision — or a freshly touched file never 304s.
 
-**A bare `make` builds everything, and the order is why that is worth having.** Three of the steps are
-order-dependent and fail quietly in the wrong order: `wasm-js` must precede `web`, because `make web`
-merges the emscripten page into `dist/js` and *skips that step with a note rather than an error* when
-the directory is absent; `gemma-kernels` must precede `compress`, or the kernel engine ships
-unencoded; and `compress` runs before `models` so that a dropped connection on the 11 GB pull does
+**A bare `make` builds everything, and the order is why that is worth having.** Two of the steps are
+order-dependent and fail quietly in the wrong order: `gemma-kernels` must precede `compress`, or the
+kernel engine ships unencoded; and `compress` runs before `models` so that a dropped connection on the 11 GB pull does
 not also cost the encoded artifacts (weights are excluded from compression anyway, and `make models`
 is resumable). The target drives these as sequential `$(MAKE)` calls rather than prerequisites, so
 `make -jN` cannot reorder them. `.DEFAULT_GOAL` names the target explicitly rather than leaning on it
 being first in the file, so adding a target above it cannot silently change what `make` does.
-`antares-onnx` is excluded: it is the one target needing Python, uv and an `HF_TOKEN`, against
-per-repository gated weights that cannot be fetched unattended.
 
 ### A weight file's *layout* decides whether a browser can load it, not just its size
 transformers.js reads a weight file into ONE `Uint8Array` before onnxruntime sees it, and
@@ -408,16 +364,16 @@ onnxruntime then builds the session inside the wasm heap. So an inline `.onnx` f
 `.onnx_data` sidecar streams and has no such ceiling (Gemma 4's ONNX build is 3.6 GB and loads).
 Neither wall scales with GPU memory.
 
-Two consequences, both measured in PLAN §10.18:
+`ModelEntry.inlineBytes` is how the page refuses one up front: `pickDtype` skips a build over
+`INLINE_WEIGHT_CEILING_BYTES` exactly as it skips f16 without the feature, and `dtypeBlockers()`
+reports *every* reason rather than the first — an oversized f16 build has two, and naming only
+`shader-f16` sends the reader after a GPU that would not help. Set it only for builds with no
+sidecar.
 
-- **`tools/quantize_onnx.py` shards on `BROWSER_INLINE_CEILING` (1 GB), not on protobuf's 2 GiB.**
-  `optimum` emits whatever protobuf allows, which left Antares 350M as one 1.82 GB file that could
-  not load. Re-saved with a sidecar it loads in 8.0 s. **If you add a model to this pipeline, do not
-  restore the protobuf rule** — it answers a different question.
-- **`ModelEntry.inlineBytes` is how the page refuses one up front.** `pickDtype` skips a build over
-  the ceiling exactly as it skips f16 without the feature, and `dtypeBlockers()` reports *every*
-  reason rather than the first — an oversized f16 build has two, and naming only `shader-f16` sends
-  the reader after a GPU that would not help. Set it only for builds with no sidecar.
+If you ever add an ONNX export step here, shard on that ceiling rather than on protobuf's 2 GiB
+limit. An exporter emits whatever protobuf allows, which is how a 1.82 GB single-file export that no
+browser could load got produced and measured; the same graph re-saved with a sidecar loaded in
+8.0 s. The protobuf rule is not wrong about protobuf — it answers a different question.
 
 **Compression is pre-computed, never on the fly.** `make compress` (`web/precompress.ts`) writes a
 `.br` and a `.gz` beside each compressible artifact; `web/serve.ts` picks one by `Accept-Encoding`,
@@ -472,8 +428,8 @@ been — the engine was never the question. Read the graph before assuming: 262 
 would cap that model's prompt at ~1400 tokens for memory it does not allocate.
 
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `antares`,
-`hermes` and `gemma4` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `hermes`
+and `gemma4` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
 capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
@@ -497,15 +453,14 @@ is still not a usable agent. Say which of the two a registry note is talking abo
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
   shared conformance table.
 - `tests/conformance/cases.json` is the single declarative table: `{name, requires?, steps[{request,
-  expect}]}` where `expect` is a partial `protocol.Response` matcher. Three drivers run it: wazero
-  (M3), the WASI browser page (M5), and the emscripten page (M6) — the **same** file, so behaviour
-  cannot diverge. Each case boots a fresh session; ordered steps give stateful cases
+  expect}]}` where `expect` is a partial `protocol.Response` matcher. Two drivers run it: wazero (M3)
+  and the WASI browser page (M5) — the **same** file, so behaviour cannot diverge. Each case boots a fresh session; ordered steps give stateful cases
   (timeout→orphan-check, cd persists).
 - `requires` names the capabilities a case needs. Today the only tag is `["mount"]`, on the 6 cases
-  that touch `/mnt/host`; the emscripten driver filters them out because that build has no host
-  mount, while the other two drivers run everything. The Go driver ignores the field (unknown JSON
-  key), so tagging a case can never weaken the wazero run. **Do not add a tag to dodge a failure** —
-  a tag says "this runtime cannot express this", not "this is flaky here".
+  that touch `/mnt/host`, and both current drivers run everything — it earned its keep against a
+  runtime that had no host mount and is kept for the next one. The Go driver ignores the field
+  (unknown JSON key), so tagging a case can never weaken the wazero run. **Do not add a tag to dodge
+  a failure** — a tag says "this runtime cannot express this", not "this is flaky here".
 - `tests/e2e/` (Playwright, M4/M5) boots `dist/smolbox.wasm` in headless Chromium through the real
   worker + `window.__smolbox` hook: `echo hello`, an OPFS mount smoke, and the full conformance
   table (`conformance.spec.ts`). The mount is an OPFS tree walked from `testdata/mount` on the Node
@@ -517,8 +472,8 @@ is still not a usable agent. Say which of the two a registry note is talking abo
   and all, and deliberately include the failure modes a real model produces. Add a case there before
   reaching for the GPU suite.
 - `tests/e2e/agent.spec.ts` drives `/agent/` from `playwright.agent.config.ts`, which is the
-  only config carrying the WebGPU launch flags. It is skipped unless `SMOLBOX_WEBGPU=1`, and both
-  other configs exclude it (the WASI config by `testIgnore`, the emscripten one by `testMatch`).
+  only config carrying the WebGPU launch flags. It is skipped unless `SMOLBOX_WEBGPU=1`, and the
+  WASI config excludes it by `testIgnore`.
   It asserts the *mechanism* — a parseable call for the one tool that exists, reaching a real
   session, with the mount's real contents in the rendered result — not the model's prose, which is
   not stable enough to assert.
@@ -530,17 +485,6 @@ is still not a usable agent. Say which of the two a registry note is talking abo
   path is real. It drives the page's own pick button through Playwright's `filechooser` event with a
   directory path, so the mount comes from the real dialog rather than a test hook. It rides the
   existing browser-e2e CI job, which already has the wasm artifact.
-- `tests/e2e/emscripten.spec.ts` (M6) drives the `/js/` page through `bootJs()` and needs `dist/js`,
-  not `dist/smolbox.wasm`. It has **its own config** (`playwright.emscripten.config.ts`) and the
-  WASI config `testIgnore`s it, so `make test-e2e` stays runnable without an emscripten build.
-  Adding a spec that needs one artifact but not the other means touching both configs.
-- That suite runs on **its own budgets and one retry**: `EMSCRIPTEN_BOOT_TIMEOUT_MS` (360 s) and
-  `EMSCRIPTEN_EXEC_TIMEOUT_MS` (300 s), because a live VM here burns **~2.4 CPU cores** (the main
-  loop busy-polls and QEMU never exits) against a 4-vCPU shared runner, and the console is ~10×
-  slower. Boots take 16–22 s there against ~7 s locally, and the 1 MiB case ~3 min against ~48 s.
-  If a case legitimately needs longer *on this runtime*, raise the budget — do **not** tag it out of
-  the shared table. Context teardown is clean (CPU back to ~3 % within 3 s), so don't go hunting for
-  leaked workers; that was checked.
 - When adding a mount fixture to `testdata/mount/`, update the `ls -1` expectation in the table
   (busybox sorts alphabetically) or the fixture/table drift silently. **The mock caller's first step
   asserts that same listing verbatim**, so a new fixture means editing `toolcall_test.go` too.
@@ -567,8 +511,6 @@ is still not a usable agent. Say which of the two a registry note is talking abo
 5. If `web/src/agent/` changed: `make test-web` covers the parser; run `make test-e2e-agent` by hand
    (needs a GPU + `make model`) — CI cannot, so an untested agent change ships untested.
 6. If the web runtime changed: `make test-web` and, with `dist/smolbox.wasm` present, `make test-e2e`
-   (the browser must still pass the same conformance table as Go). If shared code under `web/src/`
-   changed, also run `make test-e2e-js` with `dist/js` present — the emscripten page reuses
-   `protocol.ts`, `stdio.ts` and `session.ts` verbatim.
+   (the browser must still pass the same conformance table as Go).
 7. `gofmt`/`go vet` clean; `bunx --bun tsc --noEmit` clean.
 8. Update PLAN.md (measurements, open questions, risks) and this file if the change affects them.

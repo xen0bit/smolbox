@@ -351,8 +351,6 @@
       <nav>
         <a href="/">VM</a>
         <a href="/agent/" aria-current="page">chat</a>
-        <a href="/scan/">scan</a>
-        <a href="/js/">js</a>
       </nav>
     </header>
 
@@ -397,8 +395,8 @@
           These follow the selected checkpoint until you change one; a knob you
           set keeps its value across model switches and is marked. Greedy
           (<code>sample</code> off) makes a run reproducible, and is wrong for
-          some checkpoints — Antares at temperature 0 loops instead of reaching a
-          tool call.
+          some checkpoints — Gemma 4 at temperature 0 answers the first turn and
+          then emits nothing but &lt;eos&gt;.
         </p>
         <div class="knobs">
           <label data-knob="do_sample">sample <input id="gen-do_sample" type="checkbox" /></label>

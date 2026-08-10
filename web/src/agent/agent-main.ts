@@ -430,29 +430,6 @@ async function adapterFeatures(): Promise<ReadonlySet<string>> {
   return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
-/**
- * Says out loud when the selected entry is not a chat model.
- *
- * Antares is trained for one job, with a fixed termination protocol, and the
- * registry has always known that (`task: "localize"`). The chat dropdown listed
- * it anyway with nothing to distinguish it from LFM2 — which is precisely the
- * "confident nonsense" the registry comment warns about, offered as though it
- * were a supported choice. The scan page is where it belongs and is one link
- * away, so say so before the weights are fetched rather than after.
- */
-function noteModelChoice(entry: ModelEntry): void {
-  if (entry.task !== "localize") {
-    return;
-  }
-  const body = bubble("note", "not a chat model");
-  if (body) {
-    body.textContent =
-      `${entry.label} is trained for vulnerability localization, not conversation — it expects one ` +
-      `task and a fixed way of finishing it. The scan page at /scan/ is built around that protocol. ` +
-      `Loading it here will produce fluent answers that mean very little.`;
-  }
-}
-
 let busy = false;
 // Two separate readiness facts, because they fail for different reasons and the
 // composer should say which one is missing rather than accepting a message and
@@ -588,7 +565,6 @@ const handle: SmolagentHandle = {
     // with them under a new dialect would be the worst of both.
     modelReady = false;
     refreshControls();
-    noteModelChoice(entry);
     setStatus(`model: ${entry.label} — press start to load it`);
   },
   bootVm: async (timeoutMs?: number) => {
@@ -837,9 +813,7 @@ el("tool-import")?.addEventListener("click", () => {
 renderToolList();
 
 // Populate the model dropdown from the registry, marking unverified dialects so
-// an odd answer reads as "we never checked this family" rather than a bug, and
-// keeping the task-specific checkpoints in a group of their own so they are not
-// presented as chat models that happen to be further down the list.
+// an odd answer reads as "we never checked this family" rather than a bug.
 const modelSelect = el("model");
 if (modelSelect) {
   const option = (m: ModelEntry) => {
@@ -850,17 +824,8 @@ if (modelSelect) {
     return opt;
   };
 
-  for (const m of models.filter((e) => e.task !== "localize")) {
+  for (const m of models) {
     modelSelect.appendChild(option(m));
-  }
-  const special = models.filter((e) => e.task === "localize");
-  if (special.length > 0) {
-    const group = document.createElement("optgroup");
-    group.setAttribute("label", "not chat models — see /scan/");
-    for (const m of special) {
-      group.appendChild(option(m));
-    }
-    modelSelect.appendChild(group);
   }
 
   modelSelect.value = currentModelKey;

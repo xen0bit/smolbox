@@ -3,7 +3,7 @@
  * compressible file in dist/.
  *
  * Why build time rather than request time: smolbox.wasm is ~117 MB and the
- * emscripten build another ~121 MB across two files. Compressing those per
+ * Gemma kernel engine is another ~540 KB of JS. Compressing those per
  * request — in the proxy or in serve.ts — burns seconds of CPU on every cold
  * load and, worse, forces a chunked response, which throws away the
  * Content-Length the loading bar reads. Compressing once here costs nothing per

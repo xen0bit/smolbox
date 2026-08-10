@@ -20,8 +20,8 @@ function servedDir(name: string, fallback: string): URL {
 
 const distRoot = new URL("./dist/", import.meta.url);
 // The artifact root: one directory holding everything the build targets put in
-// dist/ — smolbox.wasm, the emscripten build (js/), the weights (models/) and
-// the Gemma kernel engine (kernels/). A single override replaces one-per-dir
+// dist/ — smolbox.wasm, the weights (models/) and the Gemma kernel engine
+// (kernels/). A single override replaces one-per-dir
 // env vars, which left smolbox.wasm stuck in the image: the weights and
 // kernels were mountable, the WASM itself was not. A whole dist/ mounted over
 // DIST_DIR overrides all of them at once.
@@ -58,10 +58,9 @@ export async function handle(request: Request): Promise<Response> {
 
   const mounts: [string, URL][] = [
     // The bundles served by default live in web/dist; everything that
-    // `make wasm`/`make wasm-js`/`make model(s)`/`make gemma-kernels`
-    // produces lives in dist/, so those paths are served from DIST_DIR.
+    // `make wasm`/`make model(s)`/`make gemma-kernels` produces lives in
+    // dist/, so those paths are served from DIST_DIR.
     ["/smolbox.wasm", new URL("smolbox.wasm", artifactRoot)],
-    ["/js/", new URL("js/", artifactRoot)],
     ["/models/", new URL("models/", artifactRoot)],
     ["/kernels/", new URL("kernels/", artifactRoot)],
   ];
@@ -81,7 +80,7 @@ export async function handle(request: Request): Promise<Response> {
   const chosen = await negotiate(file, new URL(rel, root), request);
 
   // Caching: almost every URL here can change without a filename change
-  // (`make web`, `make wasm` and `make wasm-js` rewrite the bundles and the VM;
+  // (`make web` and `make wasm` rewrite the bundles and the VM in place;
   // model/gemma-kernels re-pull weights), so almost nothing gets `immutable`.
   // The exception is /ort/, which `make web` copies straight out of
   // node_modules: those four multi-megabyte builds cannot change without a
