@@ -4,8 +4,8 @@
 // and which belong to the checkpoint. `max new tokens`, the prompt budget and
 // every sampling parameter are properties of the model — a reasoning model needs
 // more tokens than 512 or it stops mid-thought, and the prompt ceiling is set by
-// the vocabulary, not by taste (models.ts PREFILL_LOGITS_BUDGET_BYTES). So they
-// track the selected model, and switching models moves them.
+// the checkpoint's context window, not by taste (models.ts maxPromptTokens). So
+// they track the selected model, and switching models moves them.
 //
 // But someone who deliberately sets temperature to 0 does not mean "until I pick
 // a different model". So each knob remembers whether it was touched: touched
@@ -162,12 +162,14 @@ export class Settings {
       case "maxNewTokens":
         return entry.generation?.max_new_tokens ?? DEFAULTS.maxNewTokens;
       case "promptBudgetChars":
-        // The registry's arithmetic, or whatever this machine has proved it can
-        // survive — whichever is smaller. The arithmetic is a bound on ONE
-        // allocation on one measured adapter (models.ts
-        // PREFILL_LOGITS_BUDGET_BYTES); a real device also holds the weights and
-        // the KV cache, and Firefox is stricter about the total than the
-        // Chromium the constant was measured on (PLAN §10.16).
+        // The checkpoint's own ceiling, or whatever this machine has proved it
+        // can survive — whichever is smaller. The ceiling is a context and
+        // latency clamp (models.ts maxPromptTokens); a device that runs out
+        // anyway is holding weights, a KV cache and activations too, and Firefox
+        // is stricter about that total than Chromium (PLAN §10.16). Chunked
+        // prefill removed the allocation those reports were actually about, so
+        // this should now only ever be the model's number — the learned one
+        // stays because "should" is not a measurement.
         return Math.min(maxPromptChars(entry), this.ceilings.get(entry.key) ?? Infinity);
       default: {
         const value = generationDefaults(entry)[knob as keyof GenerationDefaults];

@@ -2456,6 +2456,79 @@ declared. §10.19 could reject candidates from metadata because the constraints 
 *mechanical* — a byte count, an architecture string, a graph input. Nothing about behaviour survived
 contact, and nothing about behaviour was knowable without the GPU.
 
+### 10.21 The prefill is chunked, so the chat stops walking into the device (2026-08-10)
+
+Reported as "sometimes a model throws an OOM for the GPU mid-chat, or says some memory limit has
+been hit". Both halves of that are the same allocation, and §10.10 and §10.16 had already named it.
+What neither did was stop making it.
+
+**Where the limits actually are.** Four, and only one of them is what the report is about:
+
+| # | Limit | Symptom | What it is |
+|---|---|---|---|
+| 1 | Prefill logits readback, `N × vocab × 4` | mid-chat OOM; also our own `prompt-too-long` | The buffer-mapping staging allocation. **Fixed here.** |
+| 2 | Total device residency — weights + KV cache + activations + (1) | Firefox dying inside a budget Chromium survived | Not queryable from WebGPU, on any browser. No arithmetic over `vocab_size` can produce it. |
+| 3 | Wasm-heap weight load, ~1 GB single-file | `std::bad_alloc` / `RangeError` at load | `INLINE_WEIGHT_CEILING_BYTES` (§10.18). A different phase, already refused up front. |
+| 4 | Session poisoning after a failed allocation | "the chat breaks" | Already handled (§10.10 part 4): drop the session, rebuild, retry once. |
+
+**Why (1) grew.** Most exports here declare their logits as `[batch, sequence_length, vocab_size]`,
+so onnxruntime maps `N × vocab × 4` bytes back to the CPU per prefill — and the agent loop re-sends
+the *entire* conversation on every tool round trip, so N grows by a tool result each iteration. The
+answer from M9 to §10.20 was to bound N: divide a 1.5 GiB budget by the vocabulary and refuse
+anything longer. It worked, and it cost LFM2.5 2.6B ~3145 prompt tokens of a 128 000-token context,
+and it never stopped guessing — §10.16 is the record of the guess being wrong in both directions on
+the same day.
+
+**The change: N is no longer a function of the conversation.** Two things, both ordinary
+transformers.js, neither reaching into the library:
+
+1. **Chunked prefill.** The prompt is handed to `generate()` a chunk at a time, each call asked for
+   one token that is thrown away, so what a prefill materializes is `chunk × vocab × 4` whatever the
+   chat does. `PREFILL_CHUNK_BUDGET_BYTES` is 256 MiB — an order of magnitude under the 2.15 GB
+   §10.10 measured working, because a chunk is a batch size rather than a capability and the room
+   left over is room for limit (2).
+2. **The KV cache survives the turn.** So a tool round trip forwards only the tokens that are new.
+   Passing `past_key_values` with the *full* prompt makes transformers.js trim it to what the cache
+   does not cover (`decoder_prepare_inputs_for_generation`), and `return_dict_in_generate` is what
+   keeps the cache alive past the call instead of disposing it.
+
+The kernel backend has done (2) since M12 — `GemmaKernelEngine.stream()`, same prefix rule — so this
+is the onnxruntime path catching up to it. `commonPrefix` moved to `prefix.ts` to serve both.
+
+```
+per turn before:  prefill(N=4000 tok) → 4000 × 128k × 4 = 2.0 GB   ← the report
+chunked:          8 × prefill(512)    →  512 × 128k × 4 = 262 MB
+chunked + reuse:  prefill(delta=300)  →  300 × 128k × 4 = 154 MB
+```
+
+**Two things that would have been silently wrong.** Neither fails loudly, which is why they are
+pure functions in `prefill.ts` with tests rather than comments in the worker:
+
+- A prompt **identical** to the cache has nothing left to forward, and transformers.js reads that
+  case as "input_ids holds only unprocessed tokens" — it re-runs the whole prompt on top of a full
+  cache. So an exact match starts over, exactly as the kernel path already did.
+- The cache stops **one token short** of the sequence `generate()` returns: the last id it sampled
+  was never fed to a forward pass. Recording the sequence itself would claim a position the cache
+  does not have and the next turn would skip a token.
+
+**What this does to the budgets.** `maxPromptTokens()` loses its `vocab_size` term and becomes
+`min(contextTokens, AGENT_WORKING_TOKENS)` — a context and latency clamp, which is what it should
+always have been. LFM2.5 2.6B goes from ~3145 prompt tokens to 8192. Everything downstream stays
+exactly as it was: `prompt-too-long`, `device-lost`, `shrinkBudget()`, and the learned per-machine
+ceilings under `smolbox.prefill-ceilings`. They are now reachable only through limit (2), which is
+the one case chunking cannot answer, and a page that reaches them is telling us something we cannot
+measure any other way.
+
+**Coverage**, all GPU-free and in CI: the chunk arithmetic per entry and that one token more does not
+fit (`models.test.ts`), that the prompt ceiling no longer varies with the vocabulary, and the window
+decision in every shape — extend, diverge, exact match, shorter-than-cache, and the tail the
+generating call is left to prefill (`prefill.test.ts`).
+
+**Still open.** Limit (2) has no fix here, only more room. And §10.16's "not fixed" stands: the
+rebuild after a device loss happens on the same onnxruntime module and therefore the same WebGPU
+device, so a browser that genuinely *loses* the device will reload successfully and fail again. Only
+tearing down the worker would help, and that is its own change.
+
 ---
 
 ## 11. Component 2, continued: Antares as a supported model (M12–M14)

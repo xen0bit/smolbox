@@ -4,13 +4,15 @@ import {
   AGENT_WORKING_TOKENS,
   CHARS_PER_TOKEN_ESTIMATE,
   MAX_EXTERNAL_DATA_SHARDS,
-  PREFILL_LOGITS_BUDGET_BYTES,
+  MIN_PREFILL_CHUNK_TOKENS,
+  PREFILL_CHUNK_BUDGET_BYTES,
   dtypeBlockers,
   models,
   maxPromptChars,
   maxPromptTokens,
   modelFor,
   pickDtype,
+  prefillChunkTokens,
   weightFiles,
 } from "./models.ts";
 
@@ -51,61 +53,85 @@ describe("model registry", () => {
   });
 });
 
-// The ceiling that keeps a prefill from killing the WebGPU device. See
-// PREFILL_LOGITS_BUDGET_BYTES for the measurement behind the number.
-describe("prefill ceiling", () => {
-  test("a prompt at the ceiling fits the logits budget, and one token more does not", () => {
+// What one prefill materializes, which is what killed the device in §10.10 and
+// §10.16. The chunk is the bound now; the prompt ceiling no longer is.
+describe("prefill chunk", () => {
+  test("one chunk's logits fit the budget, and one token more does not", () => {
     // Only the exports that pay for a logits download. The Gemma kernel backend
     // samples on the GPU and never maps one back, and Gemma 4's ONNX export
     // materializes one position; the budget is not their constraint and
     // asserting it would be asserting a cost they do not have.
     for (const m of models.filter((e) => e.prefillLogits !== "last")) {
       const bytes = (n: number) => n * m.vocabSize * 4;
-      const limit = maxPromptTokens(m);
-      expect(bytes(limit), `${m.key} at its ceiling`).toBeLessThanOrEqual(PREFILL_LOGITS_BUDGET_BYTES);
-      // Unless something else is the binding constraint — the model's own
-      // context window, or the loop's working budget — the logits budget is
-      // what stops it, and one token more must not fit.
-      if (limit < Math.min(m.contextTokens, AGENT_WORKING_TOKENS)) {
-        expect(bytes(limit + 1), `${m.key} one token past its ceiling`).toBeGreaterThan(
-          PREFILL_LOGITS_BUDGET_BYTES,
-        );
-      }
+      const chunk = prefillChunkTokens(m);
+      expect(bytes(chunk), `${m.key} at its chunk`).toBeLessThanOrEqual(PREFILL_CHUNK_BUDGET_BYTES);
+      expect(bytes(chunk + 1), `${m.key} one token past its chunk`).toBeGreaterThan(
+        PREFILL_CHUNK_BUDGET_BYTES,
+      );
     }
   });
 
+  test("the chunk is the same size whatever the conversation does", () => {
+    // The property the whole change is for: nothing about the chunk is a
+    // function of the prompt, so a prefill costs what it costs on turn one and
+    // on turn twenty.
+    const lfm25 = modelFor("lfm2.5-2.6b");
+    expect(prefillChunkTokens(lfm25)).toBe(prefillChunkTokens(lfm25));
+    expect(prefillChunkTokens(lfm25)).toBeLessThan(maxPromptTokens(lfm25));
+  });
+
+  // An entry that never materializes the tensor should not pay several forward
+  // passes for a bound it is not subject to. Both Gemma 4 builds avoid it for
+  // different reasons — the kernel engine never downloads logits, the ONNX
+  // export only produces the last position — and neither is visible from the
+  // checkpoint, which is why the registry has to say so.
+  test("a model that materializes one position is prefilled in one pass", () => {
+    for (const key of ["gemma4-e2b", "gemma4-e2b-onnx"]) {
+      const gemma = modelFor(key);
+      expect(gemma.vocabSize, key).toBe(262_144);
+      expect(gemma.prefillLogits, key).toBe("last");
+      expect(prefillChunkTokens(gemma), key).toBe(AGENT_WORKING_TOKENS);
+      // What the same entry would be chunked at if it did pay full-sequence
+      // cost: 262 144 entries per token is 256 tokens to a 256 MiB budget.
+      expect(prefillChunkTokens({ ...gemma, prefillLogits: "sequence" }), key).toBe(256);
+    }
+  });
+
+  test("a bigger vocabulary buys a smaller chunk, not a shorter conversation", () => {
+    const lfm2 = modelFor("lfm2-1.2b-tool");
+    const lfm25 = modelFor("lfm2.5-2.6b");
+    // The relationship that made LFM2 fine and LFM2.5 fatal on the same loop
+    // with the same budgets (§10.10): ~1.95x the vocabulary. It now costs
+    // ~1.95x more forward passes per prompt rather than ~1.95x less prompt.
+    expect(lfm25.vocabSize).toBeGreaterThan(lfm2.vocabSize);
+    expect(prefillChunkTokens(lfm25) * lfm25.vocabSize).toBeCloseTo(
+      prefillChunkTokens(lfm2) * lfm2.vocabSize,
+      -6,
+    );
+    expect(maxPromptTokens(lfm25)).toBe(maxPromptTokens(lfm2));
+  });
+
+  test("a vocabulary large enough to shrink the chunk past useful hits the floor", () => {
+    // Not reachable from the registry — it would take a ~1M-entry vocabulary —
+    // so it is asserted against a synthetic entry rather than left to rot.
+    const absurd = { ...modelFor("lfm2-1.2b-tool"), vocabSize: 100_000_000 };
+    expect(prefillChunkTokens(absurd)).toBe(MIN_PREFILL_CHUNK_TOKENS);
+  });
+});
+
+describe("prompt ceiling", () => {
   test("no entry may exceed the loop's working budget, whatever its engine", () => {
     for (const m of models) {
       expect(maxPromptTokens(m), `${m.key}`).toBeLessThanOrEqual(AGENT_WORKING_TOKENS);
     }
   });
 
-  // The whole reason the ceiling asks what a prefill materializes: 262 144
-  // entries per token under the logits budget is ~1400 tokens, which is not a
-  // usable agent prompt. Both Gemma 4 builds avoid it for different reasons —
-  // the kernel engine never downloads logits, the ONNX export only produces the
-  // last position — and neither difference is visible from the checkpoint.
-  test("a model that materializes one position is not charged for the whole sequence", () => {
-    for (const key of ["gemma4-e2b", "gemma4-e2b-onnx"]) {
-      const gemma = modelFor(key);
-      expect(gemma.vocabSize, key).toBe(262_144);
-      expect(gemma.prefillLogits, key).toBe("last");
-      expect(maxPromptTokens(gemma), key).toBe(AGENT_WORKING_TOKENS);
-      // What the same entry would get if it did pay full-sequence cost.
-      expect(maxPromptTokens({ ...gemma, prefillLogits: "sequence" }), key).toBeLessThan(2000);
-    }
-  });
-
-  test("a bigger vocabulary buys a shorter prompt", () => {
-    const lfm2 = modelFor("lfm2-1.2b-tool");
-    const lfm25 = modelFor("lfm2.5-2.6b");
-    // The relationship that made LFM2 fine and LFM2.5 fatal on the same loop
-    // with the same budgets: ~1.95x the vocabulary, so ~1.95x less prompt.
-    expect(lfm25.vocabSize).toBeGreaterThan(lfm2.vocabSize);
-    expect(maxPromptTokens(lfm25) * lfm25.vocabSize).toBeCloseTo(
-      maxPromptTokens(lfm2) * lfm2.vocabSize,
-      -6,
-    );
+  // The ceiling stopped being a memory bound when the chunk took that job over,
+  // so the vocabulary must no longer reach it. This is the assertion that would
+  // fail if the old arithmetic came back.
+  test("the ceiling does not vary with the vocabulary", () => {
+    const entry = modelFor("lfm2.5-2.6b");
+    expect(maxPromptTokens({ ...entry, vocabSize: 262_144 })).toBe(maxPromptTokens(entry));
   });
 
   test("the context window caps the budget when it is the smaller of the two", () => {
@@ -118,11 +144,11 @@ describe("prefill ceiling", () => {
     expect(maxPromptChars(entry)).toBe(maxPromptTokens(entry) * CHARS_PER_TOKEN_ESTIMATE);
   });
 
-  // The regression this whole mechanism exists for: the loop's old flat
-  // 24_000-char default was above what LFM2.5 can prefill, so the default
-  // configuration walked into the device error on its own.
-  test("LFM2.5's ceiling is below the flat default that used to crash it", () => {
-    expect(maxPromptChars(modelFor("lfm2.5-2.6b"))).toBeLessThan(24_000);
+  // The conversation the old ceiling could not have: LFM2.5 was held to ~3145
+  // tokens (~12 580 chars) because of its 128 000-entry vocabulary, which is
+  // what made every long chat a race between elision and the device.
+  test("LFM2.5 is no longer held to a fraction of its context window", () => {
+    expect(maxPromptChars(modelFor("lfm2.5-2.6b"))).toBeGreaterThan(24_000);
   });
 });
 

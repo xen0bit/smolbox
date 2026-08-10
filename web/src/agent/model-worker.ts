@@ -10,8 +10,10 @@ import {
   AutoModelForCausalLM,
   AutoTokenizer,
   InterruptableStoppingCriteria,
+  Tensor,
   TextStreamer,
   env,
+  type DynamicCache,
   type PreTrainedModel,
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
@@ -28,7 +30,9 @@ import {
   chatTemplateUrl,
   maxPromptTokens,
   modelFor,
+  prefillChunkTokens,
 } from "./models.ts";
+import { planPrefill } from "./prefill.ts";
 
 /** A failure the page can act on. See ModelErrorCode. */
 class WorkerError extends Error {
@@ -144,6 +148,44 @@ let lastLoad: { local: boolean; dtype: Dtype } | null = null;
 // tokenizer did not pick up. See loadChatTemplate.
 let chatTemplate: string | null = null;
 
+// ------------------------------------------------------------- the KV cache
+//
+// Held across turns, not just across the tokens of one generation, because the
+// agent loop re-sends the whole conversation on every tool round trip: without
+// this, answering a tool result means prefilling the question, the answer, the
+// call and the output all over again. The kernel backend has done this since
+// M12 (gemma-kernels.ts); this is the onnxruntime path catching up.
+//
+// It is GPU-resident — transformers.js asks onnxruntime to leave every `present`
+// output in a gpu-buffer — so it has to be disposed rather than dropped, and
+// disposed on every path out: a new load, a device failure, a throw mid-prefill.
+// The one thing that must never happen is `cachedIds` describing a cache that
+// holds something else, which is why they are only ever assigned together.
+let cache: DynamicCache | null = null;
+/**
+ * The token ids the cache covers — the prompt and completion of the last turn,
+ * less its final token.
+ *
+ * Less the final token because that is what transformers.js leaves behind: the
+ * last id it sampled was never fed to a forward pass, so the cache stops one
+ * short of the sequence it returns. Recording the sequence itself would claim a
+ * position the cache does not have, and the next turn would skip a token.
+ */
+let cachedIds: number[] = [];
+
+/** Releases the cache's GPU buffers and forgets what it held. */
+async function dropCache(): Promise<void> {
+  const dead = cache;
+  cache = null;
+  cachedIds = [];
+  try {
+    await dead?.dispose();
+  } catch {
+    // Disposing buffers whose device has already failed can itself throw. The
+    // point was to stop referencing them, and that has happened.
+  }
+}
+
 // One generation at a time, so one criteria object is enough. It is reset
 // before each run rather than recreated, because generate() holds the reference.
 const stopper = new InterruptableStoppingCriteria();
@@ -184,6 +226,11 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // reports its own files from zero rather than being deduplicated against the
   // percentages the previous one left behind.
   reported.clear();
+  // Whatever the previous session left on the GPU belongs to a session that is
+  // about to stop existing. A cache outliving its model is buffers nobody can
+  // free and, worse, ids that would match a prompt built for a different
+  // tokenizer.
+  await dropCache();
   loaded = entry;
   lastLoad = { local, dtype };
   // Local weights come from dist/models via the dev server; the hub is the
@@ -335,19 +382,19 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   const inputs = tokenizer(prompt, { add_special_tokens: false });
 
-  // The exact check the loop can only estimate. Every export in the registry
-  // emits full-sequence logits, so prefilling N tokens allocates
-  // N * vocab_size * 4 bytes of mappable memory; past the adapter's reach, Dawn
-  // fails the allocation and every later run on that device returns "invalid
-  // due to a previous error". Refusing here costs a turn. Not refusing costs
-  // the session (PLAN §10.10), so this is a guard and not a warning.
+  // The exact check the loop can only estimate, now that the loop's budget is a
+  // context window rather than an allocation: a prompt past the positions the
+  // checkpoint was trained for is a real thing to refuse, and refusing costs one
+  // turn where letting it through costs an answer nobody can trust. The
+  // allocation that used to be enforced here is bounded by the prefill chunk
+  // instead — see prefillAndGenerate and models.ts PREFILL_CHUNK_BUDGET_BYTES.
   const promptTokens = (inputs.input_ids as { dims: number[] }).dims.at(-1) ?? 0;
   const limit = loaded ? maxPromptTokens(loaded) : Infinity;
   if (promptTokens > limit) {
     throw new WorkerError(
-      `prompt is ${promptTokens} tokens; ${loaded?.label ?? "this model"} can prefill at most ${limit} ` +
-        `(its ${loaded?.vocabSize}-entry vocabulary makes a longer one exceed what the GPU can map). ` +
-        `Shorten the conversation or lower the prompt budget.`,
+      `prompt is ${promptTokens} tokens; ${loaded?.label ?? "this model"} is held to ${limit} ` +
+        `(its context window, or the loop's working budget, whichever is smaller). ` +
+        `Shorten the conversation — lowering the prompt budget is what makes the loop do that.`,
       "prompt-too-long",
       limit,
       promptTokens,
@@ -378,10 +425,9 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   // The page layers its own overrides on top, and only for the fields someone
   // actually changed — everything else keeps tracking the selected checkpoint.
   const sampling = { ...(loaded?.generation ?? { do_sample: false }), ...(req.generation ?? {}) };
-  let out: unknown;
+  let sequence: number[];
   try {
-    out = await model!.generate({
-      ...inputs,
+    sequence = await prefillAndGenerate(inputs as Record<string, unknown>, {
       ...sampling,
       max_new_tokens: req.maxNewTokens ?? sampling.max_new_tokens ?? 256,
       streamer,
@@ -393,7 +439,6 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
 
   // The generated ids include the prompt; slice it off so the caller parses only
   // this turn. Special tokens are KEPT — the tool-call markers are what we parse.
-  const sequence = (out as { tolist(): number[][] }).tolist()[0] ?? [];
   const completion = sequence.slice(promptTokens);
   const text = tokenizer.decode(completion, { skip_special_tokens: false });
 
@@ -406,6 +451,115 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     ms: Math.round(performance.now() - started),
     stopped: stopper.interrupted,
   });
+}
+
+/** A `[1, n]` int64 tensor, the shape every decoder input here wants. */
+function idTensor(ids: readonly number[]): Tensor {
+  return new Tensor(
+    "int64",
+    BigInt64Array.from(ids, (id) => BigInt(id)),
+    [1, ids.length],
+  );
+}
+
+/** The all-ones attention mask for a prompt of `n` tokens. */
+function maskTensor(n: number): Tensor {
+  return new Tensor("int64", new BigInt64Array(n).fill(1n), [1, n]);
+}
+
+/**
+ * Runs one turn, prefilling the prompt in bounded pieces and keeping the cache.
+ *
+ * This is the whole answer to the mid-chat GPU death of PLAN §10.10 and §10.16.
+ * Most exports here declare their logits as `[batch, sequence, vocab]`, so a
+ * prefill of N tokens stages `N * vocab * 4` bytes for onnxruntime to map back —
+ * and because the agent loop re-sends the entire conversation on every tool
+ * round trip, N grew until the device died. Everything built after that report
+ * bounded N by shortening the conversation, which capped LFM2.5 2.6B at ~3145
+ * tokens of a 128 000-token context and still had to guess, because the number
+ * it needed was the device's total residency and nothing can compute that.
+ *
+ * So N is bounded here instead, twice over:
+ *
+ *  - the prompt is fed to `generate()` a chunk at a time, each call asked for a
+ *    single token that is thrown away, so what a prefill materializes is
+ *    `chunk * vocab * 4` whatever the conversation does; and
+ *  - the cache survives the turn, so the next round trip forwards only the
+ *    tokens that are new — usually one tool result rather than the whole chat.
+ *
+ * Both are ordinary transformers.js: passing `past_key_values` with the full
+ * prompt makes it trim the prompt to what the cache does not cover, and
+ * `return_dict_in_generate` is what keeps the cache alive past the call instead
+ * of disposing it. Nothing here reaches into the library.
+ *
+ * Any failure drops the cache. A generation that threw partway has already had
+ * some of its layers replaced and others not, and a half-updated cache is the
+ * one thing that would produce wrong output rather than an error.
+ */
+async function prefillAndGenerate(
+  inputs: Record<string, unknown>,
+  options: Record<string, unknown>,
+): Promise<number[]> {
+  const promptIds = ((inputs.input_ids as { tolist(): (number | bigint)[][] }).tolist()[0] ?? []).map(
+    Number,
+  );
+  const chunk = loaded ? prefillChunkTokens(loaded) : promptIds.length;
+  const plan = planPrefill(cachedIds, promptIds, chunk);
+  if (plan.drop) {
+    await dropCache();
+  }
+  if (plan.reuse > 0 || plan.steps.length > 0) {
+    post({
+      type: "log",
+      message:
+        `prefill: ${promptIds.length - plan.reuse} new token(s) of ${promptIds.length} ` +
+        `in ${plan.steps.length + 1} pass(es) of up to ${chunk}` +
+        (plan.reuse > 0 ? `, reusing ${plan.reuse} from the cache` : ""),
+    });
+  }
+
+  try {
+    for (const end of plan.steps) {
+      if (stopper.interrupted) {
+        // Stopped before a token was ever generated. The cache is valid as far
+        // as it got, and the caller reports the turn as stopped because nothing
+        // follows the prompt.
+        return promptIds;
+      }
+      const step = (await model!.generate({
+        input_ids: idTensor(promptIds.slice(0, end)),
+        attention_mask: maskTensor(end),
+        ...(cache ? { past_key_values: cache } : {}),
+        // One token, sampled and discarded: the cache is what this call is for.
+        // It also keeps the pass cheap to stop — max_new_tokens sizes the
+        // stopping criteria, so generation ends after exactly one forward.
+        max_new_tokens: 1,
+        do_sample: false,
+        return_dict_in_generate: true,
+      })) as unknown as { past_key_values: DynamicCache };
+      cache = step.past_key_values;
+      // The forward covered [0, end), so that is exactly what the cache holds —
+      // the token it sampled on top was never fed back.
+      cachedIds = promptIds.slice(0, end);
+    }
+
+    const out = (await model!.generate({
+      ...inputs,
+      ...(cache ? { past_key_values: cache } : {}),
+      ...options,
+      return_dict_in_generate: true,
+    })) as unknown as { sequences: { tolist(): (number | bigint)[][] }; past_key_values: DynamicCache };
+    cache = out.past_key_values;
+    const sequence = (out.sequences.tolist()[0] ?? []).map(Number);
+    // One short of the sequence: see cachedIds. This holds whether generation
+    // ended on EOS, on the token cap or on the stop button — the last id
+    // sampled is never the last id forwarded.
+    cachedIds = sequence.slice(0, -1);
+    return sequence;
+  } catch (err) {
+    await dropCache();
+    throw err;
+  }
 }
 
 /**
@@ -485,6 +639,10 @@ async function handleRunFailure(err: unknown): Promise<Error> {
   model = null;
   kernels = null;
   tokenizer = null;
+  // Before the session, not after: the cache's buffers belong to the device that
+  // just failed, and a cache that outlived its session would be handed to the
+  // rebuilt one as though it described something it has never seen.
+  await dropCache();
   deadKernels?.dispose();
   try {
     await dead?.dispose();

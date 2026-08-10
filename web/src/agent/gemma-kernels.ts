@@ -26,6 +26,12 @@
 // faithful reimplementation of what its generate() does with those same objects.
 
 import { KernelRewriteError, adapterHasShaderF16, rewriteKernelsToF32 } from "./kernel-f32.ts";
+import { commonPrefix } from "./prefix.ts";
+
+// Re-exported because the reuse rule below is the reason it exists, and a reader
+// following the cache bookkeeping should not have to go looking for it. The
+// onnxruntime path in model-worker.ts imports it from prefix.ts directly.
+export { commonPrefix };
 
 /** Where `make gemma-kernels` puts the pinned bundle, served by web/serve.ts. */
 export const KERNEL_BUNDLE_PATH = "/kernels/gemma4/gemma-4-e2b.js";
@@ -250,13 +256,4 @@ export class GemmaKernelEngine {
     }
     this.lastIds = [];
   }
-}
-
-export function commonPrefix(a: readonly number[], b: readonly number[]): number {
-  const n = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < n && a[i] === b[i]) {
-    i++;
-  }
-  return i;
 }

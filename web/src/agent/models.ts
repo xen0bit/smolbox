@@ -105,9 +105,10 @@ export interface ModelEntry {
   /**
    * The checkpoint's vocabulary size, straight from its config.json.
    *
-   * This is not trivia: every export in this registry emits full-sequence
-   * logits, so it is the multiplier in the prefill allocation that decides how
-   * long a prompt the adapter can take. See {@link PREFILL_LOGITS_BUDGET_BYTES}.
+   * This is not trivia: most exports in this registry emit full-sequence logits,
+   * so it is the multiplier in the prefill allocation — and therefore what
+   * decides how many tokens go through the forward pass at a time. See
+   * {@link prefillChunkTokens}.
    */
   vocabSize: number;
   /**
@@ -142,12 +143,11 @@ export interface ModelEntry {
    * How much of the logits tensor a prefill produces.
    *
    * `"sequence"` (the default) is the `[batch, sequence_length, vocab_size]`
-   * shape that PREFILL_LOGITS_BUDGET_BYTES exists to bound. `"last"` means the
+   * shape that PREFILL_CHUNK_BUDGET_BYTES exists to bound. `"last"` means the
    * export only ever materializes the final position — either because the graph
    * takes `num_logits_to_keep` (Gemma 4's does) or because the engine samples on
-   * the GPU and never downloads one at all. Charging those the full-sequence
-   * cost would cap a 262 144-vocabulary model at ~1400 prompt tokens for memory
-   * it never allocates.
+   * the GPU and never downloads one at all. Chunking those would buy nothing and
+   * cost a forward pass per chunk, so they are prefilled in one go.
    */
   prefillLogits?: "sequence" | "last";
   /**
@@ -402,10 +402,11 @@ export const models: ModelEntry[] = [
     repo: "google/gemma-4-E2B-it-qat-mobile-transformers",
     revision: "dd693ff40353f057ca5f07e945ad867f4afbf2ec",
     // The largest vocabulary in the registry by a wide margin, and the reason
-    // the prefill ceiling has to know what a forward pass materializes: charged
-    // the full-sequence cost this alone would cap a prompt at ~1400 tokens. This
-    // backend samples on the GPU (its own argmax kernels) and never downloads a
-    // logits tensor, so it declares `prefillLogits: "last"`. See maxPromptTokens.
+    // the chunk has to know what a forward pass materializes: charged the
+    // full-sequence cost this alone would be prefilled 256 tokens at a time.
+    // This backend samples on the GPU (its own argmax kernels) and never
+    // downloads a logits tensor, so it declares `prefillLogits: "last"`. See
+    // prefillChunkTokens.
     vocabSize: 262_144,
     prefillLogits: "last",
     // Quantization is baked into the checkpoint (QAT), not chosen at load time.
@@ -478,7 +479,7 @@ export const models: ModelEntry[] = [
 
 export const DEFAULT_MODEL_KEY = "lfm2.5-2.6b";
 
-// ------------------------------------------------------- the prefill ceiling
+// --------------------------------------------------------- the prefill chunk
 //
 // Every ONNX export in this registry declares its logits output as
 // `[batch_size, sequence_length, vocab_size]` — the FULL sequence, not just the
@@ -487,63 +488,96 @@ export const DEFAULT_MODEL_KEY = "lfm2.5-2.6b";
 //
 //     N * vocab_size * 4 bytes
 //
-// of host-visible memory, and a chat that grows by a tool result each round
-// walks straight into it. Measured on a 16 GB adapter with LFM2.5 2.6B at q4
-// (vocab 128000): ~16 k chars of history prefills fine, ~24 k dies inside Dawn
-// with "Failed to allocate memory for buffer mapping", after which every later
-// run fails with "invalid due to a previous error" — the device is poisoned and
-// the chat is over. That is the bug this budget exists to prevent.
+// of host-visible memory. Measured on a 16 GB adapter with LFM2.5 2.6B at q4
+// (vocab 128000): ~16 k chars of history (~2.15 GB of logits) prefills fine,
+// ~24 k (~3.07 GB) dies inside Dawn with "Failed to allocate memory for buffer
+// mapping", after which every later run fails with "invalid due to a previous
+// error" — the device is poisoned and the chat is over (PLAN §10.10).
 //
-// It is also why LFM2 1.2B never showed it: same loop, same budgets, half the
-// vocabulary, so half the allocation.
+// From M9 to §10.20 the answer was to bound N: divide a 1.5 GiB budget by the
+// vocabulary and refuse any prompt over the quotient. That works and it caps the
+// conversation — LFM2.5 2.6B was held to ~3145 prompt tokens of a 128 000-token
+// context — and it never stopped guessing, because the number it needs is the
+// device's TOTAL residency (weights, KV cache, activations, and this tensor) on
+// this browser and this adapter, which no arithmetic over `vocab_size` can
+// produce. Firefox proved that by dying inside a budget Chromium survived
+// (§10.16).
 //
-// 1.5 GiB is chosen against that measurement, not from a spec: the 2.15 GB
-// prefill worked, the 3.07 GB one did not, and the survivor is not a target to
-// aim at. Decode is unaffected — it prefills one token at a time.
-export const PREFILL_LOGITS_BUDGET_BYTES = 1.5 * 1024 ** 3;
+// So N is no longer a function of the conversation. The model worker feeds the
+// prompt to the forward pass in chunks and carries the KV cache from one turn to
+// the next, so what a prefill materializes is bounded by the chunk size and by
+// nothing else — see prefillAndGenerate() in model-worker.ts. This constant is
+// what that chunk costs.
+//
+// 256 MiB, an order of magnitude under the 2.15 GB that was measured working,
+// because there is nothing to buy by going higher: a chunk is a batch size, not
+// a capability, and the room left over is room for everything in the paragraph
+// above that cannot be measured.
+export const PREFILL_CHUNK_BUDGET_BYTES = 256 * 1024 ** 2;
 
 /** Logits come back as float32. */
 const BYTES_PER_LOGIT = 4;
 
 /**
+ * The smallest chunk worth prefilling.
+ *
+ * A chunk of one token is a per-token prefill, which is decode speed applied to
+ * a prompt — correct, and slow enough to look broken. A vocabulary large enough
+ * to push the arithmetic below this is better served by an export that
+ * materializes one position (`prefillLogits: "last"`), so the floor holds and
+ * the chunk is allowed to cost more than the budget says.
+ */
+export const MIN_PREFILL_CHUNK_TOKENS = 64;
+
+/**
  * A working ceiling for the chat loop, independent of any engine limit.
  *
- * The logits budget above is a hard constraint — past it the device dies. This
- * one is judgement: an engine with no such constraint and a 131 072-token
- * context would let the history grow until every turn re-prefills a novel, and
- * "correct but takes a minute" is its own kind of broken. 8192 tokens is under
- * every entry's existing ceiling, so it changes nothing for the ONNX models and
- * only bounds the ones that would otherwise be unbounded. The settings panel
- * can raise it.
+ * Judgement rather than a constraint: an engine with a 131 072-token context
+ * would let the history grow until every turn re-prefills a novel, and "correct
+ * but takes a minute" is its own kind of broken. Since the chunk above took over
+ * bounding the allocation, this is the only thing bounding the prompt, so it is
+ * the number a user who wants longer conversations should raise — the settings
+ * panel can, and what it costs is time rather than the device.
  */
 export const AGENT_WORKING_TOKENS = 8192;
 
 /**
- * How many prompt tokens this checkpoint can prefill inside the budget.
+ * How many prompt tokens to feed the forward pass at once.
  *
- * Clamped by the model's own context window, because a budget that permitted
- * more tokens than the checkpoint has positions for would be a lie.
+ * The chunk exists so that the logits tensor a prefill materializes stays the
+ * same size whatever the conversation does. Entries that never materialize it
+ * are not charged for it: the Gemma kernel engine samples on the GPU with its
+ * own argmax kernels and never downloads logits, and an export that takes
+ * `num_logits_to_keep` produces only the final position, which transformers.js
+ * asks for. Chunking either would be pure overhead — several forward passes
+ * where one would do — so they get the whole prompt in one go.
  */
-export function maxPromptTokens(
+export function prefillChunkTokens(
   entry: ModelEntry,
-  budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
+  budgetBytes: number = PREFILL_CHUNK_BUDGET_BYTES,
 ): number {
-  // The ceiling is a property of what the forward pass MATERIALIZES, not of the
-  // checkpoint. Most exports here emit full-sequence logits that onnxruntime
-  // maps back to the CPU; two do not. The Gemma kernel engine samples on the GPU
-  // with its own argmax kernels and never downloads a logits tensor, and Gemma
-  // 4's ONNX export takes `num_logits_to_keep`, which transformers.js sets to 1
-  // so only the final position is ever produced. Applying the arithmetic to
-  // either would cap a 262 144-vocabulary model at ~1400 tokens for memory it
-  // does not allocate.
   if (entry.prefillLogits === "last") {
-    return Math.min(entry.contextTokens, AGENT_WORKING_TOKENS);
+    return AGENT_WORKING_TOKENS;
   }
-  return Math.min(
-    entry.contextTokens,
-    AGENT_WORKING_TOKENS,
-    Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT)),
-  );
+  const fits = Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT));
+  return Math.min(AGENT_WORKING_TOKENS, Math.max(MIN_PREFILL_CHUNK_TOKENS, fits));
+}
+
+/**
+ * How long a prompt this checkpoint will be given.
+ *
+ * A context and latency clamp, and no longer a memory one: what a prefill
+ * allocates is the chunk's business now, so the only questions left are how many
+ * positions the checkpoint has and how long a turn anyone wants to wait for.
+ *
+ * The worker still enforces it with the real tokenizer, and the loop still
+ * elides to it. Both are worth keeping — a prompt past the context window is a
+ * real thing to refuse, and the `prompt-too-long` and `device-lost` paths remain
+ * the only recovery from a device that runs out for a reason chunking cannot
+ * answer (see PREFILL_CHUNK_BUDGET_BYTES).
+ */
+export function maxPromptTokens(entry: ModelEntry): number {
+  return Math.min(entry.contextTokens, AGENT_WORKING_TOKENS);
 }
 
 /**
@@ -554,11 +588,8 @@ export function maxPromptTokens(
  * (see conversation.ts). The conversion is therefore an estimate, and the exact
  * check still happens in the worker, which does have the tokenizer.
  */
-export function maxPromptChars(
-  entry: ModelEntry,
-  budgetBytes: number = PREFILL_LOGITS_BUDGET_BYTES,
-): number {
-  return maxPromptTokens(entry, budgetBytes) * CHARS_PER_TOKEN_ESTIMATE;
+export function maxPromptChars(entry: ModelEntry): number {
+  return maxPromptTokens(entry) * CHARS_PER_TOKEN_ESTIMATE;
 }
 
 /**
