@@ -430,9 +430,17 @@ been — the engine was never the question. Read the graph before assuming: 262 
 would cap that model's prompt at ~1400 tokens for memory it does not allocate.
 
 ### Dialects: verified means a transcript exists
-`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `hermes`
-and `gemma4` are verified; `llama` is marked unverified and says so in the UI. Promote a dialect by
-capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded as a type.
+`Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `hermes`,
+`gemma4` and `qwen3.5` are verified; `llama` is marked unverified and says so in the UI. Promote a
+dialect by capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded
+as a type.
+
+**Matching markers do not mean matching grammar.** `qwen3.5` exists because Qwen3.5 0.8B was
+registered as `hermes` — its chat template writes `<tool_call>`, `<tool_response>` and `<think>`, so
+the markers agreed — and then emitted `<function=…><parameter=…>` XML inside those markers rather
+than JSON (§10.20). The card named the parser it needs (`--tool-call-parser qwen3_coder`) and reading
+the template still got it wrong. When adding an entry, the question is not "which family's markers
+are these" but "what did it emit", and only a real turn answers it.
 `hermes` was promoted at PLAN §10.11 off a real Qwen2.5 0.5B turn, now a `CAPTURED:` case in
 `dialects.test.ts`; note that its `<think>` path is still uncaptured, because Qwen2.5 does not reason
 and **no published build of Qwen3 1.7B loads in a browser at all** — every variant is one undivided

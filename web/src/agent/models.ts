@@ -51,6 +51,28 @@ export interface GenerationDefaults {
   top_k?: number;
   repetition_penalty?: number;
   max_new_tokens?: number;
+  /**
+   * Where generation must stop, when the checkpoint's own config is wrong.
+   *
+   * Normally this stays absent: transformers.js reads `eos_token_id` from
+   * generation_config.json and that is the checkpoint's business, not ours.
+   * Gemma 4 is the example of it going right — its file already lists
+   * `[1, 106, 50]`, the three ids a chat turn can legitimately end on.
+   *
+   * It goes wrong when an export carries the BASE model's EOS into a chat
+   * checkpoint. Qwen3.5's generation_config says `248044`, which is
+   * `<|endoftext|>`; its chat template ends every assistant turn with
+   * `<|im_end|>` (248046), and tokenizer_config.json agrees that is the eos.
+   * Nothing stops at 248044 in a conversation, so the model finished its turn,
+   * sailed past the boundary and wrote the *user's* next message, a `<think>`
+   * block and a fabricated `<tool_response>` full of invented output — a
+   * failure that reads like hallucination and is actually a two-id mismatch
+   * (PLAN §10.20).
+   *
+   * Set it only against the tokenizer, never by guessing: the ids differ per
+   * checkpoint and a wrong one either never fires or truncates every turn.
+   */
+  eos_token_id?: number | number[];
 }
 
 /**
@@ -254,6 +276,123 @@ export const models: ModelEntry[] = [
     // driving the VM. Kept because "we tried the small one" belongs where
     // someone will look for it.
     note: "Verifies the dialect, not the workflow: it emits correct call syntax but usually invents a tool name instead of using the one it has.",
+  },
+  {
+    key: "qwen3.5-0.8b",
+    label: "Qwen3.5 0.8B (text)",
+    // The TEXT export, not the headline one. onnx-community publishes both:
+    // Qwen3.5-0.8B-ONNX is Qwen3_5ForConditionalGeneration and ships a vision
+    // encoder, so a text-only load would fetch embed_tokens + decoder as
+    // separate graphs. This repo is Qwen3_5ForCausalLM — one graph, no
+    // `components`, nothing downloaded that a chat never touches.
+    repo: "onnx-community/Qwen3.5-0.8B-Text-ONNX",
+    revision: "1e45daba048899e7f771657ada617ec49350aa91",
+    vocabSize: 248_320,
+    // Verified by parsing the graph, not inferred from the architecture: the
+    // q4 export declares `num_logits_to_keep` as an input, which is the exact
+    // name transformers.js tests for before binding 1 to it. Had the export used
+    // the newer `logits_to_keep` spelling the library would silently not bind
+    // it, the graph would emit full-sequence logits, and this line would be the
+    // bug that poisons the device (§10.10). It does not; both were checked.
+    prefillLogits: "last",
+    // q4 first for the usual reason: it is the variant that runs on an adapter
+    // without shader-f16, which is every adapter here.
+    dtypes: ["q4", "q4f16"],
+    approxBytes: 551_247_327,
+    contextTokens: 262_144,
+    // `qwen3.5`, not `hermes` — and this entry shipped as `hermes` until a real
+    // turn said otherwise (§10.20). Its chat template writes `<tool_call>`, so
+    // the markers matched; the body it actually emits is
+    // `<function=…><parameter=…>` XML. The card even names the parser
+    // (`--tool-call-parser qwen3_coder`). Markers are not a grammar.
+    dialect: "qwen3.5",
+    // The card's numbers for thinking mode on text tasks, minus one it asks for
+    // that cannot be honoured: `presence_penalty: 1.5`. transformers.js has no
+    // presence penalty at all — checked against the bundle, not assumed — and a
+    // field it does not implement is spread into generate() and silently
+    // ignored, so recording the gap here beats substituting repetition_penalty,
+    // which is a different function. Same call as LFM2.5's frequency_penalty.
+    generation: {
+      do_sample: true,
+      temperature: 1.0,
+      top_p: 0.95,
+      top_k: 20,
+      max_new_tokens: 2048,
+      // Read out of this checkpoint's tokenizer.json, not copied from another
+      // entry: <|im_end|> is 248046 here. Without it the export's own
+      // generation_config stops only at <|endoftext|> (248044) and the model
+      // writes the rest of the conversation itself. See GenerationDefaults.
+      eos_token_id: 248_046,
+    },
+    note: "Verified end to end (§10.20): loads in 3.0 s, calls the tool with the right path, answers from what it read. Its call body is XML rather than JSON — see the qwen3.5 dialect.",
+  },
+  {
+    key: "granite-4.0-h-1b",
+    label: "Granite 4.0 H 1B",
+    repo: "onnx-community/granite-4.0-h-1b-ONNX",
+    revision: "fe3928cdcd09ae5c245c840ffa73589aa0529689",
+    vocabSize: 100_352,
+    // Same check as the Qwen3.5 entry above, same answer: the graph's input is
+    // spelled `num_logits_to_keep`. Its 100 352 vocabulary would survive the
+    // pessimistic arithmetic anyway (4012 tokens), so this one buys headroom
+    // rather than viability.
+    prefillLogits: "last",
+    dtypes: ["q4", "q4f16"],
+    approxBytes: 1_021_336_558,
+    contextTokens: 131_072,
+    // hermes, and not by family resemblance: the chat template writes
+    // `<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`, which is the
+    // grammar hermes.ts already parses. The turn framing differs
+    // (<|start_of_role|> rather than <|im_start|>) but that is the chat
+    // template's business, applied by transformers.js, not the parser's.
+    dialect: "hermes",
+    // Measured 2026-08-10, and it behaved better than either of the others: it
+    // set `cwd` as well as `cmd` — the only entry that has — and reached for
+    // `ls -R`, which is the right instinct. It also wrapped `arguments` as a
+    // JSON *string* rather than an object, which parseCallBody already accepts.
+    //
+    // agent.spec.ts still reports it red, and the failure is OURS: `ls -R` exits
+    // 1 on the mount because readdir returns no d_type, so ls opendir()s every
+    // regular file and collects an ENOTDIR for each. The listing it printed was
+    // complete and the model answered correctly from it. Pinned as a conformance
+    // case next to the `find` one; see §10.20.
+    note: "Sets cwd as well as cmd and answers correctly. Its preferred `ls -R` exits 1 on the mount for a reason on our side (no d_type), so the agent spec scores it red.",
+  },
+  {
+    key: "lfm2.5-350m",
+    label: "LFM2.5 350M",
+    repo: "onnx-community/LFM2.5-350M-ONNX",
+    revision: "2c07371c2e84776cad597f3d813b7d306d292aea",
+    vocabSize: 65_536,
+    dtypes: ["q4", "q4f16"],
+    approxBytes: 293_813_394,
+    // The card says 32 768 where config.json says 128 000. The card wins: a
+    // context claim that the checkpoint was not trained to honour is the kind of
+    // number that turns into a silent quality cliff rather than an error.
+    contextTokens: 32_768,
+    // `lfm2`, NOT `lfm2.5`, despite the name — the trap this registry's whole
+    // curated-rather-than-inferred design exists to catch (§10.2). The card
+    // documents Pythonic calls between <|tool_call_start|> and
+    // <|tool_call_end|>, which is lfm2.ts exactly; and its chat template ends
+    // the generation prompt at `<|im_start|>assistant\n` where the 2.6B ends at
+    // `assistant\n<think>`. It does not reason, so lfm2.5's prompt-opened
+    // splitThinking would treat a whole answer as scratchpad.
+    dialect: "lfm2",
+    // The card's numbers. Note repetition_penalty 1.05, not the 2.6B's 1.1.
+    generation: {
+      do_sample: true,
+      temperature: 0.1,
+      top_k: 50,
+      repetition_penalty: 1.05,
+    },
+    // Measured 2026-08-10, and the note says which half worked. It emits a
+    // clean, parseable call — `[run_terminal_command(cmd="ls")]` — reaches the
+    // guest and gets exit 0, so the dialect choice above is confirmed by a real
+    // turn. What it does not do is use the path it was given: asked to list
+    // /mnt/host it ran bare `ls`, listed `/`, and then described the root
+    // filesystem as though it were the user's folder. Same shape as Qwen2.5
+    // 0.5B (§10.11) but one step further along — syntax right, target wrong.
+    note: "Verifies the loop, not the workflow: emits correct call syntax and reaches the guest, but ignores the path it is given and lists / instead. Smallest entry here at ~294 MB, loads in 1.6 s.",
   },
   {
     key: "gemma4-e2b",

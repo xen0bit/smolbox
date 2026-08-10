@@ -342,6 +342,24 @@
           }
         }
       ]
+    },
+    {
+      "name": "mount: KNOWN GAP \u2014 ls -R lists everything but exits 1, same missing d_type",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "ls -R /mnt/host"
+          },
+          "expect": {
+            "exit_code": 1,
+            "stdout_contains": "nested.txt",
+            "stderr_contains": "Not a directory"
+          }
+        }
+      ]
     }
   ]
 }

@@ -38,6 +38,47 @@ describe("ToolRegistry exposure", () => {
     expect(reg.definitions()[0]!.function.name).toBe(toolName);
   });
 
+  // Regression for a real turn, not a style preference: LFM2.5 350M handed the
+  // unstripped schema opened its tool call with `$schema="https://…"` as the
+  // first argument and never emitted `cmd` (PLAN §10.20). The published
+  // artifacts under docs/schema keep both keys — they are documents — so this
+  // asserts the divergence rather than assuming the two stay identical.
+  test("document metadata never reaches the model", () => {
+    const reg = new ToolRegistry();
+    for (const def of reg.definitions()) {
+      const params = def.function.parameters as Record<string, unknown>;
+      expect(params, `${def.function.name} leaks $schema`).not.toHaveProperty("$schema");
+      expect(params, `${def.function.name} leaks title`).not.toHaveProperty("title");
+    }
+  });
+
+  test("stripping metadata leaves the parameters themselves alone", () => {
+    const reg = new ToolRegistry();
+    const params = reg.definitions()[0]!.function.parameters as {
+      type?: string;
+      required?: string[];
+      properties?: Record<string, unknown>;
+    };
+    expect(params.type).toBe("object");
+    expect(params.required).toEqual(["cmd"]);
+    expect(Object.keys(params.properties ?? {})).toEqual([
+      "cmd",
+      "cwd",
+      "env",
+      "stdin",
+      "timeout_ms",
+      "max_output",
+    ]);
+  });
+
+  // The exec definition is rebuilt per call, but template definitions need not
+  // be — a strip that mutated its input would corrupt the second read.
+  test("definitions are stable across calls", () => {
+    const reg = new ToolRegistry();
+    reg.setEnabled("list_dir", true);
+    expect(reg.definitions()).toEqual(reg.definitions());
+  });
+
   // The prompt-cost argument (PLAN §10.1): narrow tools must be a choice.
   test("built-ins exist but are off until enabled", () => {
     const reg = new ToolRegistry();
