@@ -53,6 +53,68 @@ if (env.backends.onnx.wasm) {
 // worker boundary to read it.
 const modelCache = new ModelCache();
 
+// ------------------------------------------------- the duplicate weight fetch
+//
+// transformers.js downloads every weight file TWICE on a cold load, and the two
+// transfers race each other.
+//
+// The second one is a metadata pre-pass. When `from_pretrained` is given a
+// progress_callback it first calls get_file_metadata() for every expected file
+// so it can size an aggregate progress bar — and for a *local* path that helper
+// does a plain GET, reads Content-Length off the headers, and then drops the
+// Response without cancelling it (see utils/model_registry/get_file_metadata.js;
+// only the remote branch uses a `bytes=0-0` Range request). Measured against
+// dist/models: model_q4.onnx came back as 630 202 bytes served for a 315 101
+// byte file, generation_config.json as 292 for 146.
+//
+// Suppressing the pre-pass is not available to us — it is gated on
+// `progress_callback instanceof DefaultProgressCallback`, and that class is not
+// exported from the package's browser build — so instead the second caller for
+// a URL is handed the FIRST caller's Response. That is safe precisely because
+// the pre-pass never touches the body: whoever reads it first (the real load)
+// gets the bytes, and only one request leaves the browser. A response somebody
+// has already claimed is not shareable, so that case falls straight through to a
+// fresh fetch and behaves exactly as it did before.
+const SHARE_WINDOW_MS = 60_000;
+const shared = new Map<string, Promise<Response>>();
+const nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+
+env.fetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
+  const [input, init] = args;
+  const method = (init?.method ?? "GET").toUpperCase();
+  // A Range request asks for a different representation than a full read, so it
+  // must never be answered from — or stored in — the shared slot. This is the
+  // hub path's own metadata probe, and the Gemma engine's windowed reads.
+  const ranged = new Headers(init?.headers).has("range");
+  if (method !== "GET" || ranged) {
+    return nativeFetch(...args);
+  }
+
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const pending = shared.get(url);
+  if (pending) {
+    const resp = await pending.catch(() => undefined);
+    if (resp && !resp.bodyUsed && !resp.body?.locked) {
+      return resp;
+    }
+    shared.delete(url);
+  }
+
+  const started = nativeFetch(...args);
+  shared.set(url, started);
+  // Only ever a hint that a share is *possible*; the entry is dropped on
+  // failure, on a body someone took, and on this timer, so a response nobody
+  // came back for cannot pin a stalled connection open for the session.
+  const forget = () => {
+    if (shared.get(url) === started) {
+      shared.delete(url);
+    }
+  };
+  started.catch(forget);
+  setTimeout(forget, SHARE_WINDOW_MS);
+  return started;
+};
+
 // The bundle targets a worker, but web/tsconfig.json deliberately ships no DOM
 // lib (see web-globals.d.ts), so the worker scope is reached the same way
 // worker.ts reaches it: through globalThis.
@@ -88,8 +150,38 @@ function post(msg: ModelResponse): void {
   scope.postMessage(msg);
 }
 
+/** The last whole percent reported for each file, so a repeat can be dropped. */
+const reported = new Map<string, number>();
+
+/**
+ * One progress message per whole percent per file.
+ *
+ * transformers.js calls its progress_callback once per *network read*, and
+ * Firefox hands those over in ~26 KB pieces: a cold local load of LFM2.5 2.6B
+ * fired 28 739 of them, measured. Every one became a postMessage, a
+ * console.log and a DOM write on the page, which is why the console filled with
+ * hundreds of identical "…: 1%" lines and why the download appeared to crawl —
+ * the page could not drain the queue as fast as the worker filled it.
+ *
+ * web/src/worker.ts has throttled the smolbox.wasm download this way since it
+ * was written (`pct !== lastPct`); this path never did. A percent is the finest
+ * granularity any of the three consumers can show, so nothing is lost: the same
+ * load now sends at most 101 messages per file.
+ */
+function postProgress(file: string, pct: number): void {
+  if (reported.get(file) === pct) {
+    return;
+  }
+  reported.set(file, pct);
+  post({ type: "progress", file, pct });
+}
+
 async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<void> {
   const entry = modelFor(modelKey);
+  // A second load — another checkpoint, or the rebuild after a device loss —
+  // reports its own files from zero rather than being deduplicated against the
+  // percentages the previous one left behind.
+  reported.clear();
   loaded = entry;
   lastLoad = { local, dtype };
   // A locally-built checkpoint has no hub copy to fall back to, so failing here
@@ -133,7 +225,7 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   if (entry.backend === "gemma4-kernels") {
     kernels = await GemmaKernelEngine.load(entry.repo, entry.revision, local, LOCAL_MODEL_PATH, (p) => {
       if (typeof p.fraction === "number") {
-        post({ type: "progress", file: p.message ?? "weights", pct: Math.round(p.fraction * 100) });
+        postProgress(p.message ?? "weights", Math.round(p.fraction * 100));
       }
     });
     post({ type: "log", message: `gemma kernels on ${kernels.info()}` });
@@ -164,7 +256,7 @@ function loadWeights(entry: ModelEntry, dtype: Dtype): Promise<PreTrainedModel> 
     dtype,
     progress_callback: (p: { status?: string; file?: string; progress?: number }) => {
       if (p.status === "progress" && p.file && typeof p.progress === "number") {
-        post({ type: "progress", file: p.file, pct: Math.round(p.progress) });
+        postProgress(p.file, Math.round(p.progress));
       }
     },
   }) as Promise<PreTrainedModel>;

@@ -22,6 +22,7 @@ import {
   pickDtype,
 } from "./models.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
+import { requestPersistence } from "./model-cache.ts";
 import { Settings } from "./settings.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
@@ -532,6 +533,9 @@ const handle: SmolagentHandle = {
     }
 
     const useLocal = local ?? (await haveLocalWeights(entry.repo));
+    // Asked for here rather than on page load: this is the moment someone has
+    // committed to putting gigabytes on their disk, and Firefox prompts.
+    requestPersistence();
     setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
     const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
     modelReady = true;

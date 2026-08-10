@@ -11,6 +11,7 @@ C2W_VERSION ?= 0.8.4
 
 .PHONY: all everything build wasm wasm-js vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-js test-e2e-firefox test-e2e-agent \
+        test-e2e-agent-firefox \
         test-conformance lint clean
 
 # c2w runs as root in the container, so everything it writes to dist/ lands
@@ -250,6 +251,15 @@ test-e2e-js: web
 test-e2e-agent: web
 	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
 	SMOLBOX_WEBGPU=1 bunx --bun playwright test --config tests/e2e/playwright.agent.config.ts
+
+# The weight cache on Firefox. Separate from test-e2e-agent because reaching a
+# WebGPU adapter needs a preference there and a launch flag in Chromium, and
+# because Firefox is where the download-progress flood shows up: it hands the
+# response body over in far smaller pieces, so a missing throttle costs an order
+# of magnitude more messages. See tests/e2e/playwright.agent-firefox.config.ts.
+test-e2e-agent-firefox: web
+	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
+	bunx --bun playwright test --config tests/e2e/playwright.agent-firefox.config.ts
 
 test-conformance:
 	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first (M1)" >&2; exit 1; }

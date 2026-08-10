@@ -62,6 +62,17 @@ async function load(page: import("@playwright/test").Page): Promise<number> {
   return result.loadMs;
 }
 
+/** Counts the per-file download lines the status bar logs, e.g. "…: 42%". */
+function countProgressLines(page: import("@playwright/test").Page): () => number {
+  let n = 0;
+  page.on("console", (m) => {
+    if (/\[smolagent\] loading \S+: \d+%$/.test(m.text())) {
+      n++;
+    }
+  });
+  return () => n;
+}
+
 test("a reload serves the weights from IndexedDB instead of the network", async ({ page }) => {
   const requests: string[] = [];
   page.on("request", (r) => {
@@ -69,9 +80,29 @@ test("a reload serves the weights from IndexedDB instead of the network", async 
       requests.push(`${r.method()} ${r.url()}`);
     }
   });
+  const progressLines = countProgressLines(page);
 
   const firstMs = await load(page);
   expect(requests.some((r) => r.startsWith("GET") && r.includes("model_q4.onnx"))).toBe(true);
+
+  // One GET per weight file, not two. transformers.js runs a metadata pre-pass
+  // over every expected file before it loads anything, and on the local path
+  // that pre-pass is a full GET whose body it reads Content-Length off and then
+  // abandons — so a cold load fetched this 786 MB checkpoint twice, with the
+  // two transfers racing. model-worker.ts shares one in-flight response per URL
+  // to collapse them; this is what says so.
+  const weightGets = requests.filter((r) => r.startsWith("GET") && /\.onnx(_data)?$/.test(r));
+  expect(weightGets.length).toBe(new Set(weightGets).size);
+
+  // The download flooded the page before it was throttled: transformers.js
+  // calls its progress callback once per network read, which for a checkpoint
+  // this size is tens of thousands of postMessages, console.logs and DOM
+  // writes — enough that the page could not drain them as fast as the worker
+  // produced them and the load appeared to hang (Firefox worst, since it reads
+  // in ~26 KB pieces). The worker now emits at most one message per whole
+  // percent per file; this bound is loose enough to survive another file being
+  // added to the repo and tight enough that losing the throttle fails here.
+  expect(progressLines()).toBeLessThan(1000);
 
   const cached = await dump(page);
   const weights = cached.entries.find((e) => e.key.endsWith("model_q4.onnx"));

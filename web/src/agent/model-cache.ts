@@ -220,7 +220,8 @@ export class ModelCache {
       });
       // A model is gigabytes; without this the browser is free to evict the lot
       // under storage pressure and we are back to downloading on every reload.
-      // Best-effort and fire-and-forget: a refusal changes nothing we do.
+      // Best-effort and fire-and-forget: a refusal changes nothing we do, and
+      // off the main thread it is a no-op — see requestPersistence.
       this.db.then(() => requestPersistence()).catch(() => {});
     }
     return this.db;
@@ -447,8 +448,21 @@ export class ModelCache {
 
 let persistenceAsked = false;
 
-/** Ask once per page for storage that survives eviction. Best effort. */
-function requestPersistence(): void {
+/**
+ * Ask once per page for storage that survives eviction. Best effort.
+ *
+ * `StorageManager.persist()` is `[Exposed=Window]` — `estimate()` is available
+ * to workers, this is not — so calling it from the model worker, which is where
+ * the cache actually writes, does nothing at all. It has to be called from a
+ * page, and it is exported for that reason.
+ *
+ * It is deliberately NOT called on page load: in Firefox an origin without the
+ * `persistent-storage` permission gets a doorhanger, and a permission prompt
+ * before the visitor has asked for anything is noise. The pages call it when a
+ * model load starts, which is the point at which someone has committed to
+ * putting gigabytes on their disk.
+ */
+export function requestPersistence(): void {
   if (persistenceAsked) {
     return;
   }

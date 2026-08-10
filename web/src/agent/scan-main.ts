@@ -18,6 +18,7 @@ import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import { antaresHostTools, hostToolDefinition } from "./host-tools.ts";
 import { LOCALIZE_DEFAULTS, LocalizeRun, type LocalizeEvent, type LocalizeResult } from "./localize.ts";
 import { WorkerModelClient, type ModelClient } from "./model-client.ts";
+import { requestPersistence } from "./model-cache.ts";
 import { modelFor, pickDtype } from "./models.ts";
 import type { ParsedCall } from "./parse.ts";
 import { ANTARES_TERMINAL, profiledDefinition } from "./tool-profile.ts";
@@ -482,6 +483,9 @@ async function loadModel(): Promise<boolean> {
     status("no supported precision for this GPU");
     return false;
   }
+  // See agent-main: persist() is Window-only, so the worker that writes the
+  // cache cannot ask for it and the page has to.
+  requestPersistence();
 
   // A 3.7 GB load is the longest wait in the app by a wide margin. A single
   // status line that a filename overwrites is not feedback; a bar with bytes on
