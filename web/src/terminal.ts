@@ -17,6 +17,7 @@
 
 import type { Caps, Request, Response } from "./protocol.ts";
 import { OpExec, OpInfo } from "./protocol.ts";
+import { ExportError, formatBytes, readGuestFile, saveBytes, statGuestFile } from "./export.ts";
 
 /** How the terminal reaches the VM. Both pages' Sessions satisfy this. */
 export interface TerminalSession {
@@ -33,7 +34,39 @@ export interface TerminalOptions {
   historyKey?: string;
   /** Filled into the input when clicked, above the prompt. */
   examples?: string[];
+  /**
+   * Why a command is about to wait, if something else holds the session.
+   *
+   * On the agent page the model and this terminal share one Session, so a
+   * command typed mid-turn sits in the queue until the agent's finishes. That
+   * is correct and it is also indistinguishable from a hang, so the page gets
+   * to say so.
+   */
+  busyNote?: () => string | null;
 }
+
+/**
+ * A line the page handles itself, rather than sending to the guest.
+ *
+ * The `:` prefix is what keeps the two apart: no shell command starts with one,
+ * so a builtin can never shadow something in the guest's PATH, and a guest that
+ * grows a `get` binary tomorrow does not collide with `:get` today.
+ */
+export interface Builtin {
+  name: string;
+  arg: string;
+}
+
+export function parseBuiltin(line: string): Builtin | null {
+  const match = /^:([a-z]+)\s*(.*)$/i.exec(line.trim());
+  if (!match) {
+    return null;
+  }
+  return { name: match[1]!.toLowerCase(), arg: match[2]!.trim() };
+}
+
+/** The builtins that have to talk to the guest, and so have to boot it. */
+const BUILTINS_NEEDING_VM = new Set(["get"]);
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_HISTORY = 200;
@@ -64,6 +97,7 @@ export class Terminal {
   private readonly session: TerminalSession;
   private readonly timeoutMs: number;
   private readonly historyKey: string | undefined;
+  private readonly busyNote: (() => string | null) | undefined;
 
   private history: string[];
   /** Where the arrow keys are in `history`; == length means "the live line". */
@@ -74,11 +108,14 @@ export class Terminal {
   private busy = false;
   /** Set once the guest is up, so kernel noise stops being echoed. */
   private booting = false;
+  /** Non-null while `:get` is running; Ctrl+C sets its flag between chunks. */
+  private exporting: { aborted: boolean } | null = null;
 
   constructor(opts: TerminalOptions) {
     this.session = opts.session;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.historyKey = opts.historyKey;
+    this.busyNote = opts.busyNote;
     this.history = loadHistory(this.historyKey);
     this.cursor = this.history.length;
 
@@ -114,6 +151,7 @@ export class Terminal {
 
     this.renderPrompt();
     this.line("boot the VM by running a command — try `uname -a`, or press Enter.", "note");
+    this.line("`:get <path>` downloads a file out of the VM; `:help` lists the page's own commands.", "note");
   }
 
   focus(): void {
@@ -235,7 +273,14 @@ export class Terminal {
         if (this.input.selectionStart === this.input.selectionEnd) {
           ev.preventDefault?.();
           this.line("^C", "note");
-          if (this.busy) {
+          // An export is the one long-running thing here that this page owns
+          // rather than the guest, so it is the one thing Ctrl+C can actually
+          // stop — between chunks, since the command in flight still cannot be
+          // signalled.
+          if (this.exporting) {
+            this.exporting.aborted = true;
+            this.line("cancelling the export after the chunk in flight…", "note");
+          } else if (this.busy) {
             this.line(
               "the VM protocol has no way to signal a running command; it will end on its own " +
                 `or time out after ${Math.round(this.timeoutMs / 1000)}s.`,
@@ -289,10 +334,15 @@ export class Terminal {
     const cmd = this.input.value.trim();
     this.input.value = "";
 
+    const builtin = parseBuiltin(cmd);
+
     this.busy = true;
     this.renderPrompt();
     try {
-      if (!this.booted) {
+      // A bare Enter boots, and so does any guest command. A builtin only does
+      // if it needs the guest: :help is what someone types before they know
+      // what this is, and a typo should not cost a 150 MB download.
+      if (!this.booted && (!builtin || BUILTINS_NEEDING_VM.has(builtin.name))) {
         await this.bootVm();
       }
       if (!cmd) {
@@ -300,6 +350,14 @@ export class Terminal {
       }
       this.remember(cmd);
       this.line(`${this.cwd} $ ${cmd}`, "cmd");
+      const waiting = this.busyNote?.();
+      if (waiting) {
+        this.line(waiting, "note");
+      }
+      if (builtin) {
+        await this.builtin(builtin);
+        return;
+      }
       await this.run(cmd);
     } catch (err) {
       this.line(`error: ${err instanceof Error ? err.message : String(err)}`, "err");
@@ -307,6 +365,70 @@ export class Terminal {
       this.busy = false;
       this.renderPrompt();
       this.focus();
+    }
+  }
+
+  private help(): void {
+    this.line("commands go to the guest; lines starting with ':' are handled by this page:", "note");
+    this.line("  :get <path>   download a file out of the VM to your machine", "note");
+    this.line("  :help         this list", "note");
+  }
+
+  private async builtin(b: Builtin): Promise<void> {
+    switch (b.name) {
+      case "get":
+        await this.get(b.arg);
+        break;
+      case "help":
+        this.help();
+        break;
+      default:
+        this.line(`unknown builtin :${b.name} — try :help`, "err");
+    }
+  }
+
+  /**
+   * Pulls a file out of the guest and hands it to the browser.
+   *
+   * The transfer is a loop of ordinary commands (see export.ts), so it takes
+   * real time on a real file and the progress line is not decoration: at a few
+   * hundred KiB per round trip, a multi-megabyte file is several seconds of a
+   * terminal that would otherwise look hung.
+   */
+  private async get(path: string): Promise<void> {
+    if (!path) {
+      this.line("usage: :get <path>", "err");
+      return;
+    }
+    const stat = await statGuestFile(this.session, path);
+    if (stat.kind !== "file") {
+      throw new ExportError(
+        stat.kind === "directory"
+          ? `${path} is a directory — tar it first (tar czf /tmp/out.tgz -C ${path} .) and :get that`
+          : `${path} is not a regular file`,
+      );
+    }
+    const progress = this.line(`fetching ${path} (${formatBytes(stat.size)})…`, "note");
+    this.exporting = { aborted: false };
+    try {
+      const result = await readGuestFile(this.session, path, {
+        size: stat.size,
+        signal: this.exporting,
+        onProgress: (done, total) => {
+          progress.textContent =
+            total > 0
+              ? `fetching ${path} — ${formatBytes(done)} of ${formatBytes(total)} (${Math.round((done / total) * 100)}%)`
+              : `fetching ${path}…`;
+        },
+      });
+      saveBytes(result.name, result.bytes);
+      progress.textContent = `fetched ${path} — ${formatBytes(result.bytes.length)}, saved as ${result.name}`;
+      this.line(
+        result.sha256 ? `sha256 ${result.sha256} (verified against the guest)` : "sha256 unverified: no sha256sum in the guest",
+        "note",
+      );
+    } finally {
+      this.exporting = null;
     }
   }
 

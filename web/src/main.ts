@@ -35,7 +35,7 @@ const terminal = termEl
       root: termEl,
       session,
       historyKey: "smolbox.history",
-      examples: ["uname -a", "ls /", "cat /proc/cpuinfo", "ls -la /mnt/host"],
+      examples: ["uname -a", "ls /", "python3 -V", "ls -la /mnt/host", ":help"],
     })
   : null;
 
