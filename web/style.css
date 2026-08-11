@@ -1,0 +1,224 @@
+/* What both pages share.
+ *
+ * The VM page and the agent page had two copies of the same tokens, the same
+ * body rule and the same control styling, which stayed in sync by hand until
+ * the agent page grew a terminal of its own and the copy that mattered lived
+ * only in the other file. Everything here is used by both; anything used by one
+ * stays inline in that page's <style>. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #57606a;
+  --line: #d0d7de;
+  --panel: #f6f8fa;
+  --accent: #0969da;
+  --ok: #1a7f37;
+  --bad: #d1242f;
+  --warn: #bf8700;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin: 0 auto;
+  max-width: 56rem;
+  padding: 1.5rem 1rem 2rem;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 0.95rem;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+nav {
+  margin-left: auto;
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+}
+
+nav [aria-current="page"] {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+p {
+  font-size: 0.85rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 0.2rem;
+}
+
+.toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.toolbar .spacer {
+  flex: 1;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* The download bar. Both pages front the same two very large downloads —
+   smolbox.wasm here, a checkpoint on the agent page — and an indeterminate bar
+   is the honest rendering when the response carries no identity length. */
+progress {
+  display: block;
+  width: 100%;
+}
+
+/* The terminal. It is a REPL over Session.exec, not a PTY — see
+   src/terminal.ts — so it renders whole commands rather than a cell grid, and
+   everything is a plain block of text. Both pages mount one: the VM page as its
+   whole reason to exist, the agent page as the console beside the chat. */
+.term-scroll {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 0.75rem;
+  min-height: 22rem;
+  max-height: 62vh;
+  overflow-y: auto;
+  cursor: text;
+  font-size: 0.85rem;
+}
+
+.term-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.term-cmd {
+  font-weight: 600;
+  margin-top: 0.4rem;
+}
+
+.term-err {
+  color: var(--bad);
+}
+
+.term-note,
+.term-boot {
+  color: var(--muted);
+}
+
+.term-prompt {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.term-ps1 {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: pre;
+}
+
+/* The input is the caret line: no chrome of its own, so the prompt reads as one
+   continuous line of terminal rather than a form field. */
+.term-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 0;
+  min-width: 8rem;
+}
+
+.term-input:focus {
+  outline: none;
+}
+
+.term-examples {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.6rem;
+}
+
+.term-chip {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  color: var(--muted);
+  background: transparent;
+}
+
+.term-chip:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --line: #30363d;
+    --panel: #161b22;
+    --accent: #4493f8;
+    --ok: #3fb950;
+    --bad: #f85149;
+    --warn: #d29922;
+  }
+
+  .term-input {
+    background: transparent;
+  }
+}

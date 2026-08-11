@@ -20,7 +20,8 @@ internal/tool/                # M7: the model-facing tool surface over the exec 
 web/
   serve.ts                    # dev server: Bun.serve with COOP/COEP headers; /models/ -> dist/models
   fetch-model.ts              # M8: pulls the pinned checkpoint into dist/models (`make model`)
-  index.html                  # minimal page: boot/run UI + crossOriginIsolated check
+  index.html                  # minimal page: the terminal + crossOriginIsolated check
+  style.css                   # what both pages share: tokens, controls, the terminal
   js.html                     # M6: the same UI for the emscripten build, served at /js/
   agent.html                  # M8: the WebGPU agent spike, served at /agent/
   src/
@@ -29,6 +30,7 @@ web/
       model-worker.ts         #   transformers.js on WebGPU, its own dedicated worker
       parse.ts                #   tool-call parser: Pythonic AND JSON (28 unit tests)
       agent-main.ts           #   page entry: VM + model + the transcript; window.__smolagent
+      status.ts               #   the status strip: one state per component, not one status line
     emscripten/               # M6: the --to-js page (no worker, no fsbridge)
       js-main.ts              #   page entry: Module wiring + window.__smolbox
       protocol-pty.ts         #   Module['pty'] over the shared StdinChannel
@@ -38,6 +40,8 @@ web/
     stdio.ts                  # stdio router: FrameDecoder + SAB stdin channel
     session.ts                # TS twin of internal/vm session client
     tool.ts                   # M7: TS twin of internal/tool (definition, adapters, renderResult)
+    terminal.ts               # REPL over Session.exec, mounted by both pages; `:` builtins
+    export.ts                 # a file out of the guest: chunked dd|base64 over the exec API
     mount.ts                  # M5: mount providers (picker / OPFS) behind one interface
     fsbridge/                 # M5: SAB layout, worker Fd, main-thread async service
       protocol.ts             #   SAB layout + op codecs, shared by both ends
@@ -53,6 +57,8 @@ tests/
     conformance.spec.ts       #   M5: the WASI page, all 14 cases
     emscripten.spec.ts        #   M6: the /js/ page, the 8 non-mount cases
     agent.spec.ts             #   M8: the agent spike; opt-in (SMOLBOX_WEBGPU=1), needs a GPU
+    export.spec.ts            #   `:get`: a 1.2 MB binary out of the guest, hash-checked
+    agent-console.spec.ts     #   the status chips, and that the console shares the model's VM
 testdata/mount/               # fixture directory used as the mounted folder
 docs/tool-api.md              # M7: the tool-call surface, hand-written spec
 docs/schema/                  # M7: GENERATED from the Go types — never hand-edit

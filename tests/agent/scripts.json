@@ -222,6 +222,18 @@
           "text": "The history was trimmed, so this fits.</think>I am smolbox, on a shorter prompt."
         }
       ]
+    },
+    {
+      "name": "writes a file to /tmp, which the console must then be able to see",
+      "when": "leave me a file",
+      "turns": [
+        {
+          "text": "<|tool_call_start|>[run_terminal_command(cmd=\"echo agent-was-here > /tmp/from-agent\")]<|tool_call_end|>"
+        },
+        {
+          "text": "Written to /tmp/from-agent."
+        }
+      ]
     }
   ]
 }

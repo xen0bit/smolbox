@@ -57,6 +57,27 @@ Chromium through the real worker/session code path and asserts the `echo hello` 
 mount smoke (file/nested/list/symlink reads through the sync bridge), and the **full conformance
 table** (`tests/e2e/conformance.spec.ts`, 14/14) — the browser half of the single-table guarantee.
 
+The same TS suite covers the two things added around the exec API rather than inside it:
+`export.test.ts` drives the chunked read against a scripted guest (multi-chunk reassembly, an exact
+chunk multiple, an empty file, wrapped and unwrapped base64, a truncated chunk, a file that vanishes
+or grows mid-read, a hash the guest disagrees with, a guest with no `sha256sum`, cancellation, and a
+path that would otherwise be shell), and `status.test.ts` covers the agent page's chip states and the
+indeterminate download bar. Both are pure over an interface, which is the only reason a page with no
+CI has any of it tested at all.
+
+**Browser e2e, the file export** (`tests/e2e/export.spec.ts`): the guest's own python3 writes 1.2 MB
+of every byte value in sequence — binary, three chunks, and self-describing about an offset error —
+`:get` downloads it through the real terminal, and the test compares the downloaded file's SHA-256
+against the guest's `sha256sum`. Plus the two refusals worth having: a directory names the way out,
+and `:help` answers without booting a VM.
+
+**Browser e2e, the agent page** (`tests/e2e/agent-console.spec.ts`): the chips start idle and each
+follows its own half (a mounted folder is ready while the VM is not), a command typed in the console
+boots the VM and updates the chip that did not start it, the console's `cd` is the guest's cwd, and —
+the claim that matters — a file the scripted model writes to `/tmp` is one the console reads back,
+which is what "the same VM" means and what would silently stop being true if the console ever got a
+session of its own.
+
 **Emscripten e2e** (`make test-e2e-js`, Playwright, **M6 done**): boots `dist/js` at `/js/` and runs
 the boot smoke, a `/mnt/host is empty` guard for the no-mount non-goal, and the 8 conformance cases
 not tagged `requires: ["mount"]` (10/10). It runs from its own

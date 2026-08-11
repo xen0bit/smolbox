@@ -143,6 +143,48 @@
       ]
     },
     {
+      "name": "python3: the interpreter is installed and runs",
+      "steps": [
+        {
+          "request": {
+            "cmd": "python3 -c 'print(1+1)'"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout": "2\n"
+          }
+        }
+      ]
+    },
+    {
+      "name": "python3: the stdlib a model reaches for is present",
+      "steps": [
+        {
+          "request": {
+            "cmd": "python3 -c 'import json,re,csv,sqlite3;print(json.dumps({\"n\":len(re.findall(\"a\",\"banana\"))}))'"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout": "{\"n\": 3}\n"
+          }
+        }
+      ]
+    },
+    {
+      "name": "python3: reads stdin through a pipe",
+      "steps": [
+        {
+          "request": {
+            "cmd": "echo '{\"a\":1}' | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"a\"])'"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout": "1\n"
+          }
+        }
+      ]
+    },
+    {
       "name": "mount: read a file through the host mount",
       "requires": [
         "mount"

@@ -90,6 +90,10 @@ web:
 	mkdir -p web/dist
 	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
 	cp web/index.html web/dist/index.html
+	@# Both pages link this; it holds the tokens, the controls and the terminal
+	@# styling they share (the agent page grew a terminal of its own at the
+	@# console panel, and two copies of those rules had already drifted once).
+	cp web/style.css web/dist/style.css
 	@# The VM artifacts stay in dist/ and are served from there (web/serve.ts
 	@# resolves them via DIST_DIR); web/dist holds only the bundles.
 	mkdir -p web/dist/agent web/dist/ort

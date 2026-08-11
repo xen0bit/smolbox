@@ -10,7 +10,9 @@ import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
 import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "../mount.ts";
+import { Terminal } from "../terminal.ts";
 import { toolName } from "../tool.ts";
+import { PageStatus } from "./status.ts";
 import { type AgentEvent, Conversation, DEFAULTS, type ToolRunner } from "./conversation.ts";
 import { dialectFor } from "./dialects/index.ts";
 import {
@@ -37,11 +39,59 @@ const probeFor = (repo: string) => `/models/${repo}/config.json`;
 
 const SYSTEM_PROMPT = `You are smolbox, an assistant with access to a Linux sandbox.
 
-The user's folder is mounted read-only at /mnt/host. Use the ${toolName} tool to inspect it before answering, then answer from what the tool returned.`;
+The user's folder is mounted read-only at /mnt/host. Use the ${toolName} tool to inspect it before answering, then answer from what the tool returned.
+
+The sandbox has busybox, coreutils, grep, rg, tree and python3. Prefer a shell pipeline for listing, searching and reading; reach for python3 -c when the work is real computation, parsing or a multi-step transform, and write it as one command. /tmp is writable; /mnt/host is not.`;
+
+// ---------------------------------------------------------------- DOM helpers
+
+const el = (id: string) => document.getElementById(id);
+const logEl = el("log");
+const promptEl = el("prompt");
+const sendEl = el("send");
+const stopEl = el("stop");
+const startEl = el("start");
+const pickEl = el("pick");
+
+/**
+ * The three things that can be up, loading or broken independently.
+ *
+ * This used to be one span and one `setStatus(text)` that guessed its own state
+ * by matching the message against a regex. Three states cannot be carried by
+ * one line of text, so every call site now says which component it is talking
+ * about — see status.ts for why that is worth the edits.
+ */
+const status = new PageStatus({
+  vm: el("chip-vm"),
+  model: el("chip-model"),
+  folder: el("chip-folder"),
+  progressRow: el("progress-row"),
+  progressBar: el("progress"),
+  progressLabel: el("progress-label"),
+});
+
+/** Kept for the console log alone, which the e2e suites read. */
+function log(text: string): void {
+  console.log("[smolagent]", text);
+}
+
+// What the model chip reads when nothing is wrong. Held here because a failed
+// turn turns the chip red and the next good one has to be able to put it back —
+// a page that stays red after it recovered is a page nobody trusts again.
+let modelLabel = "not loaded";
+
+function modelIsFine(): void {
+  status.model("ready", modelLabel);
+}
 
 const vmWorker = new Worker("/worker.js", { type: "module" });
 const session = new Session(vmWorker);
 const mount = new MountHost();
+
+// Assigned once the console panel is built, below. The worker starts talking
+// before that happens, so this is a forward reference rather than an import
+// cycle waiting to happen.
+let consoleTerm: Terminal | null = null;
 
 vmWorker.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as {
@@ -50,6 +100,7 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
     sab?: SharedArrayBuffer;
     loaded?: number;
     total?: number;
+    text?: string;
   };
   switch (msg.type) {
     case "fschannel":
@@ -60,51 +111,30 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
     case "fsreq":
       mount.serve();
       break;
+    // The guest's raw console, which is the kernel's boot log until the agent
+    // answers. The agent page used to drop it; now that there is a terminal on
+    // this page too, a slow boot is watchable here as well.
+    case "console":
+      if (msg.text) {
+        consoleTerm?.system(msg.text);
+      }
+      break;
     case "progress":
-      // smolbox.wasm is ~110 MiB; the VM boots inside session.boot().
-      if (typeof msg.loaded === "number" && msg.total) {
-        setStatus(`loading smolbox.wasm… ${Math.min(100, Math.round((msg.loaded / msg.total) * 100))}%`);
+      // smolbox.wasm is ~150 MiB, and on a cold load it is the longest anyone
+      // waits before anything else can start.
+      if (typeof msg.loaded === "number") {
+        status.progress("smolbox.wasm", msg.loaded, msg.total);
+        status.vm("loading", "downloading");
+      }
+      break;
+    case "log":
+      // Anything after the fetch means the bar has done its job.
+      if (msg.message && msg.message !== "fetching wasm") {
+        status.clearProgress();
       }
       break;
   }
 });
-
-// ---------------------------------------------------------------- DOM helpers
-
-const el = (id: string) => document.getElementById(id);
-const logEl = el("log");
-const statusEl = el("status");
-const promptEl = el("prompt");
-const sendEl = el("send");
-const stopEl = el("stop");
-const startEl = el("start");
-const pickEl = el("pick");
-
-/**
- * The status line, and what state it is in.
- *
- * The text was always there; what was missing is that "loading Qwen3 1.7B" and
- * "FAIL: cross-origin isolation required" looked identical at a glance. The
- * state is inferred from the message rather than passed by every caller — there
- * are ~20 call sites and threading a second argument through all of them would
- * be a lot of edits for a colour.
- */
-function setStatus(text: string): void {
-  console.log("[smolagent]", text);
-  if (!statusEl) {
-    return;
-  }
-  statusEl.textContent = text;
-  const lower = text.toLowerCase();
-  const state = /^(fail|error)|\berror\b|failed/.test(lower)
-    ? "error"
-    : /loading|booting|generating|…/.test(lower)
-      ? "loading"
-      : /ready/.test(lower)
-        ? "ready"
-        : "idle";
-  statusEl.setAttribute("data-state", state);
-}
 
 function bubble(cls: string, who: string): Element | null {
   if (!logEl) {
@@ -131,7 +161,11 @@ const spawnModelWorker = () => new Worker("./model-worker.js", { type: "module" 
 let modelClient: ModelClient = new WorkerModelClient(
   spawnModelWorker(),
   (line) => console.log("[model]", line),
-  (file, pct) => setStatus(`loading ${file}: ${pct}%`),
+  (file, pct) => {
+    log(`loading ${file}: ${pct}%`);
+    status.progressPercent(file, pct);
+    status.model("loading", `loading ${file}`, `loading ${file}: ${pct}%`);
+  },
   // Passed so a device that is genuinely lost — rather than merely out of memory
   // — can be replaced. See DEVICE_LOSSES_BEFORE_RESPAWN.
   spawnModelWorker,
@@ -278,7 +312,7 @@ function onEvent(ev: AgentEvent): void {
       if (ev.reason === "device-lost") {
         // The retry is about to sit through a full reload, so say what is
         // happening — otherwise it reads as a hang partway through an answer.
-        setStatus("rebuilding the model session after a GPU error…");
+        status.model("loading", "rebuilding after a GPU error");
         bubble("note", "gpu")!.textContent =
           `the GPU ran out of memory prefilling ~${ev.was} chars of prompt, which takes the inference ` +
           `session with it. Rebuilding it and retrying this turn with a ${ev.chars}-char budget; ` +
@@ -566,7 +600,10 @@ const handle: SmolagentHandle = {
   },
   useFake: (scripts: FakeScript[]) => {
     modelClient = new FakeModelClient(scripts);
-    setStatus("model: scripted fake");
+    modelLabel = "scripted fake";
+    status.model("ready", modelLabel);
+    modelReady = true;
+    refreshControls();
   },
   loadModel: async (local?: boolean) => {
     const entry = modelFor(currentModelKey);
@@ -613,11 +650,14 @@ const handle: SmolagentHandle = {
     // Asked for here rather than on page load: this is the moment someone has
     // committed to putting gigabytes on their disk, and Firefox prompts.
     requestPersistence();
-    setStatus(`loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})…`);
+    status.model("loading", `${entry.label} (${dtype})`, `loading ${entry.label} (${dtype}, ${useLocal ? "local" : "hub"})`);
     const ready = await modelClient.load(useLocal, { modelKey: entry.key, dtype });
     modelReady = true;
     refreshControls();
-    setStatus(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
+    status.clearProgress();
+    modelLabel = `${entry.label} (${dtype})`;
+    status.model("ready", modelLabel, `${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
+    log(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     return ready;
   },
   setModel: (key: string) => {
@@ -631,19 +671,19 @@ const handle: SmolagentHandle = {
     // with them under a new dialect would be the worst of both.
     modelReady = false;
     refreshControls();
-    setStatus(`model: ${entry.label} — press start to load it`);
+    status.model("idle", `${entry.label} — press start`);
   },
   bootVm: async (timeoutMs?: number) => {
-    setStatus("booting the VM…");
+    status.vm("loading", "booting");
     const caps = await session.boot(timeoutMs);
     vmReady = true;
     refreshControls();
-    setStatus(`vm ready (agent v${caps.version})`);
+    status.vm("ready", `agent v${caps.version}`);
     return caps;
   },
   setMount: (h: DirectoryHandleLike | null, links?: Record<string, string>) => {
     mount.remount(h, links);
-    setStatus(h ? "folder mounted at /mnt/host" : "no folder mounted");
+    status.folder(h ? "ready" : "idle", h ? "mounted at /mnt/host" : "none");
   },
   send: async (text: string) => {
     events = [];
@@ -685,7 +725,7 @@ if (params.get("model") === "fake") {
 }
 
 if (!crossOriginIsolated) {
-  setStatus("FAIL: cross-origin isolation required. Serve with COOP/COEP headers.");
+  status.vm("error", "no cross-origin isolation", "cross-origin isolation required (SharedArrayBuffer). Serve with COOP/COEP headers.");
 }
 
 // A tiny built-in script so the page is explorable without a GPU; CI injects
@@ -729,7 +769,10 @@ async function submit(): Promise<void> {
   }
   try {
     await handle.send(text);
-    setStatus("ready");
+    // A turn that worked clears whatever the last one left on the chip.
+    if (modelReady) {
+      modelIsFine();
+    }
   } catch (err) {
     // The loop turns model and tool failures into `error` events, so reaching
     // here means something outside it broke. Put it in the log anyway: a status
@@ -740,7 +783,7 @@ async function submit(): Promise<void> {
     if (body) {
       body.textContent = message;
     }
-    setStatus(`error: ${message}`);
+    status.model("error", "the turn failed", message);
   }
 }
 
@@ -753,7 +796,7 @@ startEl?.addEventListener("click", async () => {
     if (params.get("model") !== "fake") {
       const gpu = await handle.webgpu();
       if (!gpu.adapter) {
-        setStatus("FAIL: no WebGPU adapter in this browser");
+        status.model("error", "no WebGPU adapter in this browser");
         return;
       }
     }
@@ -762,7 +805,6 @@ startEl?.addEventListener("click", async () => {
     }
     await handle.bootVm();
     await handle.loadModel();
-    setStatus("ready — ask something");
   } catch (err) {
     // Loading a 2 GB checkpoint fails for reasons the user can act on — no
     // adapter, no weights, a quantization this GPU cannot run — so the reason
@@ -772,7 +814,14 @@ startEl?.addEventListener("click", async () => {
     if (body) {
       body.textContent = message;
     }
-    setStatus(`error: ${message}`);
+    // Which half failed decides which chip goes red: a VM that never booted and
+    // a checkpoint this GPU cannot run send the reader to different places.
+    status.set(status.phase("vm") === "ready" ? "model" : "vm", {
+      state: "error",
+      detail: "start failed",
+      title: message,
+    });
+    status.clearProgress();
   } finally {
     setBusy(false);
   }
@@ -782,11 +831,12 @@ pickEl?.addEventListener("click", async () => {
   try {
     handle.setMount(await pickDirectoryHandle());
   } catch (err) {
-    setStatus(
-      isPickCancelled(err)
-        ? "mount unchanged (no folder chosen)"
-        : `pick failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    if (isPickCancelled(err)) {
+      log("mount unchanged (no folder chosen)");
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    status.folder("error", "pick failed", message);
   }
 });
 
@@ -897,5 +947,35 @@ if (modelSelect) {
   modelSelect.value = currentModelKey;
   modelSelect.addEventListener("change", () => handle.setModel(modelSelect.value));
 }
+
+// ---------------------------------------------------------------- the console
+//
+// The same Session the model drives, not a second one: Session.exec chains
+// every request through one promise, so a command typed here queues behind the
+// agent's tool call rather than racing it for the stdin slot. Sharing it is the
+// point — the working directory, /tmp and everything the model has built up are
+// all right there — and it is also why boot goes through handle.bootVm(), which
+// is what keeps the VM chip honest no matter which half started the VM.
+
+const termEl = el("terminal");
+if (termEl) {
+  consoleTerm = new Terminal({
+    root: termEl,
+    session: {
+      boot: () => handle.bootVm(),
+      exec: (req) => session.exec(req),
+    },
+    historyKey: "smolbox.history",
+    examples: ["ls -la /mnt/host", "python3 -V", ":get /tmp/out.txt", ":help"],
+    busyNote: () => (busy ? "the agent is using the session; this command runs when its turn ends…" : null),
+  });
+}
+
+// A panel opened by hand is a panel someone is about to type into.
+el("console-panel")?.addEventListener("toggle", () => {
+  if (el("console-panel")?.open) {
+    consoleTerm?.focus();
+  }
+});
 
 setBusy(false);

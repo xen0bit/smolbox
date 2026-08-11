@@ -5,7 +5,7 @@ a folder from your machine as a read-only part of its filesystem. A small on-dev
 issuing terminal commands.
 
 > **Status: component 1 is complete (M0–M7); component 2 is working (M8–M11).** The VM builds (`make wasm` → `dist/smolbox.wasm`,
-> 108 MB) and boots to the guest agent's ready banner under wazero in ~3.2 s and **in a browser in
+> 153 MB, 45 MB brotli) and boots to the guest agent's ready banner under wazero in ~3.2 s and **in a browser in
 > ~2.6 s**, with the read-only host mount working under wazero and in the browser via the sync FS
 > bridge (a folder picked with the File System Access API is mounted read-only at `/mnt/host`). The
 > `smolbox` CLI (`exec`/`repl`) drives it over the framed protocol, and a shared conformance table
@@ -53,7 +53,10 @@ one folder they explicitly chose, and cannot write to it.
 ### The VM
 
 - A single `dist/smolbox.wasm` boots a real x86_64 Linux kernel and starts a container, with no
-  native dependencies beyond a WebAssembly runtime.
+  native dependencies beyond a WebAssembly runtime. The guest carries busybox, coreutils, findutils,
+  grep, ripgrep, tree and **python3** — enough that a model can do real work in one command, and
+  nothing more, because every package is wasm bytes every visitor downloads (see
+  [§10.24](docs/plan/10-findings.md)).
 - It runs identically under **wazero** (Go, for local development and integration tests) and in a
   **browser** via `browser_wasi_shim` — the same bytes, exercised by the same test suite.
 - A host directory can be mounted at `/mnt/host`, **read-only**. Reads are enforced read-only at the
@@ -75,6 +78,10 @@ one folder they explicitly chose, and cannot write to it.
   process-group kills so nothing leaks.
 - **One definition, two runtimes.** The wire types are defined once in Go and mirrored in TypeScript,
   with a generated JSON Schema. The Go and browser clients cannot drift.
+- **Files come back out over it too, not beside it.** `:get <path>` in either page's terminal reads a
+  guest file in 512 KiB `dd | base64` chunks over this same API and hands the bytes to the browser as
+  a download, checked against the guest's own `sha256sum`. No new op, no new wire field — new
+  capability goes around the exec API, not inside it.
 
 ```go
 resp, err := session.Exec(ctx, protocol.Request{
@@ -101,6 +108,13 @@ resp, err := session.Exec(ctx, protocol.Request{
 - The tool surface is fully specified and tested against a mock caller **before** any model is
   wired in — the model is a consumer of a proven API, not a prerequisite for it. See
   [docs/tool-api.md](docs/tool-api.md).
+- The page says what is up rather than what happened last: one chip each for the VM, the model and
+  the mounted folder, since all three load independently and any of them can fail on its own, with
+  the download bar underneath them for the two very large downloads (the wasm, then the weights).
+- **A console beside the chat, on the same VM.** The panel under the composer is the same terminal
+  the `/` page is built from, driving the same `Session` — so a command you type queues behind the
+  agent's tool call rather than racing it, `cd` moves the directory its next command inherits, and a
+  file it wrote to `/tmp` is one you can read back or `:get` out of the VM.
 
 ### Build and test
 
@@ -132,7 +146,9 @@ make web serve   # bundle and serve the browser runtime on localhost:8080
 resumable step — `make model MODEL=<key>` pulls a single registry entry, `make model MODEL=--list`
 shows them.
 
-The dev server hosts the VM at `/` and the agent page at `/agent/`. The agent page needs a GPU; it loads weights from `dist/models` when
+The dev server hosts the VM at `/` and the agent page at `/agent/`. Both pages carry a terminal
+whose `:`-prefixed lines are handled by the page rather than the guest — `:get <path>` downloads a
+file out of the VM, `:help` lists them. The agent page needs a GPU; it loads weights from `dist/models` when
 `make model` has been run and from the Hugging Face CDN otherwise.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.

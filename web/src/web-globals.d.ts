@@ -39,6 +39,11 @@ interface Element {
   /** <dialog> only, and optional so a browser without it degrades to inline. */
   showModal?(): void;
   close?(): void;
+  /** <details> only: the agent page's console panel. */
+  open: boolean;
+  /** Anchors only, and only the synthesised ones an export is handed to. */
+  href: string;
+  download: string;
   scrollTop: number;
   readonly scrollHeight: number;
   readonly children: readonly Element[];
@@ -61,7 +66,7 @@ interface Element {
   /** Only used to trigger the JSON download on a synthesised anchor. */
   click(): void;
   addEventListener(
-    type: "click" | "keydown" | "change" | "input" | "cancel",
+    type: "click" | "keydown" | "change" | "input" | "cancel" | "toggle",
     listener: (ev: KeyboardEventLike) => void,
   ): void;
   remove(): void;

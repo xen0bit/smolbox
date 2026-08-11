@@ -20,13 +20,24 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
       -o /smolagentd ./guest/smolagentd
 
 FROM alpine:3.21          # pin by digest for reproducible wasm builds
-RUN apk add --no-cache coreutils findutils grep
+RUN apk add --no-cache coreutils findutils grep ripgrep tree python3 \
+ && cd /usr/lib/python3.12 \
+ && rm -rf ensurepip lib2to3 pydoc_data idlelib turtledemo test */test */tests
 COPY --from=agent /smolagentd /sbin/smolagentd
 RUN mkdir -p /mnt/host
 ENTRYPOINT ["/sbin/smolagentd"]
 ```
 
 Tagged `smolbox/vm:dev`.
+
+**What is in the image, and why each thing is.** `coreutils`/`findutils`/`grep` are the tools the
+conformance table and the tool surface assume; `ripgrep` and `tree` are named by the Antares system
+prompt (§11.1.16); `python3` is there so a model can do computation and parsing in one call instead
+of a five-stage pipeline. Every package here is paid for by every visitor in wasm bytes — python3
+alone moved `dist/smolbox.wasm` from 117.7 MB to 152.6 MB, which is more than its 22 MiB install
+(§10.24) — so the bar for adding another one is what it saves a model from doing badly, not what it
+would be nice to have. There is no `pip`: the guest has no network, so it could only install from
+files already inside the VM.
 
 **`build/Dockerfile.c2w` — builds the VM.** A builder *image*, not a build stage.
 
