@@ -1,4 +1,4 @@
-## 10 (continued). What running it taught us (§10.10–§10.23)
+## 10 (continued). What running it taught us (§10.10–§10.24)
 
 The measurement log for component 2: every finding that came from putting a real model on a real GPU
 in front of a real VM, in the order it was found. §10.1–§10.9 in
@@ -1119,3 +1119,72 @@ real guest, a non-empty result, prose after it, and no error events. That makes 
 perfectly good smoke model.
 
 Unit 424 → 452. The default entry still passes `agent.spec.ts`.
+
+### 10.24 python3 in the guest, a way out for files, and what both cost (2026-08-11)
+
+Three changes that touch each other only at the edges: the guest got an interpreter, the pages got a
+way to pull a file out of the VM, and the agent page got a status strip and a console. The numbers
+are here because two of the three are paid for by every visitor.
+
+**python3 costs 34.9 MB of wasm, which is more than the package.** `apk add python3` on Alpine 3.21
+is Python 3.12.13 and reports 22 MiB installed; trimming `ensurepip`, `lib2to3`, `pydoc_data`,
+`idlelib`, `turtledemo` and the stdlib's test trees takes `/usr/lib/python3.12` from 30.1 MB to
+26 MB. The artifact moved further than that:
+
+| | before | after |
+|---|---|---|
+| `smolbox/vm:dev` (docker disk usage) | 24.5 MB | 76.6 MB |
+| `dist/smolbox.wasm` | 117,650,243 B | 152,559,919 B |
+| the same, brotli (what is downloaded) | 35,222,075 B | 45,162,081 B |
+
+So the wasm grew 29.7% for a package that installs 22 MiB, and the download a visitor actually pays
+for grew 28.2% — c2w's rootfs image is not a tarball and does not shrink to fit. Anyone weighing
+another `apk add` here should budget from the compressed artifact, not from `apk info -s`.
+
+`__pycache__` (5.3 MB) was deliberately **kept**. Deleting it is the biggest single saving on offer
+and it is the wrong trade: the alternative is recompiling stdlib modules on every invocation, inside
+an emulated x86 where that is the expensive kind of work. Alpine ships it as its own package
+(`python3-pyc`), so this is a decision, not an accident.
+
+**What an interpreter costs per call.** Timed inside the guest with `date +%s%N`, on one session, so
+boot is excluded:
+
+| | |
+|---|---|
+| `echo` (a shell round trip) | 218 ms |
+| `python3 -c pass`, first run | 2950 ms |
+| `python3 -c pass`, again | 1530 ms |
+| `python3 -c 'import json,re,argparse'` | 4162 ms |
+
+A tool call that starts Python costs a second and a half at best and four seconds with a few imports
+— against 218 ms for a shell pipeline. That ratio is why the agent's system prompt says to prefer a
+pipeline for listing, searching and reading, and to reach for `python3 -c` when the work is real
+computation or parsing. It is a fair trade there and a bad one for `ls`.
+
+**Export is `dd` and `base64`, and it is fast enough.** Getting bytes out needed no protocol change:
+`dd` seeks, base64 survives the response frame, and `web/src/export.ts` loops range reads. Measured
+in the guest:
+
+| | |
+|---|---|
+| `dd bs=512K count=1 \| base64` | 809 ms |
+| `sha256sum` over 512 KiB | 700 ms |
+
+So roughly 1.5–2 s per MiB, and `MAX_EXPORT_BYTES` (64 MiB) is about two minutes at that rate —
+which is the honest reason for the ceiling, rather than any protocol limit. The chunk size is 512 KiB
+because that base64s to 699,052 bytes, under the 1 MiB cap the request asks for and well under the
+guest's own 1,162,808-byte frame ceiling; a `truncated` response is therefore impossible and is
+treated as a hard error rather than a short read. One detail that would have been a silent corruption:
+`base64` **wraps** its output (708,251 bytes came back for a 524,288-byte chunk), and busybox and
+coreutils disagree about `-w0`, so the whitespace is stripped on this side instead.
+
+**Unexplained: three compound scripts stalled past their own timeout.** While measuring the above, a
+single exec running a multi-command script hung for minutes on three occasions — past a
+`timeout_ms` that should have killed it and returned a `timed_out` response, which is the part worth
+recording. Every command in those scripts ran fine on its own immediately afterwards, including the
+exact ones that had been in the hung script, and the same script that hung once completed in 13.9 s
+later. Nothing was reproducible, so nothing here is a diagnosis. The one lead worth writing down for
+whoever meets it again: `reapOrphans()` in `guest/smolagentd/agent.go` drains with `Wait4(WNOHANG)`
+in a loop that only breaks on an error, so a child that has not exited yet is a busy-spin — cheap on
+real silicon, and a spin that starves the very child it is waiting for when PID 1 and that child
+share one emulated CPU. That is a hypothesis, not a finding; it has not been instrumented.

@@ -74,8 +74,19 @@ Everything gate = `make lint test` then `make test-integration` + `make test-con
 ## How the VM is built (the two Dockerfiles)
 
 1. `vm/Dockerfile` — **the VM**: builds `guest/smolagentd` (Go, static linux/amd64) and layers it on
-   pinned `alpine:3.21` with coreutils/findutils/grep. Entrypoint is `/sbin/smolagentd` (M2+); M1
-   used `/bin/sh` for harness debugging.
+   pinned `alpine:3.21` with coreutils/findutils/grep, ripgrep/tree, and python3. Entrypoint is
+   `/sbin/smolagentd` (M2+); M1 used `/bin/sh` for harness debugging.
+
+   **A package in this image is paid for by every visitor, in wasm bytes.** python3 reports 22 MiB
+   installed and moved `dist/smolbox.wasm` from 117.7 MB to 152.6 MB — 33.6 MiB to 43.1 MiB brotli,
+   which is the number a visitor actually downloads. c2w's rootfs image does not shrink to fit, so
+   budget from the artifact, never from `apk info -s` (PLAN §10.24). It is worth it
+   because a model doing arithmetic or parsing in one `python3 -c` beats a five-stage pipeline it
+   gets wrong; it is *not* worth it for anything a shell already does. There is no pip (no network in
+   the guest), and `__pycache__` stays — recompiling the stdlib per invocation inside an emulated x86
+   costs far more than the 5.3 MiB. An interpreter start is ~1.5 s warm and ~4 s with a few imports,
+   against 218 ms for a shell round trip, which is why the system prompt tells the model when to
+   reach for it.
 2. `build/Dockerfile.c2w` — **builds** the VM: installs docker CLI + buildx + the pinned c2w release
    (checksum-verified). It also clones `container2wasm/container2wasm@v0.8.4` to `/assets`.
 3. `make wasm` runs `c2w --assets /assets smolbox/vm:dev /out/smolbox.wasm` against the host daemon.
@@ -346,7 +357,7 @@ model/gemma-kernels re-pull weights — so every file is served with an `ETag` (
 `Last-Modified`, and a matching `If-None-Match`/`If-Modified-Since` returns 304. Non-HTML gets
 `Cache-Control: public, max-age=86400` (a revisit within the day costs nothing; after that it is a
 cheap 304); the HTML entry pages are `no-cache` because they are the anchor everything else
-revalidates against. `smolbox.wasm` is ~110 MiB, so this is what stops a slow link from re-downloading
+revalidates against. `smolbox.wasm` is ~145 MiB, so this is what stops a slow link from re-downloading
 it every load; the page shows a `<progress>` bar fed by the worker's download stream
 (`web/src/worker.ts` `fetchWasm`) while it does. The `If-Modified-Since` comparison floors the mtime
 to whole seconds — HTTP dates have no sub-second precision — or a freshly touched file never 304s.
@@ -381,7 +392,7 @@ browser could load got produced and measured; the same graph re-saved with a sid
 `.br` and a `.gz` beside each compressible artifact; `web/serve.ts` picks one by `Accept-Encoding`,
 preferring brotli, and serves identity when no sibling exists — so the target is optional and a
 deployment that skips it merely loses the saving. Encoding per request instead would cost seconds of
-CPU per cold load and force a chunked response. `dist/smolbox.wasm` goes 117.7 MB → 32.8 MB.
+CPU per cold load and force a chunked response. `dist/smolbox.wasm` goes 152.6 MB → 45.2 MB.
 
 Four things that are easy to get wrong here, all covered by `web/serve.test.ts`:
 
@@ -460,6 +471,45 @@ take it.
 **Verified is about the parser, not the model.** Qwen2.5 0.5B emits flawless `<tool_call>` JSON
 naming tools that do not exist, and never takes the correction; that is what promoted `hermes` and it
 is still not a usable agent. Say which of the two a registry note is talking about.
+
+### Files leave the guest over the exec API, not beside it
+`web/src/export.ts` reads a guest file in 512 KiB chunks with `dd if=… skip=N count=1 | base64` and
+hands the bytes to the browser. There is no transfer op and there should not be: new capability goes
+*around* the exec API (AGENTS' standing rule), and the protocol stayed exactly where M7 left it. Three
+things in there are load-bearing. The chunk size is 512 KiB because it base64s to 699,052 bytes —
+under the 1 MiB cap the request asks for and under the guest's 1,162,808-byte frame ceiling — so a
+`truncated` response is *impossible* and is treated as a hard error rather than a short read. The
+base64 comes back **wrapped** and busybox and coreutils disagree about `-w0`, so whitespace is
+stripped on this side. And every export is checked against the guest's own `sha256sum`: a dropped
+chunk or a mangled decode has no other symptom. Throughput is ~1.5–2 s per MiB through the emulated
+CPU, which is what `MAX_EXPORT_BYTES` (64 MiB) is really about (PLAN §10.24).
+
+### The terminal is shared, and `:` is the seam
+`web/src/terminal.ts` is mounted by both pages — the VM page is built from it, the agent page's
+console panel is the same class against the same `Session` the model drives. Lines starting with `:`
+are handled by the page (`:get`, `:help`) and everything else goes to the guest, which is what stops a
+builtin from ever shadowing something in the guest's PATH. `parseBuiltin` is pure and unit-tested;
+the DOM half is covered by `export.spec.ts`.
+
+On the agent page the sharing is the feature: `Session.exec` chains every request through one
+promise, so a typed command queues behind the model's tool call instead of racing it for the SAB
+slot, and the cwd, `/tmp` and everything the model built up are all right there. It also means a
+`cd` typed in the console moves the directory the model's next command inherits. That is one VM
+behaving like one VM; do not "fix" it by giving the console its own session, and do not paper over it
+by re-sending `cwd` per request — the panel says so instead.
+
+### The agent page's status is three facts, not one line
+`web/src/agent/status.ts` owns a chip each for the VM, the model and the folder, because all three
+load independently and any one of them can fail while the others are fine. The old single span
+inferred its colour by regex over its own message, which worked for one thing and cannot work for
+three — so call sites name their component (`status.vm("ready", …)`) rather than passing prose.
+Keep the pure part (`chipText`, `canChat`, `formatBytes`) separable from the DOM part: this page has
+no CI, and that split is the only reason any of it is tested. The download bar belongs to neither
+chip and goes indeterminate — never frozen — when a response carries no identity length.
+
+Two things the e2e suites read that must keep working: the per-file model progress line
+(`[smolagent] loading <file>: <pct>%`, counted by `model-cache.spec.ts`) and the chips'
+`data-state` attribute (`settings.spec.ts`, `agent-console.spec.ts`).
 
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require

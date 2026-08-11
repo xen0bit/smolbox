@@ -12,7 +12,7 @@
 | `antares-onnx` | **M12.** `uv run tools/convert-antares.py` → converts the gated `fdtn-ai/antares-*` safetensors to ONNX in `dist/models`. Needs Python, `uv` and `HF_TOKEN`; the only target in this repo that needs any of the three (§11.2) |
 | `test-e2e-antares` | **M13.** Playwright against `/scan/` with `FakeModelClient` replaying a captured Antares transcript — **in CI, no GPU** |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
-| `web` | bundle `web/src/{worker,main}.ts` → `web/dist`; merge the emscripten page into `dist/js` so it is a complete page |
+| `web` | bundle `web/src/{worker,main}.ts` and the agent entries → `web/dist`, and copy both pages plus `web/style.css` (the tokens, controls and terminal styling they share) |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; serves `smolbox.wasm`, `js/`, `models/` and `kernels/` from `DIST_DIR` (default `dist/`) |
 | `generate` | `go run ./cmd/gen-tool-api` → rewrites `docs/schema/*.json` from the Go wire types |
 | `test` | Go unit tests; no Docker required |
