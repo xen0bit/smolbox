@@ -4,67 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>smolbox — agent</title>
+    <link rel="stylesheet" href="/style.css" />
     <style>
-      :root {
-        --bg: #ffffff;
-        --fg: #1f2328;
-        --muted: #57606a;
-        --line: #d0d7de;
-        --panel: #f6f8fa;
-        --accent: #0969da;
-        --ok: #1a7f37;
-        --bad: #d1242f;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        margin: 0 auto;
-        max-width: 56rem;
-        padding: 1.5rem 1rem 2rem;
-        color: var(--fg);
-        line-height: 1.5;
-      }
-      h1 {
-        font-size: 1.1rem;
-        margin: 0;
-      }
-      header {
-        display: flex;
-        align-items: baseline;
-        gap: 1rem;
-        flex-wrap: wrap;
-        border-bottom: 1px solid var(--line);
-        padding-bottom: 0.75rem;
-        margin-bottom: 1rem;
-      }
-      nav { margin-left: auto; display: flex; gap: 0.75rem; font-size: 0.8rem; }
-      nav [aria-current="page"] { font-weight: 600; text-decoration: none; }
-      #status {
-        color: var(--muted);
-        font-size: 0.85rem;
-      }
-      h2 {
-        font-size: 0.95rem;
-      }
-      button,
-      input,
-      select {
-        font: inherit;
-        padding: 0.35rem 0.7rem;
-        border: 1px solid var(--line);
-        border-radius: 4px;
-        background: var(--bg);
-        color: inherit;
-      }
-      button {
-        cursor: pointer;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: default;
-      }
       #log {
         min-height: 18rem;
         max-height: 60vh;
@@ -158,41 +99,99 @@
       #prompt {
         flex: 1;
       }
-      /* The toolbar: everything that acts on the session, on its own row, so
-         the title and the nav stop competing with the controls for space. */
-      .toolbar {
+      /* The status strip: three chips, one per thing that can be up, loading or
+         broken independently of the other two. A dot carries the state so it
+         survives a glance, and the long version lives in the title attribute
+         rather than stretching the chip. */
+      .status-strip {
         display: flex;
         gap: 0.5rem;
         align-items: center;
         flex-wrap: wrap;
-        margin-bottom: 0.75rem;
+        margin-bottom: 0.5rem;
+        font-size: 0.8rem;
       }
-      .toolbar .spacer {
-        flex: 1;
-      }
-      /* The status line was a bare span that read the same whether the page was
-         idle, downloading two gigabytes, or broken. Same text, but now the
-         state is visible without reading it. */
-      #status {
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
         border: 1px solid var(--line);
         border-radius: 999px;
         padding: 0.1rem 0.6rem;
+        color: var(--muted);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 24rem;
+        max-width: 22rem;
       }
-      #status[data-state="loading"] {
+      .chip .dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 50%;
+        background: currentColor;
+        flex: none;
+      }
+      .chip[data-state="loading"] {
         border-color: var(--accent);
         color: var(--accent);
       }
-      #status[data-state="ready"] {
+      /* A load in flight should be visibly in flight: the same chip sitting at
+         "loading" for four minutes of weights is the one thing here that most
+         looks like a hang. */
+      .chip[data-state="loading"] .dot {
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      .chip[data-state="ready"] {
         border-color: var(--ok);
         color: var(--ok);
       }
-      #status[data-state="error"] {
+      .chip[data-state="error"] {
         border-color: var(--bad);
         color: var(--bad);
+      }
+      @keyframes pulse {
+        50% {
+          opacity: 0.25;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .chip[data-state="loading"] .dot {
+          animation: none;
+        }
+      }
+      #progress-row {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin-bottom: 0.75rem;
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+      #progress-row[hidden] {
+        display: none;
+      }
+      #progress-label {
+        white-space: nowrap;
+      }
+
+      /* The console: the same VM the model is driving, on the same Session, so
+         a command typed here queues behind the agent's rather than racing it. */
+      #console-panel {
+        margin-top: 1rem;
+        border-top: 1px solid var(--line);
+        padding-top: 0.5rem;
+      }
+      #console-panel > summary {
+        cursor: pointer;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      #console-panel[open] > summary {
+        color: var(--fg);
+      }
+      #console-panel .term-scroll {
+        min-height: 12rem;
+        max-height: 40vh;
       }
 
       /* The settings dialog. The first <dialog> on the site; sections inside it
@@ -323,26 +322,6 @@
         color: var(--muted);
         font-size: 0.8rem;
       }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #0d1117;
-          --fg: #e6edf3;
-          --muted: #8b949e;
-          --line: #30363d;
-          --panel: #161b22;
-          --accent: #4493f8;
-          --ok: #3fb950;
-          --bad: #f85149;
-        }
-        body {
-          background: var(--bg);
-        }
-        button,
-        input,
-        select {
-          background: var(--bg);
-        }
-      }
     </style>
   </head>
   <body>
@@ -359,8 +338,17 @@
       <button id="start" type="button">start</button>
       <button id="pick" type="button">pick folder</button>
       <button id="settings-open" type="button" title="system prompt, sampling, tools, storage">settings</button>
-      <span class="spacer"></span>
-      <span id="status" data-state="idle">idle</span>
+    </div>
+
+    <div class="status-strip">
+      <span class="chip" id="chip-vm" data-state="idle"><span class="dot"></span><span class="chip-text">VM</span></span>
+      <span class="chip" id="chip-model" data-state="idle"><span class="dot"></span><span class="chip-text">model</span></span>
+      <span class="chip" id="chip-folder" data-state="idle"><span class="dot"></span><span class="chip-text">folder</span></span>
+    </div>
+
+    <div id="progress-row" hidden>
+      <progress id="progress" max="100"></progress>
+      <span id="progress-label"></span>
     </div>
 
     <div id="log"></div>
@@ -370,6 +358,17 @@
       <button id="send" type="submit">send</button>
       <button id="stop" type="button" disabled>stop</button>
     </form>
+
+    <details id="console-panel">
+      <summary>console — the same VM the model is using</summary>
+      <p class="hint">
+        Not a second sandbox: these commands go down the same session, so they
+        queue behind whatever the agent is running, and a <code>cd</code> here
+        moves the working directory its next command inherits.
+        <code>:get &lt;path&gt;</code> downloads a file out of the VM.
+      </p>
+      <div id="terminal"></div>
+    </details>
 
     <dialog id="settings">
       <form method="dialog" class="settings-head">
@@ -468,11 +467,12 @@
       </details>
     </dialog>
 
-    <p style="font-size: 0.8rem; color: var(--muted)">
+    <p class="hint">
       A local model on WebGPU drives a Linux VM through one
       <code>run_terminal_command</code> tool. The folder you pick is mounted
-      read-only at <code>/mnt/host</code>. Weights load from
-      <code>dist/models</code> after <code>make model</code>, else from the
+      read-only at <code>/mnt/host</code>; the guest has busybox, coreutils,
+      <code>rg</code>, <code>tree</code> and <code>python3</code>. Weights load
+      from <code>dist/models</code> after <code>make model</code>, else from the
       Hugging Face CDN. The VM-only page is at <a href="/">/</a>.
     </p>
 

@@ -4,175 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>smolbox</title>
+    <link rel="stylesheet" href="/style.css" />
     <style>
-      :root {
-        --fg: #1f2328;
-        --muted: #57606a;
-        --line: #d0d7de;
-        --panel: #f6f8fa;
-        --accent: #0969da;
-        --bad: #d1242f;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        margin: 0 auto;
-        max-width: 56rem;
-        padding: 1.5rem 1rem 2rem;
-        color: var(--fg);
-        line-height: 1.5;
-      }
-      h1 {
-        font-size: 1.1rem;
-        margin: 0;
-      }
-      header {
-        display: flex;
-        align-items: baseline;
-        gap: 1rem;
-        flex-wrap: wrap;
-        border-bottom: 1px solid var(--line);
-        padding-bottom: 0.75rem;
-        margin-bottom: 1rem;
-      }
-      nav { margin-left: auto; display: flex; gap: 0.75rem; font-size: 0.8rem; }
-      nav [aria-current="page"] { font-weight: 600; text-decoration: none; }
       #status {
         color: var(--muted);
         font-size: 0.85rem;
       }
-      button,
-      input,
-      select {
-        font: inherit;
-        padding: 0.35rem 0.7rem;
-        border: 1px solid var(--line);
-        border-radius: 4px;
-        background: #fff;
-        color: inherit;
-      }
-      button {
-        cursor: pointer;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: default;
-      }
       #wasm-progress {
-        display: block;
-        width: 100%;
         margin-bottom: 0.75rem;
-      }
-      .toolbar {
-        display: flex;
-        gap: 0.5rem;
-        flex-wrap: wrap;
-        margin-bottom: 0.75rem;
-      }
-
-      /* The terminal. It is a REPL over Session.exec, not a PTY — see
-         src/terminal.ts — so it renders whole commands rather than a cell grid,
-         and everything is a plain block of text. */
-      .term-scroll {
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: var(--panel);
-        padding: 0.75rem;
-        min-height: 22rem;
-        max-height: 62vh;
-        overflow-y: auto;
-        cursor: text;
-        font-size: 0.85rem;
-      }
-      .term-line {
-        white-space: pre-wrap;
-        word-break: break-word;
-        margin: 0;
-      }
-      .term-cmd {
-        font-weight: 600;
-        margin-top: 0.4rem;
-      }
-      .term-err {
-        color: var(--bad);
-      }
-      .term-note,
-      .term-boot {
-        color: var(--muted);
-      }
-      .term-prompt {
-        display: flex;
-        align-items: baseline;
-        gap: 0.5rem;
-        margin-top: 0.4rem;
-      }
-      .term-ps1 {
-        color: var(--accent);
-        font-weight: 600;
-        white-space: pre;
-      }
-      /* The input is the caret line: no chrome of its own, so the prompt reads
-         as one continuous line of terminal rather than a form field. */
-      .term-input {
-        flex: 1;
-        border: none;
-        background: transparent;
-        padding: 0;
-        min-width: 8rem;
-      }
-      .term-input:focus {
-        outline: none;
-      }
-      .term-examples {
-        display: flex;
-        gap: 0.4rem;
-        flex-wrap: wrap;
-        margin-top: 0.6rem;
-      }
-      .term-chip {
-        font-size: 0.75rem;
-        padding: 0.2rem 0.5rem;
-        color: var(--muted);
-        background: transparent;
-      }
-      .term-chip:hover {
-        color: var(--fg);
-        border-color: var(--accent);
-      }
-      p {
-        font-size: 0.85rem;
-      }
-      a {
-        color: var(--accent);
-      }
-      code {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 3px;
-        padding: 0 0.2rem;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --fg: #e6edf3;
-          --muted: #8b949e;
-          --line: #30363d;
-          --panel: #161b22;
-          --accent: #4493f8;
-          --bad: #f85149;
-        }
-        body {
-          background: #0d1117;
-        }
-        button,
-        input,
-        select {
-          background: #0d1117;
-        }
-        .term-input {
-          background: transparent;
-        }
       }
     </style>
   </head>
@@ -199,7 +38,15 @@
       VM, one at a time; the working directory and anything you write to
       <code>/tmp</code> survive between them. There is no pty behind this, so
       interactive programs and Ctrl+C are out — but <code>cd</code>,
-      <code>ArrowUp</code> and <code>Ctrl+L</code> all work.
+      <code>ArrowUp</code> and <code>Ctrl+L</code> all work. Busybox, coreutils,
+      <code>grep</code>, <code>rg</code>, <code>tree</code> and
+      <code>python3</code> are installed.
+    </p>
+    <p>
+      Lines starting with <code>:</code> are handled by this page rather than the
+      guest: <code>:get &lt;path&gt;</code> downloads a file out of the VM (read
+      in chunks over the same exec API, then checked against the guest's own
+      sha256), and <code>:help</code> lists them.
     </p>
     <p>
       This is the WASI build: the same <code>dist/smolbox.wasm</code> runs under

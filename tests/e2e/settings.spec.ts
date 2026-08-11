@@ -145,7 +145,11 @@ test("the storage panel reports an empty cache", async ({ page }) => {
   await expect(page.locator("#cache-msg")).toContainText("cached");
 });
 
-test("the status badge carries its state", async ({ page }) => {
+test("each status chip carries its own state", async ({ page }) => {
   await open(page);
-  await expect(page.locator("#status")).toHaveAttribute("data-state", /idle|ready|loading/);
+  // One chip per thing that can be up, loading or broken on its own; a single
+  // badge could only ever describe one of them (web/src/agent/status.ts).
+  for (const id of ["#chip-vm", "#chip-model", "#chip-folder"]) {
+    await expect(page.locator(id)).toHaveAttribute("data-state", /idle|ready|loading|error/);
+  }
 });
