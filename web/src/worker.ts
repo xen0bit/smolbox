@@ -176,7 +176,7 @@ function patchPollOneoff(wasiInstance: WASI, ch: StdinChannel): void {
   };
 }
 
-// smolbox.wasm is ~110 MiB, so on a slow link the download dwarfs the boot.
+// smolbox.wasm is ~145 MiB, so on a slow link the download dwarfs the boot.
 // Stream it and report progress to the main thread, which shows a loading bar;
 // the worker can still receive postMessage here because wasi.start() has not
 // run yet. One message per percentage point keeps a fast localhost fetch to
