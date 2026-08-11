@@ -32,7 +32,7 @@ import {
   modelFor,
   prefillChunkTokens,
 } from "./models.ts";
-import { planPrefill } from "./prefill.ts";
+import { planPrefill, resolvePrefillLogits } from "./prefill.ts";
 
 /** A failure the page can act on. See ModelErrorCode. */
 class WorkerError extends Error {
@@ -81,6 +81,14 @@ const modelCache = new ModelCache();
 // gets the bytes, and only one request leaves the browser. A response somebody
 // has already claimed is not shareable, so that case falls straight through to a
 // fresh fetch and behaves exactly as it did before.
+//
+// Re-examined after the IndexedDB cache landed, on the theory that the cache
+// might have made this dead code. It has not, and the split is worth knowing: on
+// a WARM load the real read is served from IndexedDB and the pre-pass issues no
+// network GET at all (model-cache.spec.ts asserts zero weight bodies on the
+// second load), so this does nothing. On a COLD load it is still the only reason
+// each weight file is fetched once — which the same spec asserts, by requiring
+// the GETs to be unique.
 const SHARE_WINDOW_MS = 60_000;
 const shared = new Map<string, Promise<Response>>();
 const nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
@@ -231,6 +239,9 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // free and, worse, ids that would match a prompt built for a different
   // tokenizer.
   await dropCache();
+  // Same reasoning one field over: what the last graph said about its logits
+  // says nothing about the one about to load.
+  graphPrefillLogits = null;
   loaded = entry;
   lastLoad = { local, dtype };
   // Local weights come from dist/models via the dev server; the hub is the
@@ -276,6 +287,7 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
     } catch (err) {
       throw describeLoadFailure(err, entry, dtype);
     }
+    graphPrefillLogits = checkPrefillLogits(entry, model);
   }
 
   post({
@@ -326,6 +338,30 @@ function describeLoadFailure(err: unknown, entry: ModelEntry, dtype: Dtype): Err
       `in a browser at all` +
       (others.length > 0 ? `; a smaller quantization (${others.join(", ")}) may fit.` : "."),
   );
+}
+
+/**
+ * What the loaded graph says about its logits, which outranks the registry.
+ *
+ * Null means the question could not be asked — the kernel backend, or a session
+ * shape resolvePrefillLogits does not recognise — and the registry stands. See
+ * prefill.ts for why the graph wins when they disagree.
+ */
+let graphPrefillLogits: ModelEntry["prefillLogits"] | null = null;
+
+function checkPrefillLogits(entry: ModelEntry, m: PreTrainedModel): ModelEntry["prefillLogits"] | null {
+  const sessions = (m as unknown as { sessions?: Record<string, { inputNames?: string[] }> }).sessions;
+  const names = new Set<string>();
+  for (const session of Object.values(sessions ?? {})) {
+    for (const name of session?.inputNames ?? []) {
+      names.add(name);
+    }
+  }
+  const { actual, message } = resolvePrefillLogits(entry, [...names]);
+  if (message) {
+    post({ type: "log", message });
+  }
+  return actual;
 }
 
 /**
@@ -405,7 +441,10 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   const maxNewTokens = req.maxNewTokens ?? loaded?.generation?.max_new_tokens ?? 256;
 
   if (kernels) {
-    await generateWithKernels(req, prompt, inputs, maxNewTokens, started);
+    await generateWithKernels(req, prompt, inputs, maxNewTokens, started, {
+      promptTokens,
+      limitTokens: Number.isFinite(limit) ? limit : 0,
+    });
     return;
   }
 
@@ -450,6 +489,8 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
     tokens: completion.length,
     ms: Math.round(performance.now() - started),
     stopped: stopper.interrupted,
+    promptTokens,
+    limitTokens: Number.isFinite(limit) ? limit : 0,
   });
 }
 
@@ -503,7 +544,12 @@ async function prefillAndGenerate(
   const promptIds = ((inputs.input_ids as { tolist(): (number | bigint)[][] }).tolist()[0] ?? []).map(
     Number,
   );
-  const chunk = loaded ? prefillChunkTokens(loaded) : promptIds.length;
+  // The graph outranks the registry on this one field; see graphPrefillLogits.
+  const chunk = loaded
+    ? prefillChunkTokens(
+        graphPrefillLogits ? { ...loaded, prefillLogits: graphPrefillLogits } : loaded,
+      )
+    : promptIds.length;
   const plan = planPrefill(cachedIds, promptIds, chunk);
   if (plan.drop) {
     await dropCache();
@@ -572,8 +618,13 @@ async function prefillAndGenerate(
  * Decoding is incremental and deliberately keeps special tokens: the engine's
  * own generate() drops them, and they are exactly what the dialect parses.
  * Decoding the whole completion each step and taking the new suffix is what its
- * generate() does too — it is quadratic in the token count and irrelevant at
- * these lengths.
+ * generate() does too, and it is quadratic in the token count.
+ *
+ * Re-checked when max_new_tokens went from 256 to 2048, since "irrelevant at
+ * these lengths" was written for the smaller number: a 2048-token turn decodes
+ * ~2.1M token-positions in total, which is a couple of seconds of CPU spread
+ * across a generation whose GPU work is measured in minutes. Still the wrong
+ * thing to optimise, but now for a stated reason rather than an assumed one.
  */
 async function generateWithKernels(
   req: Extract<ModelRequest, { type: "generate" }>,
@@ -581,6 +632,8 @@ async function generateWithKernels(
   inputs: unknown,
   maxNewTokens: number,
   started: number,
+  /** The prompt guard's two numbers, so the loop can calibrate off this engine too. */
+  measured: { promptTokens: number; limitTokens: number },
 ): Promise<void> {
   const tok = tokenizer!;
   const engine = kernels!;
@@ -611,6 +664,7 @@ async function generateWithKernels(
     tokens: produced.length,
     ms: Math.round(performance.now() - started),
     stopped: cancelRequested,
+    ...measured,
   });
 }
 

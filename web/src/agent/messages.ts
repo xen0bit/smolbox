@@ -64,6 +64,18 @@ export type ModelResponse =
       ms: number;
       /** True when generation was cut short by cancel() rather than by EOS. */
       stopped: boolean;
+      /**
+       * What the prompt measured, and the ceiling it was measured against.
+       *
+       * On the `error` message below these two exist so a *refused* turn can be
+       * retried at the right size. Here they exist so it never comes to that:
+       * the loop divides the characters it counted by the tokens they became,
+       * gets this conversation's real ratio, and can hold its character budget
+       * to the ceiling before a prompt crosses it. Every successful turn is a
+       * free measurement of the thing CHARS_PER_TOKEN_ESTIMATE guesses.
+       */
+      promptTokens: number;
+      limitTokens: number;
     }
   | {
       type: "error";

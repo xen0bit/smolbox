@@ -326,7 +326,33 @@
       ]
     },
     {
-      "name": "mount: KNOWN GAP \u2014 readdir has no d_type, so find does not recurse",
+      "name": "mount: files carry a real modification time, not the epoch",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "find /mnt/host/hello.txt -newermt 2001-01-01"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": "hello.txt"
+          }
+        },
+        {
+          "request": {
+            "cmd": "ls -l --time-style=+%Y /mnt/host/hello.txt"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_not_contains": "1970"
+          }
+        }
+      ]
+    },
+    {
+      "name": "mount: KNOWN GAP — readdir has no d_type, so find does not recurse",
       "requires": [
         "mount"
       ],
@@ -344,7 +370,7 @@
       ]
     },
     {
-      "name": "mount: KNOWN GAP \u2014 ls -R lists everything but exits 1, same missing d_type",
+      "name": "mount: KNOWN GAP — ls -R lists everything but exits 1, same missing d_type",
       "requires": [
         "mount"
       ],

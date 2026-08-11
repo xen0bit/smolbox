@@ -127,10 +127,14 @@ function bubble(cls: string, who: string): Element | null {
 // ------------------------------------------------------------ the model side
 
 const params = new URLSearchParams(location.search);
+const spawnModelWorker = () => new Worker("./model-worker.js", { type: "module" });
 let modelClient: ModelClient = new WorkerModelClient(
-  new Worker("./model-worker.js", { type: "module" }),
+  spawnModelWorker(),
   (line) => console.log("[model]", line),
   (file, pct) => setStatus(`loading ${file}: ${pct}%`),
+  // Passed so a device that is genuinely lost — rather than merely out of memory
+  // — can be replaced. See DEVICE_LOSSES_BEFORE_RESPAWN.
+  spawnModelWorker,
 );
 
 const TOOLS_KEY = "smolbox.tools";
@@ -251,11 +255,26 @@ function onEvent(ev: AgentEvent): void {
       break;
     }
     case "elided":
+      // The count is here because each elision costs the worker's whole KV
+      // cache, so a conversation doing this repeatedly is one that will feel
+      // slow for a reason the log should name (conversation.ts
+      // ELIDE_TARGET_FRACTION).
       bubble("note", "context")!.textContent =
-        `trimmed ${ev.messages} older message(s) to stay inside this model's prompt budget (now ~${ev.chars} chars)`;
+        `trimmed ${ev.messages} older message(s) to stay inside this model's prompt budget ` +
+        `(now ~${ev.chars} chars)` +
+        (ev.times > 1 ? `, ${ev.times} times this session — each one re-prefills the conversation` : "");
       break;
     case "budget":
       endStream();
+      if (ev.reason === "measured") {
+        // Not a failure: a turn that worked reported what its prompt really
+        // cost in tokens, and the character budget stopped guessing. Quiet on
+        // purpose — nothing is wrong and nothing is being retried.
+        bubble("note", "context")!.textContent =
+          `measured this conversation's real characters-per-token; prompt budget tightened from ` +
+          `~${ev.was} to ~${ev.chars} chars to match what the model actually counts.`;
+        break;
+      }
       if (ev.reason === "device-lost") {
         // The retry is about to sit through a full reload, so say what is
         // happening — otherwise it reads as a hang partway through an answer.
@@ -433,6 +452,49 @@ async function adapterFeatures(): Promise<ReadonlySet<string>> {
   return new Set(adapter?.features ? [...adapter.features] : []);
 }
 
+/**
+ * The limits every out-of-memory report so far has been missing.
+ *
+ * PLAN §10.10 and §10.16 are both arguments about numbers nobody had: what this
+ * adapter will actually allocate, and what it was holding at the time. Two of
+ * those are knowable and free — `maxBufferSize` and
+ * `maxStorageBufferBindingSize` are the hard ceilings onnxruntime requests at
+ * the adapter's maximum, so they bound every tensor a forward pass builds — and
+ * printing them once at load means the next report arrives with evidence
+ * instead of an adjective.
+ *
+ * What is still not knowable: total device memory, and what else on the machine
+ * is using it. No WebGPU API exposes either, which is why §10.16's ceiling had
+ * to be learned by hitting it.
+ */
+let adapterLogged = false;
+
+async function logAdapterLimits(): Promise<void> {
+  if (adapterLogged) {
+    return;
+  }
+  adapterLogged = true;
+  try {
+    const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+    const adapter = (await gpu?.requestAdapter()) as
+      | { limits?: Record<string, number>; info?: Record<string, string> }
+      | undefined;
+    if (!adapter) {
+      return;
+    }
+    const gb = (n?: number) => (typeof n === "number" ? `${(n / 1024 ** 3).toFixed(2)} GiB` : "?");
+    const info = adapter.info;
+    const who = info ? [info.vendor, info.architecture].filter(Boolean).join(" ") : "";
+    bubble("note", "adapter")!.textContent =
+      `${who || "WebGPU adapter"} — maxBufferSize ${gb(adapter.limits?.maxBufferSize)}, ` +
+      `maxStorageBufferBindingSize ${gb(adapter.limits?.maxStorageBufferBindingSize)}. ` +
+      `Total device memory is not exposed by WebGPU, so an out-of-memory here is only ever ` +
+      `discoverable by reaching it.`;
+  } catch (err) {
+    console.warn("[smolagent] could not read adapter limits:", err);
+  }
+}
+
 let busy = false;
 // Two separate readiness facts, because they fail for different reasons and the
 // composer should say which one is missing rather than accepting a message and
@@ -512,6 +574,7 @@ const handle: SmolagentHandle = {
     convo.configure({ dialect });
 
     const features = await adapterFeatures();
+    await logAdapterLimits();
     // Checked before anything is fetched. The kernel backend would otherwise
     // stream 2.5 GB onto the GPU and fail on the first forward pass with "No
     // supported WebGPU variant", which reads as a bug rather than as an

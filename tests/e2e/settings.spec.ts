@@ -117,13 +117,25 @@ test("switching models re-derives untouched knobs and keeps touched ones", async
   await expect.poll(() => options(page).then((o) => o.generation)).toEqual({ temperature: 0.25 });
 
   const before = await options(page);
-  await page.selectOption("#model", { index: 3 });
+  // By key rather than by index: the assertion below is about two specific
+  // checkpoints disagreeing, and registry order is not a thing to depend on.
+  // The default entry asks for its own max_new_tokens; LFM2.5 350M asks for
+  // nothing and so falls back to the loop's default.
+  await page.selectOption("#model", "lfm2.5-350m");
   const after = await options(page);
 
   expect(after.generation).toEqual({ temperature: 0.25 });
-  // The prompt ceiling is a property of the checkpoint's vocabulary, so it has
-  // to move even though the user never asked it to.
-  expect(after.promptBudgetChars).not.toBe(before.promptBudgetChars);
+  // How long a turn is allowed to run is a property of the checkpoint, so it
+  // has to move even though the user never asked it to.
+  expect(after.maxNewTokens).not.toBe(before.maxNewTokens);
+  // The prompt ceiling used to move here too, back when it was scaled by the
+  // checkpoint's vocabulary to bound a full-sequence logits allocation. #16
+  // chunked the prefill and took that term out, so it is now min(context,
+  // AGENT_WORKING_TOKENS) and every registry entry has more context than the
+  // working window. What is still worth pinning is that a model switch
+  // re-derives it from the entry rather than dropping it back to the
+  // no-model-selected floor in DEFAULTS.
+  expect(after.promptBudgetChars).toBe(before.promptBudgetChars);
 });
 
 test("the storage panel reports an empty cache", async ({ page }) => {

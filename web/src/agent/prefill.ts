@@ -7,6 +7,55 @@
 // checkpoint to be wrong. Same reasoning as GemmaKernelEngine.wrap().
 
 import { commonPrefix } from "./prefix.ts";
+import type { ModelEntry } from "./models.ts";
+
+/**
+ * What a loaded graph says about its logits, against what the registry claimed.
+ *
+ * `ModelEntry.prefillLogits` is declared by hand, from a graph someone read
+ * once. The graph is right there at load time, and the two disagreeing has a
+ * sharp end: an entry claiming `"last"` when the export does not take
+ * `num_logits_to_keep` gets prefilled in one pass, materializes
+ * `N * vocab_size * 4` bytes, and is the device death of PLAN §10.10
+ * reintroduced by a registry line rather than by any code. So the graph wins,
+ * and the disagreement is worth saying out loud.
+ *
+ * The spelling is the trap §10.20 names: transformers.js tests for
+ * `num_logits_to_keep` and nothing else, so an export using the newer
+ * `logits_to_keep` emits full-sequence logits whatever its author intended.
+ *
+ * An empty `inputNames` means the question could not be asked — the registry
+ * stands, and nothing is claimed about it.
+ */
+export function resolvePrefillLogits(
+  entry: Pick<ModelEntry, "key" | "prefillLogits">,
+  inputNames: readonly string[],
+): { actual: ModelEntry["prefillLogits"] | null; message?: string } {
+  const names = new Set(inputNames);
+  if (names.size === 0) {
+    return { actual: null };
+  }
+  // The name transformers.js actually binds 1 to. Anything else is decoration.
+  const bound = names.has("num_logits_to_keep");
+  const actual: ModelEntry["prefillLogits"] = bound ? "last" : "sequence";
+  const declared = entry.prefillLogits ?? "sequence";
+  if (actual === declared) {
+    return { actual };
+  }
+  const why =
+    !bound && names.has("logits_to_keep")
+      ? "its graph spells that input `logits_to_keep`, which transformers.js does not bind, so it " +
+        "emits full-sequence logits regardless (PLAN §10.20)"
+      : `its graph does ${bound ? "" : "not "}take \`num_logits_to_keep\``;
+  const cost =
+    actual === "sequence"
+      ? "prefill a whole prompt in one pass, which is what kills the device"
+      : "chunk a prompt that does not need it";
+  return {
+    actual,
+    message: `registry says ${entry.key} prefills "${declared}" logits, but ${why}. Using "${actual}": believing the registry would ${cost}.`,
+  };
+}
 
 export interface PrefillPlan {
   /**

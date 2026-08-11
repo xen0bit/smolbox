@@ -54,7 +54,20 @@ export type AgentEvent =
       /** The request that actually ran, budget applied. */
       request?: { cmd?: string; max_output?: number };
     }
-  | { kind: "elided"; messages: number; chars: number }
+  | {
+      kind: "elided";
+      messages: number;
+      chars: number;
+      /**
+       * How many times this conversation has elided, first is 1.
+       *
+       * Carried because each elision costs a full re-prefill (see
+       * ELIDE_TARGET_FRACTION) and the number is the only way to know whether
+       * the fraction is doing its job on real conversations rather than on the
+       * one this project reasoned about.
+       */
+      times: number;
+    }
   | {
       /**
        * The loop lowered its own prompt budget after the model refused or the
@@ -66,7 +79,14 @@ export type AgentEvent =
        * remember the ceiling this machine actually proved (see settings.ts).
        */
       kind: "budget";
-      reason: ModelErrorCode;
+      /**
+       * Why the budget moved.
+       *
+       * The two error codes are recoveries — something already went wrong.
+       * `measured` is the opposite: nothing failed, a successful turn simply
+       * reported what its prompt really cost in tokens and the budget followed.
+       */
+      reason: ModelErrorCode | "measured";
       was: number;
       chars: number;
     }
@@ -152,6 +172,23 @@ const DEVICE_LOSS_SHRINK = 0.5;
  */
 const PROMPT_RETRY_MARGIN = 0.95;
 
+/**
+ * How far under the budget an elision trims, rather than just back inside it.
+ *
+ * Hysteresis, and it is not a nicety: the model worker carries its KV cache from
+ * one turn to the next and can only reuse it while the new prompt is a *prefix*
+ * of the last one. Eliding rewrites an older message, which breaks that, so
+ * every elision costs a full re-prefill of the whole conversation.
+ *
+ * Trimming to exactly the budget — which this did — meant the next tool result
+ * put the prompt back over it, so a long conversation elided on *every* turn and
+ * the cache never survived to be used. Trimming to 70% buys several turns of
+ * headroom for one rebuild, which turns N re-prefills into one. The cost is a few
+ * thousand characters of history that would have fit, and history is exactly what
+ * elision has already decided is expendable.
+ */
+const ELIDE_TARGET_FRACTION = 0.7;
+
 export class Conversation {
   private history: ChatMessage[] = [];
   private cancelled = false;
@@ -163,6 +200,11 @@ export class Conversation {
   // Only has to be unique within one conversation: it exists so a structured
   // template can match a result to the call it answers.
   private callSeq = 0;
+  // How many times elide() has actually removed something. Each one costs the
+  // worker's KV cache, so it is the number that says whether
+  // ELIDE_TARGET_FRACTION is doing its job. Survives reset() deliberately: it
+  // describes this page's session, not this history.
+  private elisions = 0;
 
   constructor(
     private opts: ConversationOptions,
@@ -336,13 +378,15 @@ export class Conversation {
       // nothing at all.
       const sent = this.charCount();
       try {
-        return await this.model.generate({
+        const result = await this.model.generate({
           messages: this.messages(),
           tools: this.opts.tools,
           maxNewTokens: this.opts.maxNewTokens,
           generation: this.opts.generation,
           onToken: (t) => this.emit({ kind: "token", text: t }),
         });
+        this.calibrate(sent, result);
+        return result;
       } catch (err) {
         const code = err instanceof ModelError ? err.code : undefined;
         if (code && !retried.has(code) && (code === "prompt-too-long" || code === "device-lost")) {
@@ -362,6 +406,39 @@ export class Conversation {
         return undefined;
       }
     }
+  }
+
+  /**
+   * Lowers the prompt budget to what this conversation's own ratio says it is.
+   *
+   * The budget is counted in characters and the ceiling it stands for is counted
+   * in tokens, and until now the bridge between them was a constant: four
+   * characters per token, which §10.16 measured at 3.85 for a chat full of paths
+   * and command output. The error is in the direction that makes an oversized
+   * prompt look acceptable, so the first anyone learned of it was a refusal.
+   *
+   * Every successful turn measures it for free — the worker counts the tokens
+   * with the real tokenizer, the loop already counted the characters it sent —
+   * so the guess only ever has to survive turn one. After that the budget is
+   * this checkpoint's real ratio on this conversation's real text, and the
+   * refusal that used to teach it becomes unreachable.
+   *
+   * Strictly downwards, like shrinkBudget: raising a budget on the strength of a
+   * ratio measured from a *short* prompt is how you talk yourself into the
+   * failure this exists to avoid. The settings panel is what raises it.
+   */
+  private calibrate(sent: number, result: { promptTokens?: number; limitTokens?: number }): void {
+    const { promptTokens, limitTokens } = result;
+    if (!promptTokens || !limitTokens || promptTokens <= 0 || limitTokens <= 0) {
+      return;
+    }
+    const ceiling = Math.floor(limitTokens * (sent / promptTokens) * PROMPT_RETRY_MARGIN);
+    if (ceiling >= this.opts.promptBudgetChars || ceiling < MIN_PROMPT_BUDGET_CHARS) {
+      return;
+    }
+    const was = this.opts.promptBudgetChars;
+    this.opts = { ...this.opts, promptBudgetChars: ceiling };
+    this.emit({ kind: "budget", reason: "measured", was, chars: ceiling });
   }
 
   /**
@@ -408,17 +485,23 @@ export class Conversation {
   // exit code stay, because "I ran this and it worked" keeps its value long
   // after the bytes stop being useful. Only once no tool output is left does
   // this start dropping whole turns.
+  //
+  // It fires at the budget and trims to well under it, which is the whole point
+  // — see ELIDE_TARGET_FRACTION.
   private elide(): void {
     let total = this.charCount();
     if (total <= this.opts.promptBudgetChars) {
       return;
     }
+    const target = Math.max(
+      MIN_PROMPT_BUDGET_CHARS,
+      Math.floor(this.opts.promptBudgetChars * ELIDE_TARGET_FRACTION),
+    );
 
     let elided = 0;
-    const freed = () => this.opts.promptBudgetChars;
 
     for (const msg of this.history) {
-      if (total <= freed()) {
+      if (total <= target) {
         break;
       }
       if (msg.role !== "tool" || msg.content.startsWith(ELIDED_PREFIX)) {
@@ -430,14 +513,15 @@ export class Conversation {
       elided++;
     }
 
-    while (total > freed() && this.history.length > 2) {
+    while (total > target && this.history.length > 2) {
       const dropped = this.history.shift();
       total -= dropped?.content.length ?? 0;
       elided++;
     }
 
     if (elided > 0) {
-      this.emit({ kind: "elided", messages: elided, chars: this.charCount() });
+      this.elisions++;
+      this.emit({ kind: "elided", messages: elided, chars: this.charCount(), times: this.elisions });
     }
   }
 

@@ -39,6 +39,14 @@ import {
 // backends in the unit tests do too. No DOM lib required.
 export interface BlobLike {
   readonly size: number;
+  /**
+   * Milliseconds since the epoch, as `File` reports it.
+   *
+   * Optional because this shape is deliberately narrower than `File` — the tests
+   * satisfy it with a plain object — and because a Blob that is not a File has
+   * no date. Absent reaches the guest as an unknown mtime rather than as 1970.
+   */
+  readonly lastModified?: number;
   slice(start?: number, end?: number): BlobLike;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
@@ -64,6 +72,18 @@ export interface StorageManagerLike {
   estimate?(): Promise<{ usage?: number; quota?: number }>;
 }
 
+/**
+ * The mount, as the guest sees it.
+ *
+ * Every cache below is unbounded in time and invalidated only by `setHandle` or
+ * `setVirtualLinks`, which is a deliberate choice and a real limitation: a file
+ * edited on disk *during* a session keeps its old size, date and contents inside
+ * the guest until the folder is picked again. The alternative is re-stat'ing on
+ * every syscall, and the guest issues a lot of them — `cat` of a large file is
+ * hundreds of reads through this class — so a session-consistent view is what
+ * gets bought with it. Re-picking the folder is the refresh, and it is one
+ * click.
+ */
 export class MountHost {
   private channel: BridgeChannel | null = null;
   private handle: DirectoryHandleLike | null = null;
@@ -162,11 +182,14 @@ export class MountHost {
   // root, then a memoized STAT; misses are not cached (a later remount can
   // create them), hits are. A file's size comes from getFile.
   private async stat(path: string): Promise<StatResponse> {
+    // nlink is 1 everywhere here, and that is a claim rather than a count: this
+    // filesystem has no hard links to count, and 1 is the conventional way to
+    // tell fts not to derive a subdirectory count from it. See StatResponse.
     if (this.virtualLinks.has(path)) {
-      return { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_SYMBOLIC_LINK, size: 0 };
+      return { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_SYMBOLIC_LINK, size: 0, nlink: 1 };
     }
     if (path === "/") {
-      return { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_DIRECTORY, size: 0 };
+      return { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_DIRECTORY, size: 0, nlink: 1 };
     }
     const cached = this.statCache.get(path);
     if (cached !== undefined) {
@@ -177,7 +200,16 @@ export class MountHost {
       return { op: OpStat, errno: ERRNO_NOENT };
     }
     if (handle.kind === "directory") {
-      const st: StatResponse = { op: OpStat, errno: ERRNO_SUCCESS, filetype: FILETYPE_DIRECTORY, size: 0 };
+      // A directory handle carries no timestamp — the File System Access API
+      // only dates files — so it has none to report. Absent beats invented: a
+      // fabricated mtime sorts wrongly, where a missing one sorts last.
+      const st: StatResponse = {
+        op: OpStat,
+        errno: ERRNO_SUCCESS,
+        filetype: FILETYPE_DIRECTORY,
+        size: 0,
+        nlink: 1,
+      };
       this.statCache.set(path, st);
       return st;
     }
@@ -190,6 +222,10 @@ export class MountHost {
       errno: ERRNO_SUCCESS,
       filetype: FILETYPE_REGULAR_FILE,
       size: file.size,
+      // Free, and the whole reason mtimeMs exists: the picker already read this
+      // File, and its date is the one the user sees in their own file manager.
+      mtimeMs: file.lastModified,
+      nlink: 1,
     };
     this.statCache.set(path, st);
     return st;

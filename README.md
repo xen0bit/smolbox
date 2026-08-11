@@ -16,7 +16,7 @@ issuing terminal commands.
 > a real VM**. **M8 replaced that mock caller with a real one:** an LFM2-1.2B model running on WebGPU
 > in the page picks up the same generated schema, emits a `run_terminal_command` call, and reads the
 > folder you picked — the tool surface needed **no changes at all** to serve it.
-> See [PLAN.md](PLAN.md) for implementation plan, research notes, and current milestone.
+> See [PLAN.md](PLAN.md) for the implementation plan, research notes, and current milestone.
 
 ---
 
@@ -217,7 +217,10 @@ xterm-pty already uses for terminal I/O, which is why cross-origin isolation is 
 
 ## Documentation
 
-- [PLAN.md](PLAN.md) — implementation plan, research notes, upstream references, risks
+- [PLAN.md](PLAN.md) — index over `docs/plan/`: implementation plan, research notes, upstream
+  references, risks
+- [docs/plan/10-findings.md](docs/plan/10-findings.md) — the measurement log: what running a real
+  model on a real GPU actually taught us
 - [docs/tool-api.md](docs/tool-api.md) — the exec API and the `run_terminal_command` tool definition
 - [docs/schema/](docs/schema) — JSON Schemas, generated from the Go wire types (`make generate`)
 

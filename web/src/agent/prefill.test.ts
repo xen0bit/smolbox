@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { planPrefill } from "./prefill.ts";
+import { planPrefill, resolvePrefillLogits } from "./prefill.ts";
 import { commonPrefix } from "./prefix.ts";
 
 /** Distinct ids, so a wrong window is a visibly wrong slice rather than a tie. */
@@ -95,6 +95,47 @@ describe("planPrefill", () => {
     // prefillChunkTokens has a floor, but this function is the one that would
     // hang rather than fail if it were ever handed a zero.
     expect(planPrefill([], ids(3), 0).steps).toEqual([1, 2]);
+  });
+});
+
+describe("resolvePrefillLogits", () => {
+  const entry = (prefillLogits?: "sequence" | "last") => ({ key: "test", prefillLogits });
+
+  test("agreement is silent", () => {
+    expect(resolvePrefillLogits(entry("last"), ["input_ids", "num_logits_to_keep"])).toEqual({
+      actual: "last",
+    });
+    expect(resolvePrefillLogits(entry("sequence"), ["input_ids"])).toEqual({ actual: "sequence" });
+    // An absent declaration means "sequence", the pessimistic default.
+    expect(resolvePrefillLogits(entry(), ["input_ids"])).toEqual({ actual: "sequence" });
+  });
+
+  test("a registry claiming `last` against a graph that cannot deliver it loses", () => {
+    // The dangerous direction: believing this entry would prefill the whole
+    // prompt in one pass and hand the device an N x vocab x 4 tensor.
+    const out = resolvePrefillLogits(entry("last"), ["input_ids", "attention_mask"]);
+    expect(out.actual).toBe("sequence");
+    expect(out.message).toMatch(/does not take/);
+    expect(out.message).toMatch(/kills the device/);
+  });
+
+  test("the `logits_to_keep` spelling is named for what it is", () => {
+    // §10.20's trap: the export means to emit one position, transformers.js
+    // only ever binds `num_logits_to_keep`, and the graph emits all of them.
+    const out = resolvePrefillLogits(entry("last"), ["input_ids", "logits_to_keep"]);
+    expect(out.actual).toBe("sequence");
+    expect(out.message).toMatch(/logits_to_keep/);
+    expect(out.message).toMatch(/§10\.20/);
+  });
+
+  test("a registry being pessimistic is corrected too, at no risk", () => {
+    const out = resolvePrefillLogits(entry("sequence"), ["input_ids", "num_logits_to_keep"]);
+    expect(out.actual).toBe("last");
+    expect(out.message).toMatch(/chunk a prompt that does not need it/);
+  });
+
+  test("a graph that cannot be inspected leaves the registry alone", () => {
+    expect(resolvePrefillLogits(entry("last"), [])).toEqual({ actual: null });
   });
 });
 
