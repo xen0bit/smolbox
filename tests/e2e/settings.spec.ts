@@ -18,6 +18,9 @@ interface Options {
 
 type AgentGlobal = { __smolagent?: { options(): Options } };
 
+/** The one test below that asks the page which bundle it is. */
+type ModelSourceGlobal = { __smolagent?: { modelSource(): string } };
+
 async function open(page: Page): Promise<void> {
   // ?model=fake keeps this off a GPU; the settings path does not touch weights.
   await page.goto("/agent/?model=fake");
@@ -136,6 +139,32 @@ test("switching models re-derives untouched knobs and keeps touched ones", async
   // re-derives it from the entry rather than dropping it back to the
   // no-model-selected floor in DEFAULTS.
   expect(after.promptBudgetChars).toBe(before.promptBudgetChars);
+});
+
+// The model-source flag, seen from the page rather than from a unit test.
+//
+// `make test-e2e` builds with the default (hub), which is the case that matters:
+// the Gemma kernel entry is listed — dropping it would make a checkpoint that
+// exists look like one that never did — and cannot be picked, because its engine
+// is served from this origin and a deployment has no dist/kernels. The ONNX
+// build of the same model sits next to it enabled, which is the point: the block
+// is about the engine, not the weights.
+//
+// It reads the source off the page rather than assuming it, so that running this
+// suite by hand after `make web-local` reports the truth instead of a failure
+// about a build nobody asked for. See web/src/agent/model-source.ts.
+test("the model source decides whether the kernel entry can be chosen", async ({ page }) => {
+  await open(page);
+  const source = await page.evaluate(() => (globalThis as ModelSourceGlobal).__smolagent!.modelSource());
+  const kernels = page.locator('#model option[value="gemma4-e2b"]');
+  await expect(kernels).toHaveCount(1);
+  if (source === "hub") {
+    await expect(kernels).toBeDisabled();
+    await expect(kernels).toContainText("needs a local build");
+  } else {
+    await expect(kernels).toBeEnabled();
+  }
+  await expect(page.locator('#model option[value="gemma4-e2b-onnx"]')).toBeEnabled();
 });
 
 test("the storage panel reports an empty cache", async ({ page }) => {
