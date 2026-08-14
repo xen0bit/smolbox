@@ -184,6 +184,28 @@ export interface ModelEntry {
   inlineBytes?: Partial<Record<Dtype, number>>;
   /** How its weights are laid out in the repo. Absent means the ONNX layout. */
   weights?: WeightLayout;
+  /**
+   * What has to be built locally before this entry can run, and why.
+   *
+   * Absent for everything the browser can load unaided, which is almost all of
+   * it: every repo here serves its files anonymously from huggingface.co with
+   * CORS at the pinned revision, checked by HEAD rather than assumed — including
+   * the Google one, which is not gated.
+   *
+   * Present when something OTHER than the weights has to come off this origin.
+   * The Gemma kernel entry is the case: its 2.46 GB of safetensors are on the
+   * hub and the engine reads them from there quite happily, but the engine
+   * itself is a dynamic import of /kernels/gemma4/gemma-4-e2b.js, which exists
+   * only after `make gemma-kernels`. It is not vendored and cannot be served
+   * from the hub by the page: the Space that publishes it declares no license
+   * (web/fetch-kernels.ts), and this page is cross-origin isolated, so a
+   * cross-origin module import would need CORP headers nobody has promised.
+   *
+   * The string is shown to whoever hits the limit, so write it as an answer
+   * rather than a flag name. See unavailableReason() in model-source.ts, which
+   * is what keeps these entries out of the dropdown on a hub build.
+   */
+  requiresLocalBuild?: string;
 }
 
 /** Quantizations that need `shader-f16` on the adapter. */
@@ -241,8 +263,17 @@ export const models: ModelEntry[] = [
     // tighter prompt budget than the one that came before it.
     vocabSize: 128_000,
     // q4 first, as for the 1.2B: it is the variant `make model` pulls and the
-    // only one that runs headless. q4f16 is smaller (1.53 GB) but splits its
-    // weights across two .onnx_data shards, which only the hub path handles.
+    // only one that runs headless. q4f16 is smaller (1.53 GB) but needs
+    // shader-f16, which is the whole of the reason — an earlier version of this
+    // comment also claimed its two .onnx_data shards were "only handled by the
+    // hub path", and that was wrong in both halves. transformers.js reads the
+    // shard COUNT from this repo's config.json
+    // (`transformers.js_config.use_external_data_format` says `model_q4f16.onnx: 2`),
+    // names them `.onnx_data` and `.onnx_data_1`, and fetches each through the
+    // same getModelFile() that serves local and hub alike — nothing in
+    // utils/model-loader.js branches on where the files come from. weightFiles()
+    // below probes the same names as optional files, so `make model
+    // MODEL="lfm2.5-2.6b --dtype q4f16"` pulls both shards too.
     dtypes: ["q4", "q4f16"],
     approxBytes: 1_854_562_304,
     contextTokens: 128_000,
@@ -424,6 +455,12 @@ export const models: ModelEntry[] = [
     dialect: "gemma4",
     backend: "gemma4-kernels",
     weights: "safetensors",
+    // The only entry a hub-only build cannot offer, and not because of its
+    // weights: those are on the hub, ungated, and the engine reads them straight
+    // from there. It is the ENGINE that has to be local. See requiresLocalBuild.
+    requiresLocalBuild:
+      "its WebGPU kernel engine is served from this origin rather than the hub — " +
+      "build with SMOLBOX_MODEL_SOURCE=local after `make gemma-kernels`",
     // No requiresFeatures. This entry declared `shader-f16` from M12 to §10.17
     // on the strength of a true observation — every variant of
     // com.xenova.gemma4.DenseGemv is guarded on it — and a false inference from

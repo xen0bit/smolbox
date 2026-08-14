@@ -24,6 +24,7 @@ import {
   models,
   pickDtype,
 } from "./models.ts";
+import { MODEL_SOURCE, selectableModels, unavailableReason } from "./model-source.ts";
 import { FakeModelClient, type FakeScript } from "./fake-model.ts";
 import { requestPersistence } from "./model-cache.ts";
 import { Settings } from "./settings.ts";
@@ -33,7 +34,14 @@ import type { ParsedCall, StreamPreview } from "./parse.ts";
 import { ToolRegistry } from "./tool-registry.ts";
 import type { TemplateTool } from "./user-tools.ts";
 
-let currentModelKey = DEFAULT_MODEL_KEY;
+// The registry's default, unless this build cannot offer it — a hub build must
+// not open on a checkpoint whose own option is greyed out. Falls back to the
+// first entry the build does offer; selectableModels() is never empty on either
+// source, and model-source.test.ts holds both that and the stronger claim that
+// the default never needs this fallback in the first place.
+let currentModelKey = unavailableReason(modelFor(DEFAULT_MODEL_KEY))
+  ? selectableModels()[0]!.key
+  : DEFAULT_MODEL_KEY;
 
 const probeFor = (repo: string) => `/models/${repo}/config.json`;
 
@@ -571,6 +579,16 @@ export interface SmolagentHandle {
   webgpu(): Promise<{ available: boolean; adapter: boolean; info?: unknown }>;
   /** Swaps in a scripted model. Used by CI, which has no GPU. */
   useFake(scripts: FakeScript[]): void;
+  /**
+   * Which source this bundle was built for, "hub" or "local".
+   *
+   * Exposed because it is otherwise invisible: the flag is baked in at build
+   * time, so a page that will not offer a checkpoint looks identical to one
+   * whose registry never had it. A spec reads this to know which half of the
+   * behaviour to assert, and a person debugging reads it to find out which
+   * bundle is actually being served.
+   */
+  modelSource(): string;
   setModel(key: string): void;
   loadModel(local?: boolean): Promise<{ source: string; loadMs: number }>;
   bootVm(timeoutMs?: number): Promise<Caps>;
@@ -598,6 +616,7 @@ const handle: SmolagentHandle = {
     const adapter = await gpu.requestAdapter();
     return { available: true, adapter: Boolean(adapter), info: (adapter as { info?: unknown })?.info };
   },
+  modelSource: () => MODEL_SOURCE,
   useFake: (scripts: FakeScript[]) => {
     modelClient = new FakeModelClient(scripts);
     modelLabel = "scripted fake";
@@ -607,6 +626,24 @@ const handle: SmolagentHandle = {
   },
   loadModel: async (local?: boolean) => {
     const entry = modelFor(currentModelKey);
+    // Checked before the adapter, the dtype and everything else: on a hub build
+    // this entry's option is disabled, so arriving here means something set the
+    // key programmatically — a spec, or a console. Saying no with the reason
+    // beats letting it fail three steps later inside a dynamic import.
+    const unavailable = unavailableReason(entry);
+    if (unavailable) {
+      throw new Error(`${entry.label} is not available in this build: ${unavailable}`);
+    }
+    // The local weight path still exists and still works; it is simply not what
+    // this build was made for. Refusing here rather than honouring the argument
+    // is what makes MODEL_SOURCE a property of the page instead of a default
+    // that any caller can talk its way past.
+    if (local === true && MODEL_SOURCE !== "local") {
+      throw new Error(
+        "this page was built to load weights from the hub; rebuild with " +
+          "SMOLBOX_MODEL_SOURCE=local make web to read them from dist/models",
+      );
+    }
     const dialect = dialectFor(entry.dialect);
     convo.configure({ dialect });
 
@@ -646,7 +683,10 @@ const handle: SmolagentHandle = {
         `${dialect.label}: ${dialect.note ?? "never run against the real model"}`;
     }
 
-    const useLocal = local ?? (await haveLocalWeights(entry.repo));
+    // The probe is a local-build question now. On a hub build there is nothing
+    // to probe for — /models/ is not part of a deployment — and asking would be
+    // a 404 per load whose answer is ignored either way.
+    const useLocal = local ?? (MODEL_SOURCE === "local" && (await haveLocalWeights(entry.repo)));
     // Asked for here rather than on page load: this is the moment someone has
     // committed to putting gigabytes on their disk, and Firefox prompts.
     requestPersistence();
@@ -662,6 +702,14 @@ const handle: SmolagentHandle = {
   },
   setModel: (key: string) => {
     const entry = modelFor(key);
+    // The same refusal as loadModel(), one step earlier. The dropdown cannot
+    // reach a disabled entry, so this is only ever a programmatic caller — and
+    // leaving the page sitting on a checkpoint that will refuse to start is a
+    // worse answer than refusing the selection.
+    const unavailable = unavailableReason(entry);
+    if (unavailable) {
+      throw new Error(`${entry.label} is not available in this build: ${unavailable}`);
+    }
     currentModelKey = entry.key;
     convo.configure({ dialect: dialectFor(entry.dialect) });
     // Re-derives every knob the user has not taken over — the new checkpoint's
@@ -930,13 +978,26 @@ renderToolList();
 
 // Populate the model dropdown from the registry, marking unverified dialects so
 // an odd answer reads as "we never checked this family" rather than a bug.
+//
+// An entry this build cannot load is shown disabled rather than dropped. The
+// registry is the page's answer to "what can this run", and a silently shorter
+// list makes a missing checkpoint look like it was never there — where a greyed
+// option that says why is the difference between a bug report and a `make`
+// target. It cannot be selected, and loadModel() refuses it besides.
 const modelSelect = el("model");
 if (modelSelect) {
   const option = (m: ModelEntry) => {
     const opt = document.createElement("option");
     opt.value = m.key;
     const verified = dialectFor(m.dialect).verified ? "" : " · dialect unverified";
-    opt.textContent = `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})`;
+    const unavailable = unavailableReason(m);
+    opt.textContent =
+      `${m.label} (${(m.approxBytes / 1e9).toFixed(2)} GB${verified})` +
+      (unavailable ? " · needs a local build" : "");
+    if (unavailable) {
+      opt.disabled = true;
+      opt.title = unavailable;
+    }
     return opt;
   };
 

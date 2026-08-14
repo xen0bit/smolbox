@@ -36,6 +36,11 @@ interface Element {
   checked: boolean;
   disabled: boolean;
   hidden: boolean;
+  /**
+   * Hover text. The model dropdown's only use for it: a disabled <option> says
+   * in the list that it needs a local build and says here what to run.
+   */
+  title: string;
   /** <dialog> only, and optional so a browser without it degrades to inline. */
   showModal?(): void;
   close?(): void;

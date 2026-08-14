@@ -9,7 +9,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all everything build wasm vm-image builder-image require-docker web serve compress generate model models gemma-kernels \
+.PHONY: all everything build wasm vm-image builder-image require-docker web web-local serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
         test-e2e-agent-smoke test-e2e-agent-firefox \
         test-conformance lint clean
@@ -86,7 +86,27 @@ build:
 	mkdir -p $(BIN)
 	go build -o $(BIN)/smolbox ./cmd/smolbox
 
+# Where the agent page reads weights from: `hub` (the default) or `local`.
+#
+# Baked into the bundle rather than read by the server, because web/dist is
+# static and `make compress` writes .br/.gz variants beside every file — there is
+# nothing left for a server to rewrite on the way out. See
+# web/src/agent/model-source.ts.
+#
+#   make web                              a deployment: huggingface.co only
+#   SMOLBOX_MODEL_SOURCE=local make web   dist/models, for debugging a checkpoint
+#
+# A hub build hides the entries that need something built locally (today: the
+# Gemma 4 kernel engine), so `make everything` produces a page whose every
+# offered model a visitor can actually load.
+SMOLBOX_MODEL_SOURCE ?= hub
+
 web:
+	@case "$(SMOLBOX_MODEL_SOURCE)" in \
+		hub|local) ;; \
+		*) echo "error: SMOLBOX_MODEL_SOURCE must be 'hub' or 'local', got '$(SMOLBOX_MODEL_SOURCE)'" >&2; exit 1 ;; \
+	esac
+	@echo "web: model source is $(SMOLBOX_MODEL_SOURCE)"
 	mkdir -p web/dist
 	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
 	cp web/index.html web/dist/index.html
@@ -97,8 +117,11 @@ web:
 	@# The VM artifacts stay in dist/ and are served from there (web/serve.ts
 	@# resolves them via DIST_DIR); web/dist holds only the bundles.
 	mkdir -p web/dist/agent web/dist/ort
+	@# --define replaces the bare SMOLBOX_MODEL_SOURCE identifier with a literal;
+	@# process.env would not survive a browser build, which has no process.
 	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \
-		--target=browser --outdir web/dist/agent
+		--target=browser --outdir web/dist/agent \
+		--define SMOLBOX_MODEL_SOURCE='"$(SMOLBOX_MODEL_SOURCE)"'
 	cp web/agent.html web/dist/agent/index.html
 	@# onnxruntime-web otherwise pulls these from jsdelivr at runtime; serving them
 	@# locally keeps the page pinned to the installed version and works offline.
@@ -110,8 +133,9 @@ web:
 	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm web/dist/ort/
 	cp node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs web/dist/ort/
 
-# Pulls a registry checkpoint into dist/models (gitignored). The agent page
-# prefers it and falls back to the HF CDN when it is absent.
+# Pulls a registry checkpoint into dist/models (gitignored), for the page built
+# with SMOLBOX_MODEL_SOURCE=local — a hub build ignores dist/models entirely and
+# reads every checkpoint from huggingface.co. See `web` above.
 #   make model                  the default entry (LFM2.5 2.6B, 1.85 GB)
 #   make model MODEL=lfm2-1.2b-tool  a specific one
 #   make model MODEL=--list     what is on offer
@@ -164,6 +188,13 @@ gemma-kernels:
 compress:
 	bun web/precompress.ts
 
+# The bundle the GPU suites need: they load checkpoints off the disk, and a hub
+# build refuses to (web/src/agent/model-source.ts). It rebuilds web/dist, so a
+# `make web` afterwards is what puts the deployment build back — hence the note.
+web-local:
+	@SMOLBOX_MODEL_SOURCE=local $(MAKE) web
+	@echo "note: web/dist now loads weights from dist/models; 'make web' restores the hub build"
+
 serve:
 	bun web/serve.ts
 
@@ -194,7 +225,7 @@ test-e2e-firefox: web
 
 # The M8 agent spike. Opt-in and not in CI: it needs a real GPU adapter (headless
 # Chromium has no software fallback for WebGPU) and the local weights.
-test-e2e-agent: web
+test-e2e-agent: web-local
 	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
 	SMOLBOX_WEBGPU=1 bunx --bun playwright test --config tests/e2e/playwright.agent.config.ts
 
@@ -203,7 +234,7 @@ test-e2e-agent: web
 # to run before believing a model. See tests/e2e/playwright.agent-smoke.config.ts
 # for what it does and does not prove.
 SMOKE_MODEL ?= lfm2.5-350m
-test-e2e-agent-smoke: web
+test-e2e-agent-smoke: web-local
 	@test -d "$(DIST)/models/onnx-community/LFM2.5-350M-ONNX" || \
 		{ echo "error: weights missing; run 'make model MODEL=$(SMOKE_MODEL)' first" >&2; exit 1; }
 	SMOLBOX_WEBGPU=1 SMOLBOX_MODEL=$(SMOKE_MODEL) \
@@ -214,7 +245,7 @@ test-e2e-agent-smoke: web
 # because Firefox is where the download-progress flood shows up: it hands the
 # response body over in far smaller pieces, so a missing throttle costs an order
 # of magnitude more messages. See tests/e2e/playwright.agent-firefox.config.ts.
-test-e2e-agent-firefox: web
+test-e2e-agent-firefox: web-local
 	@test -d "$(DIST)/models" || { echo "error: $(DIST)/models missing; run 'make model' first (M8)" >&2; exit 1; }
 	bunx --bun playwright test --config tests/e2e/playwright.agent-firefox.config.ts
 

@@ -55,15 +55,16 @@ pure and drive it with `FakeModelClient`.
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page into `web/dist`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
+| `SMOLBOX_MODEL_SOURCE=local make web` (or `make web-local`) | the same bundle, reading weights from `dist/models` instead of huggingface.co. **The default is `hub`**, and a hub build disables any registry entry that needs something built here — today only `gemma4-e2b`, whose kernel engine is not on the hub. `make web` puts the hub build back |
 | `make compress` | write a `.br` + `.gz` beside every compressible artifact in `dist/` and `web/dist`; `web/serve.ts` serves them by negotiation and falls back to identity when absent |
 | `make test-web` | `bun test web` (protocol + session + fsbridge + tool-surface + serve negotiation unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
-| `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by the agent page (M8) |
+| `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by a `local` build of the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
 | `make models` | pull **every** downloadable registry entry; keeps going past a failure and reports at the end |
 | `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
-| `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; **never runs in CI** |
+| `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; builds through `web-local` so it reads the disk rather than the hub; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
@@ -252,8 +253,10 @@ is undefined outside a secure context, so any probe must run against localhost, 
 
 ### Model weights: `make model`, and don't let the browser cache them
 `make model` pulls a **pinned revision** into `dist/models` (gitignored, 1.22 GB); `web/serve.ts`
-serves it at `/models/` without copying it into `web/dist`. The page prefers local and falls back to
-the HF CDN. Two traps: Cache Storage cannot hold a 1.2 GB entry (the `put` fails with an opaque
+serves it at `/models/` without copying it into `web/dist`. Whether the page reads it at all is the
+`SMOLBOX_MODEL_SOURCE` build flag (default `hub`, so a plain `make web` ignores `dist/models`
+entirely and pulls from huggingface.co); `make web-local` is the build that reads the disk, and the
+GPU suites depend on it. Two traps: Cache Storage cannot hold a 1.2 GB entry (the `put` fails with an opaque
 internal error), so `env.useBrowserCache = false` on the local path; and onnxruntime-web picks its
 wasm variant at runtime — this version wants `ort-wasm-simd-threaded.asyncify.*`, not `.jsep` — so
 `make web` copies **every** variant. A missing one surfaces as "no available backend found", not a

@@ -1188,3 +1188,62 @@ whoever meets it again: `reapOrphans()` in `guest/smolagentd/agent.go` drains wi
 in a loop that only breaks on an error, so a child that has not exited yet is a busy-spin — cheap on
 real silicon, and a spin that starves the very child it is waiting for when PID 1 and that child
 share one emulated CPU. That is a hypothesis, not a finding; it has not been instrumented.
+
+### 10.25 Which checkpoints a browser can load unaided, and a flag that says so (2026-08-13)
+
+The page had been deciding where to read weights from by probing: `haveLocalWeights()` HEADs
+`/models/<repo>/config.json` and, on a 404, falls back to the hub. That was written as a
+convenience for a workstation and had quietly become the deployment's configuration too — which
+means what a visitor gets depends on which `make model` pulls happened to finish on the machine that
+built it. A half-finished `make models` serves some entries locally, some from the hub, and says
+nothing about either.
+
+The prior question is which entries a browser can fetch for itself at all. **Answer: all eight** —
+measured, not assumed, by an anonymous HEAD (with an `Origin` header, so CORS is included) on every
+required file of each entry's preferred dtype, at the pinned revision:
+
+| entry | preferred dtype | weights | `access-control-allow-origin` |
+|---|---|---|---|
+| lfm2-1.2b-tool | q4 | 1.22 GB, `.onnx_data` sidecar | present |
+| lfm2.5-2.6b | q4 | 1.85 GB, sidecar | present |
+| qwen2.5-0.5b-instruct | q4 | 786 MB, **inline, no sidecar** | present |
+| qwen3.5-0.8b | q4 | 551 MB, sidecar | present |
+| granite-4.0-h-1b | q4 | 1.02 GB, sidecar | present |
+| lfm2.5-350m | q4 | 294 MB, sidecar | present |
+| gemma4-e2b | (baked) | 2.46 GB `model.safetensors` | present |
+| gemma4-e2b-onnx | q4f16 | 2 graphs, ~3.6 GB | present |
+
+Two things worth knowing from that sweep. **`google/gemma-4-E2B-it-qat-mobile-transformers` is not
+gated** — the usual Gemma license gate does not apply to this checkpoint, and an unauthenticated GET
+returns the weights. And qwen2.5-0.5b is the only entry with no external-data sidecar, so it is the
+only one whose single file has to stay under `INLINE_WEIGHT_CEILING_BYTES` (§10.18); it is at 786 MB
+against a 1 GB line.
+
+**A comment that was wrong in both halves.** The LFM2.5 2.6B entry claimed its q4f16 build "splits
+its weights across two `.onnx_data` shards, which only the hub path handles". The shards are real —
+this repo's `config.json` declares `transformers.js_config.use_external_data_format` as
+`{"model_q4f16.onnx": 2}` and the hub serves `.onnx_data` and `.onnx_data_1` — but nothing about
+them is hub-specific. `getModelDataFiles()` in `utils/model-loader.js` derives the chunk names from
+that config and fetches each through the same `getModelFile()` that resolves a local path, so the
+local branch sees identical filenames; and `weightFiles()` here probes the same names as optional
+files, so `make model` pulls both shards too. What actually keeps q4 in front is `shader-f16`, which
+was already the other half of the sentence. The real caveat outlived the invented one.
+
+**So the source is a flag now: `SMOLBOX_MODEL_SOURCE`, defaulting to `hub`.** `local` is kept, does
+exactly what the probe used to, and is what `make web-local` and the opt-in GPU suites build — those
+must not re-pull gigabytes per run. It is a **build** flag (`bun build --define`, via the `web`
+target) rather than a server one for a boring reason: `web/dist` is static and `make compress`
+writes `.br`/`.gz` variants beside every file, so there is nothing left for `web/serve.ts` to rewrite
+on the way out. The cost is that flipping it is a rebuild; what it buys is a page with no runtime
+configuration to fetch, race on, or fail to fetch.
+
+**One entry a hub build cannot offer, and it is not about its weights.** `gemma4-e2b`'s 2.46 GB are
+on the hub and its engine reads them from there happily; the *engine* is the problem. It is a
+dynamic import of `/kernels/gemma4/gemma-4-e2b.js`, which exists only after `make gemma-kernels`,
+and it cannot be imported from the hub instead: the Space that publishes it declares no license
+(which is why it is fetched rather than vendored, `web/fetch-kernels.ts`), and this page is
+cross-origin isolated, so a cross-origin module import would need CORP headers nobody has promised.
+Its registry entry therefore carries `requiresLocalBuild`, and on a hub build the dropdown shows the
+option **disabled with the reason** rather than dropping it. Dropping it would make a checkpoint
+that exists look like one that never did; `loadModel()` and `setModel()` refuse it as well, so the
+path survives for debugging without being reachable from the page.

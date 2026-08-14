@@ -133,7 +133,7 @@ resp, err := session.Exec(ctx, protocol.Request{
 ```
 make everything  # the whole served set: wasm, web, gemma-kernels, compress, models
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
-make model       # optional: pull the default checkpoint (LFM2.5 2.6B) -> dist/models, for the agent page
+make model       # optional: pull the default checkpoint (LFM2.5 2.6B) -> dist/models, for a local build
 make build       # build the smolbox CLI
 
 ./bin/smolbox exec --mount ./testdata/mount -- ls -la /mnt/host
@@ -148,8 +148,16 @@ shows them.
 
 The dev server hosts the VM at `/` and the agent page at `/agent/`. Both pages carry a terminal
 whose `:`-prefixed lines are handled by the page rather than the guest — `:get <path>` downloads a
-file out of the VM, `:help` lists them. The agent page needs a GPU; it loads weights from `dist/models` when
-`make model` has been run and from the Hugging Face CDN otherwise.
+file out of the VM, `:help` lists them. The agent page needs a GPU.
+
+Where it reads weights from is a build flag, `SMOLBOX_MODEL_SOURCE`, and it defaults to `hub`: every
+checkpoint comes from huggingface.co, which is what a visitor to a deployment gets and needs no
+`make model` at all. `SMOLBOX_MODEL_SOURCE=local make web` reads them from `dist/models` instead —
+for debugging a checkpoint off the disk, and what the opt-in GPU suites build. A hub build greys out
+any entry that needs something built here rather than fetched: today that is the Gemma 4 kernel
+build alone, whose 2.5 GB of weights are on the hub but whose WebGPU engine comes from
+`make gemma-kernels`. Every other registry entry is servable from the hub, checked by HEAD against
+each pinned revision.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
