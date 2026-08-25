@@ -9,6 +9,7 @@
 // the thing that downloads weights and the thing that loads them cannot
 // disagree about which revision is current.
 
+import { asset } from "../base.ts";
 import type { DialectName } from "./dialects/index.ts";
 
 /**
@@ -712,8 +713,12 @@ export const REQUIRED_FILES = ["config.json", "tokenizer.json", "tokenizer_confi
  * Where the dev server mirrors `dist/models`. The worker sets
  * `env.localModelPath` from this, so the path the fetcher writes to and the
  * paths the page reads from stay one decision.
+ *
+ * Under the site's base prefix (base.ts) like every other served path, though
+ * in practice the two never differ: local weights are a `make serve` thing and
+ * `make serve` hosts the site at the root.
  */
-export const LOCAL_MODEL_PATH = "/models/";
+export const LOCAL_MODEL_PATH = asset("models/");
 
 /**
  * The chat template, when a repo keeps it out of tokenizer_config.json.

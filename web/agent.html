@@ -4,7 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>smolbox — agent</title>
-    <link rel="stylesheet" href="/style.css" />
+    <!-- Cross-origin isolation, for a host that cannot send COOP/COEP itself
+         (GitHub Pages). A no-op when the server already sends them, which is
+         what `make serve` does — see web/coi-serviceworker.js. Classic and
+         first in the head so it runs before the deferred module below. -->
+    <script src="../coi-serviceworker.js"></script>
+    <link rel="stylesheet" href="../style.css" />
     <style>
       #log {
         min-height: 18rem;

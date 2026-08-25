@@ -161,6 +161,29 @@ each pinned revision.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
+### Deploying it
+
+`make site` assembles everything a static host needs into `_site/`: both pages, their bundles, the
+onnxruntime builds and `dist/smolbox.wasm`, in one flat tree with the site at its root. It is a hub
+build by definition — no weights are published, because a visitor gets every checkpoint from
+huggingface.co — so it comes to ~230 MB rather than ~11 GB.
+
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml) publishes that tree to GitHub Pages on
+every push to `main`, and on demand from the Actions tab. Pages needs two accommodations, both
+handled at build time because there is no server on the other end to handle them at request time:
+
+- **No response headers.** The runtime needs cross-origin isolation and Pages sends neither
+  `Cross-Origin-Opener-Policy` nor `Cross-Origin-Embedder-Policy`, with no way to add them.
+  [`web/coi-serviceworker.js`](web/coi-serviceworker.js) installs both from a service worker
+  instead, at the cost of one extra reload on a first visit. It does nothing at all when the server
+  already sends the headers, so `make serve` and the container image are unaffected — pinned by
+  `tests/e2e/coi.spec.ts`.
+- **No root.** A project site lives at `https://<user>.github.io/<repo>/`, so every asset path is
+  built under a prefix: `SMOLBOX_BASE`, defaulting to `/`, in the same shape as
+  `SMOLBOX_MODEL_SOURCE` and for the same reason (see [`web/src/base.ts`](web/src/base.ts)). The
+  workflow reads the prefix from the deployment rather than hardcoding it, so a fork or a custom
+  domain needs no edit.
+
 The same dev server runs in a container, built from the root `Dockerfile`:
 
 ```
@@ -192,7 +215,8 @@ same artifact in headless Chromium: `echo hello`, an OPFS-backed mount smoke, an
 conformance table** — the browser passes the same `cases.json` as the Go driver).
 
 The browser runtime requires **cross-origin isolation** (`Cross-Origin-Opener-Policy: same-origin`
-and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these. Folder mounting works in
+and `Cross-Origin-Embedder-Policy: require-corp`); `make serve` sets these, and on a host that
+cannot — GitHub Pages — a service worker sets them instead (see *Deploying it* above). Folder mounting works in
 every current browser: `showDirectoryPicker()` where it exists, `<input type="file" webkitdirectory>`
 otherwise — `make test-e2e-firefox` runs that second path against a real VM in Firefox.
 

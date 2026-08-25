@@ -18,6 +18,7 @@ import {
   type PreTrainedTokenizer,
 } from "@huggingface/transformers";
 
+import { asset } from "../base.ts";
 import { GemmaKernelEngine } from "./gemma-kernels.ts";
 import { ModelCache } from "./model-cache.ts";
 import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
@@ -51,7 +52,7 @@ class WorkerError extends Error {
 // it from our own origin pins it to the installed version and keeps the page
 // working offline once the weights are cached.
 if (env.backends.onnx.wasm) {
-  env.backends.onnx.wasm.wasmPaths = "/ort/";
+  env.backends.onnx.wasm.wasmPaths = asset("ort/");
 }
 
 // One per worker. The page holds its own handle to the same IndexedDB database

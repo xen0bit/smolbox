@@ -12,6 +12,10 @@ import { createBridgeFd } from "./fsbridge/worker-fd.ts";
 import type { Caps, Response } from "./protocol.ts";
 import { StdinChannel, StdioRouter } from "./stdio.ts";
 
+// Relative on purpose, and it stays relative under a base prefix (src/base.ts):
+// a worker resolves a bare URL against its own script, and worker.js sits at the
+// site root beside smolbox.wasm wherever that root happens to be. So this is
+// already `/smolbox/smolbox.wasm` on a project Pages site without asking.
 const WASM_URL = "smolbox.wasm";
 
 // Stateful on purpose: fd_write hands over whatever the guest happened to flush,

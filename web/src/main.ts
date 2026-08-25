@@ -4,6 +4,7 @@
 // while the VM runs, so the fsbridge handle lives here and mount/remount never
 // round-trips the worker.
 
+import { asset } from "./base.ts";
 import { MountHost, DirectoryHandleLike } from "./fsbridge/main-host.ts";
 import type { Caps, Request, Response } from "./protocol.ts";
 import { Session } from "./session.ts";
@@ -18,7 +19,7 @@ export interface SmolboxHandle {
   mountStatus(): boolean;
 }
 
-const worker = new Worker("/worker.js", { type: "module" });
+const worker = new Worker(asset("worker.js"), { type: "module" });
 const session = new Session(worker);
 const mount = new MountHost();
 

@@ -25,6 +25,7 @@
 // it exposes for the purpose. The prefix-cache bookkeeping in stream() is a
 // faithful reimplementation of what its generate() does with those same objects.
 
+import { asset } from "../base.ts";
 import { KernelRewriteError, adapterHasShaderF16, rewriteKernelsToF32 } from "./kernel-f32.ts";
 import { commonPrefix } from "./prefix.ts";
 
@@ -33,8 +34,11 @@ import { commonPrefix } from "./prefix.ts";
 // onnxruntime path in model-worker.ts imports it from prefix.ts directly.
 export { commonPrefix };
 
-/** Where `make gemma-kernels` puts the pinned bundle, served by web/serve.ts. */
-export const KERNEL_BUNDLE_PATH = "/kernels/gemma4/gemma-4-e2b.js";
+/**
+ * Where `make gemma-kernels` puts the pinned bundle, served by web/serve.ts,
+ * under the site's base prefix (base.ts).
+ */
+export const KERNEL_BUNDLE_PATH = asset("kernels/gemma4/gemma-4-e2b.js");
 
 /** Progress, in the shape the engine reports it. */
 export interface KernelProgress {
