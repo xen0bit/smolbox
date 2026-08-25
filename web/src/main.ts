@@ -10,6 +10,7 @@ import type { Caps, Request, Response } from "./protocol.ts";
 import { Session } from "./session.ts";
 import { Terminal } from "./terminal.ts";
 import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "./mount.ts";
+import { isDownloading, isWorkerPhase, vmStatusLine } from "./vm-status.ts";
 
 export interface SmolboxHandle {
   boot(timeoutMs?: number): Promise<Caps>;
@@ -40,10 +41,29 @@ const terminal = termEl
     })
   : null;
 
-function setStatus(text: string): void {
+// The header is one span and there are two independent facts to put in it —
+// what the VM is doing, and whether a folder is mounted — so they are held
+// apart and joined rather than overwriting each other. Picking a folder used to
+// wipe out whatever the VM had last said about itself. (The agent page reached
+// the same conclusion about the same problem and came out with three chips; see
+// agent/status.ts.)
+let vmLine = "starting…";
+let mountLine = "";
+
+function render(): void {
   if (statusEl) {
-    statusEl.textContent = text;
+    statusEl.textContent = mountLine ? `${vmLine} · ${mountLine}` : vmLine;
   }
+}
+
+function setStatus(text: string): void {
+  vmLine = text;
+  render();
+}
+
+function setMountStatus(text: string): void {
+  mountLine = text;
+  render();
 }
 
 function formatBytes(n: number): string {
@@ -63,6 +83,9 @@ worker.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as {
     type?: string;
     message?: string;
+    phase?: string;
+    caps?: Caps;
+    code?: number;
     sab?: SharedArrayBuffer;
     loaded?: number;
     total?: number;
@@ -77,13 +100,32 @@ worker.addEventListener("message", (ev: MessageEvent) => {
     case "log":
       if (msg.message) {
         console.log("smolbox worker:", msg.message);
-        setStatus(msg.message);
-        // "fetching wasm" is the message that precedes the download; anything
-        // later (instantiating, booting) means the bar's job is done.
-        if (msg.message !== "fetching wasm" && progressEl) {
+      }
+      if (isWorkerPhase(msg.phase)) {
+        setStatus(vmStatusLine(msg.phase));
+        // "fetching" is the phase the download runs in; reaching any later one
+        // means the bar's job is done.
+        if (!isDownloading(msg.phase) && progressEl) {
           progressEl.hidden = true;
         }
+      } else if (msg.message) {
+        // A log line with no phase is the boot watchdog's stall report, which is
+        // the one diagnostic this page has for a VM that never comes up. Show it
+        // verbatim, and leave the bar alone — it says nothing about the download.
+        setStatus(msg.message);
       }
+      break;
+    // The guest is up. The worker starts the VM on its own, so this arrives
+    // whether or not anyone has typed a command — which is exactly why the
+    // header used to sit on "booting the VM" forever on a VM that had booted.
+    case "ready":
+      setStatus(vmStatusLine("ready", msg.caps ? `agent v${msg.caps.version}` : undefined));
+      if (progressEl) {
+        progressEl.hidden = true;
+      }
+      break;
+    case "exit":
+      setStatus(vmStatusLine("exited", `code ${msg.code}`));
       break;
     case "progress":
       if (progressEl && typeof msg.loaded === "number") {
@@ -105,9 +147,7 @@ worker.addEventListener("message", (ev: MessageEvent) => {
       }
       break;
     case "error":
-      if (msg.message) {
-        setStatus(`error: ${msg.message}`);
-      }
+      setStatus(vmStatusLine("failed", msg.message));
       if (progressEl) {
         progressEl.hidden = true;
       }
@@ -136,7 +176,7 @@ const handle: SmolboxHandle = {
   close: (t?: number) => session.close(t),
   setMount: (mountHandle: DirectoryHandleLike | null, links?: Record<string, string>) => {
     mount.remount(mountHandle, links);
-    setStatus(mountHandle ? "mount: folder ready" : "mount: none");
+    setMountStatus(mountHandle ? "mount: folder ready" : "mount: none");
   },
   mountStatus: () => mount.mounted(),
 };
@@ -152,7 +192,7 @@ if (pickButton) {
       const picked = await pickDirectoryHandle();
       handle.setMount(picked);
     } catch (err) {
-      setStatus(
+      setMountStatus(
         isPickCancelled(err)
           ? "mount unchanged (no folder chosen)"
           : `pick failed: ${err instanceof Error ? err.message : String(err)}`,

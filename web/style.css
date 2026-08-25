@@ -123,6 +123,17 @@ progress {
   width: 100%;
 }
 
+/* And the rule above has to give way to `hidden`, or it silently outranks it.
+   The browser hides a [hidden] element with `display: none` from the UA sheet,
+   which any author `display` at all overrides — so the VM page's bar was set
+   hidden the moment the download ended, stayed on screen sitting at 100%, and
+   was still there under a header that had frozen on "booting the VM". The agent
+   page carries its own copy of this for #progress-row, which is where the shape
+   of the bug was already visible. */
+progress[hidden] {
+  display: none;
+}
+
 /* The terminal. It is a REPL over Session.exec, not a PTY — see
    src/terminal.ts — so it renders whole commands rather than a cell grid, and
    everything is a plain block of text. Both pages mount one: the VM page as its

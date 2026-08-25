@@ -58,10 +58,12 @@ test("each chip follows its own half", async ({ page }) => {
 
   const fixture = (await walkFixture(mountDir)) as FixtureNode;
   await installMount(page, fixture, "__smolagent");
-  // The folder is up while the other two are not, which is the whole reason
-  // there are three chips rather than one status line.
+  // The folder is up while the model is not, which is the whole reason there
+  // are three chips rather than one status line. The VM is deliberately not
+  // asserted against here: it boots on its own, so which side of ready it is on
+  // by now is a race with the download, not a fact about the mount.
   await expect(page.locator("#chip-folder")).toHaveAttribute("data-state", "ready");
-  await expect(page.locator("#chip-vm")).not.toHaveAttribute("data-state", "ready");
+  await expect(page.locator("#chip-model")).toHaveAttribute("data-state", "idle");
 
   await page.evaluate((t) => (globalThis as AgentGlobal).__smolagent!.bootVm(t), BOOT_TIMEOUT_MS);
   await expect(page.locator("#chip-vm")).toHaveAttribute("data-state", "ready");

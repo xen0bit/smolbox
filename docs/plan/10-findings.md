@@ -1,4 +1,4 @@
-## 10 (continued). What running it taught us (§10.10–§10.24)
+## 10 (continued). What running it taught us (§10.10–§10.26)
 
 The measurement log for component 2: every finding that came from putting a real model on a real GPU
 in front of a real VM, in the order it was found. §10.1–§10.9 in
@@ -1247,3 +1247,104 @@ Its registry entry therefore carries `requiresLocalBuild`, and on a hub build th
 option **disabled with the reason** rather than dropping it. Dropping it would make a checkpoint
 that exists look like one that never did; `loadModel()` and `setModel()` refuse it as well, so the
 path survives for debugging without being reachable from the page.
+
+### 10.26 The progress bar Pages took away, and the two displays that stopped at the download (2026-08-25)
+
+Reported against the deployment, not seen locally: *"it seems to have lost the progress bar on
+download? in the VM tab, it loads the VM, but there is a bar at the top that gets stuck on 'booting
+the VM' even though it works. in the chat tab, it gets stuck on downloading, but its actually
+finished the download and was waiting for me to start the model download (which has a correct
+progress bar)."*
+
+Three separate defects, all of them invisible under `make serve` and all of them in the first thirty
+seconds a visitor spends on the site.
+
+**1. GitHub Pages gzips the wasm, so the bar lost its denominator.** The bytes a `fetch()` reader
+yields are decoded, so `Content-Length` on an encoded response counts the wrong thing —
+`web/src/worker.ts` has always known that and refuses to divide by it, falling back to an
+indeterminate bar. `web/serve.ts` supplies the identity size in `X-Uncompressed-Length` and the bar
+works locally. Pages sends no such header:
+
+```
+$ curl -sSI -H 'Accept-Encoding: gzip' https://xen0bit.github.io/smolbox/smolbox.wasm
+content-type: application/wasm
+content-encoding: gzip
+content-length: 56409697          # the identity file is 151229171
+```
+
+So for the whole ~150 MB download the deployment showed a bar with no fill and a byte counter, which
+from the outside is a progress bar that has stopped working.
+
+**Nothing in the browser can recover the number.** Script cannot remove `gzip` from
+`Accept-Encoding` — it is a forbidden header name — and a Range request is no way round it either,
+because Pages answers one against the *selected* representation:
+
+```
+$ curl -sS -D- -o /dev/null -H 'Accept-Encoding: gzip' -H 'Range: bytes=0-0' .../smolbox.wasm
+content-range: bytes 0-0/56409697     # the compressed length, from a one-byte probe
+$ curl -sS -D- -o /dev/null -H 'Range: bytes=0-0' .../smolbox.wasm
+content-range: bytes 0-0/151229171    # identity, but only for a client that can refuse gzip
+```
+
+The size is only knowable where the file is, so it is measured at build time and substituted into
+the bundle: `SMOLBOX_WASM_BYTES`, the third build define after `SMOLBOX_BASE` (§10.25 for the second
+and the reason all three are defines rather than server config). It is consulted *last* — behind
+`X-Uncompressed-Length` and behind `Content-Length` on an unencoded response — because it is the only
+one of the three that can be stale, and the download drops it the moment more bytes arrive than it
+allows for. The final progress message carries the true count rather than the estimate, so a bar
+driven off a slightly stale flag still lands on 100%.
+
+**2. Both pages read the VM's phase out of an English log line, and neither listened for `ready`.**
+The worker posts `fetching wasm`, `instantiating wasm`, `booting the VM`, and the pages compared
+that string against `"fetching wasm"` to decide whether the bar still had a job. Nothing else
+consumed it, and nothing at all consumed the `ready` message, so:
+
+- the VM page's header froze on `booting the VM` — which is posted *before* `wasi.start()`, so the
+  last thing a working VM said about itself was that it was still starting. It used to say
+  `ready (agent v…)` from the run button's own handler; b51968f turned that button into a terminal
+  and the line went with it.
+- the agent page's VM chip froze on `downloading`, because the only other thing that ever moved it
+  was `bootVm()`, and the only caller of `bootVm()` is the start button. The reporter was looking at
+  a chip that said "downloading" while the download had been over for minutes and the page was
+  waiting on *them*.
+
+The worker names its phase now (`{type:"log", message, phase}`) and `web/src/vm-status.ts` maps it,
+so neither page parses prose and both follow the VM the whole way down. Both also listen for `ready`
+and `exit`: the worker boots the VM without being asked, so a display that waits for a button before
+it will admit the VM is up is describing the button.
+
+**3. `progress { display: block }` outranked the `hidden` attribute.** The browser hides a `[hidden]`
+element with `display: none` from the UA stylesheet, which *any* author `display` overrides. So the
+VM page's bar was set hidden the moment the download finished and stayed on screen at 100%,
+underneath a header frozen on "booting the VM" — which is exactly the "bar at the top that gets
+stuck" in the report, read literally. The agent page escaped it only because `#progress-row[hidden]`
+carries its own `display: none`, which is the same bug already worked around once without being
+named. `progress[hidden] { display: none }` now sits beside the rule that caused it.
+
+This one was found by the e2e assertion rather than by reading: `toBeHidden()` fails on an element
+whose `hidden` attribute is set but whose CSS keeps it painted, which no amount of checking
+`el.hidden` from a driver script would have caught.
+
+**Verified against a stand-in for Pages** — `_site` under `/smolbox/`, no COOP/COEP, `smolbox.wasm`
+served gzipped with the encoded `Content-Length` and no `X-Uncompressed-Length` — driven with
+Chromium, before and after:
+
+```
+before   bar=[indeterminate]  status=[loading smolbox.wasm… 94.1 MiB]
+         bar=[hidden*]        status=[instantiating wasm]
+         bar=[hidden*]        status=[booting the VM]        ← and it stops there
+after    bar=[68%]            status=[loading smolbox.wasm… 68% (98.2 MiB of 145.5 MiB)]
+         bar=[hidden]         status=[instantiating smolbox.wasm…]
+         bar=[hidden]         status=[booting the VM…]
+         bar=[hidden]         status=[ready (agent v0.0.1)]
+
+before   bar=[indeterminate smolbox.wasm — 93.1 MiB]  chip=[loading | VM downloading]
+         bar=[hidden]                                 chip=[loading | VM downloading]   ← and it stops there
+after    bar=[66% … 95.3 MiB of 145.5 MiB (66%)]      chip=[loading | VM downloading]
+         bar=[hidden]                                 chip=[loading | VM instantiating]
+         bar=[hidden]                                 chip=[loading | VM booting]
+         bar=[hidden]                                 chip=[ready | VM agent v0.0.1]
+```
+
+(`hidden*` is the attribute being set while defect 3 kept the element painted — the driver was
+reading `el.hidden`, which is why the "before" column understates how bad the VM page looked.)

@@ -9,6 +9,7 @@
 import { asset } from "../base.ts";
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
+import { isDownloading, isWorkerPhase, vmChip } from "../vm-status.ts";
 import { Session } from "../session.ts";
 import { getOpfsDirectoryHandle, isPickCancelled, pickDirectoryHandle } from "../mount.ts";
 import { Terminal } from "../terminal.ts";
@@ -107,6 +108,9 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as {
     type?: string;
     message?: string;
+    phase?: string;
+    caps?: Caps;
+    code?: number;
     sab?: SharedArrayBuffer;
     loaded?: number;
     total?: number;
@@ -134,15 +138,43 @@ vmWorker.addEventListener("message", (ev: MessageEvent) => {
       // waits before anything else can start.
       if (typeof msg.loaded === "number") {
         status.progress("smolbox.wasm", msg.loaded, msg.total);
-        status.vm("loading", "downloading");
       }
       break;
     case "log":
-      // Anything after the fetch means the bar has done its job.
-      if (msg.message && msg.message !== "fetching wasm") {
-        status.clearProgress();
+      // The worker names its phase; the chip follows it the whole way down.
+      // Reading these off the message text is what left the chip saying
+      // "downloading" for as long as the page was open — the only other thing
+      // that ever moved it was bootVm(), which nothing calls until someone
+      // presses start. See vm-status.ts.
+      if (isWorkerPhase(msg.phase)) {
+        const chip = vmChip(msg.phase);
+        status.vm(chip.state, chip.detail);
+        if (!isDownloading(msg.phase)) {
+          status.clearProgress();
+        }
       }
       break;
+    // The worker boots the VM without being asked, so the guest is up well
+    // before the start button is pressed — and a chip that waits for the button
+    // to say so is describing the button, not the VM.
+    case "ready": {
+      vmReady = true;
+      refreshControls();
+      const chip = vmChip("ready", msg.caps ? `agent v${msg.caps.version}` : undefined);
+      status.vm(chip.state, chip.detail);
+      status.clearProgress();
+      break;
+    }
+    // A VM that has exited cannot run a tool call, however it got there — a
+    // deliberate close() included. Saying "ready" after that is the same kind of
+    // lie the chip was already telling, one message later.
+    case "exit": {
+      vmReady = false;
+      refreshControls();
+      const chip = vmChip("exited", `code ${msg.code}`);
+      status.vm(chip.state, chip.detail);
+      break;
+    }
   }
 });
 

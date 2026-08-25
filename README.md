@@ -169,7 +169,7 @@ build by definition — no weights are published, because a visitor gets every c
 huggingface.co — so it comes to ~230 MB rather than ~11 GB.
 
 [`.github/workflows/pages.yml`](.github/workflows/pages.yml) publishes that tree to GitHub Pages on
-every push to `main`, and on demand from the Actions tab. Pages needs two accommodations, both
+every push to `main`, and on demand from the Actions tab. Pages needs three accommodations, all
 handled at build time because there is no server on the other end to handle them at request time:
 
 - **No response headers.** The runtime needs cross-origin isolation and Pages sends neither
@@ -183,6 +183,12 @@ handled at build time because there is no server on the other end to handle them
   `SMOLBOX_MODEL_SOURCE` and for the same reason (see [`web/src/base.ts`](web/src/base.ts)). The
   workflow reads the prefix from the deployment rather than hardcoding it, so a fork or a custom
   domain needs no edit.
+- **No size to divide by.** Pages serves `smolbox.wasm` gzipped and sends nothing naming the size of
+  the decoded bytes, which are the ones the download bar counts — so the bar had no denominator and
+  ran with no percentage for the whole 150 MB. Nothing in the browser can recover that number, so
+  `make web` measures the file and bakes it in as `SMOLBOX_WASM_BYTES` (see
+  [`web/src/wasm-size.ts`](web/src/wasm-size.ts)). It is only ever the fallback: a server that says
+  the size itself, as `make serve` does, is still believed first.
 
 The same dev server runs in a container, built from the root `Dockerfile`:
 
