@@ -24,9 +24,12 @@
     <header>
       <h1>smolbox</h1>
       <span id="status">starting…</span>
+      <!-- Relative, not root-absolute: the pages are copied verbatim, so unlike
+           the bundles they never see SMOLBOX_BASE, and `/agent/` 404s on a
+           project Pages site served from /<repo>/. See web/src/base.ts. -->
       <nav>
-        <a href="/" aria-current="page">VM</a>
-        <a href="/agent/">chat</a>
+        <a href="./" aria-current="page">VM</a>
+        <a href="agent/">chat</a>
       </nav>
     </header>
 
@@ -59,7 +62,7 @@
       <code>/mnt/host</code>.
     </p>
     <p>
-      <strong>Also here:</strong> <a href="/agent/">/agent/</a> is a chat UI with
+      <strong>Also here:</strong> <a href="agent/">agent/</a> is a chat UI with
       a local model driving this VM. It needs <code>make model</code> first.
     </p>
 

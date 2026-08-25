@@ -332,9 +332,12 @@
   <body>
     <header>
       <h1>smolbox agent</h1>
+      <!-- Relative, not root-absolute, and one level up because this page is
+           served from <base>/agent/ — the pages are copied verbatim and never
+           see SMOLBOX_BASE. See web/src/base.ts. -->
       <nav>
-        <a href="/">VM</a>
-        <a href="/agent/" aria-current="page">chat</a>
+        <a href="../">VM</a>
+        <a href="./" aria-current="page">chat</a>
       </nav>
     </header>
 
@@ -478,7 +481,7 @@
       read-only at <code>/mnt/host</code>; the guest has busybox, coreutils,
       <code>rg</code>, <code>tree</code> and <code>python3</code>. Weights load
       from <code>dist/models</code> after <code>make model</code>, else from the
-      Hugging Face CDN. The VM-only page is at <a href="/">/</a>.
+      Hugging Face CDN. The VM-only page is <a href="../">one level up</a>.
     </p>
 
     <script type="module" src="./agent-main.js"></script>
