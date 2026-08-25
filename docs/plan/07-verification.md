@@ -71,8 +71,17 @@ of every byte value in sequence — binary, three chunks, and self-describing ab
 against the guest's `sha256sum`. Plus the two refusals worth having: a directory names the way out,
 and `:help` answers without booting a VM.
 
+**Browser e2e, what the pages say while the VM comes up** (`tests/e2e/vm-status.spec.ts`): both
+displays reach ready **with nothing typed and no button pressed**, because the worker boots the VM on
+its own — the VM page's header lands on `ready (agent v…)` rather than freezing on the phase before
+it, and the agent page's chip walks off "downloading" instead of waiting for the start button. Both
+also assert the download bar is *hidden* by then, which is a stronger claim than it looks: an
+element whose `hidden` attribute is set can still be painted if an author `display` outranks the UA
+sheet, and that is what `toBeHidden()` caught and no driver reading `el.hidden` could have. See
+§10.26 for the three defects behind it.
+
 **Browser e2e, the agent page** (`tests/e2e/agent-console.spec.ts`): the chips start idle and each
-follows its own half (a mounted folder is ready while the VM is not), a command typed in the console
+follows its own half (a mounted folder is ready while the model is not), a command typed in the console
 boots the VM and updates the chip that did not start it, the console's `cd` is the guest's cwd, and —
 the claim that matters — a file the scripted model writes to `/tmp` is one the console reads back,
 which is what "the same VM" means and what would silently stop being true if the console ever got a

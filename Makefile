@@ -115,6 +115,21 @@ SMOLBOX_MODEL_SOURCE ?= hub
 #   SMOLBOX_BASE=/smolbox/ make web   https://<user>.github.io/smolbox/
 SMOLBOX_BASE ?= /
 
+# How big smolbox.wasm is, in identity bytes, for the download bar.
+#
+# The bar needs a denominator and the response is not always able to supply one:
+# GitHub Pages serves the artifact gzipped (~151 MB as ~56 MB) and sends no
+# X-Uncompressed-Length, which is web/serve.ts's own header, so the deployment
+# had a bar that ran indeterminate for the whole 150 MB. Nothing in the browser
+# can recover the number — even a Range probe there is answered against the
+# compressed representation — so it is measured here, where the file is.
+#
+# Recursively expanded (`=`, not `:=`) on purpose: `make everything` builds the
+# wasm and then the bundle in two sub-makes, and a parse-time measurement would
+# be taken before the wasm existed. 0 means "no wasm on disk", which lands the
+# page back on the indeterminate bar rather than on a wrong number.
+WASM_BYTES = $(shell test -f "$(WASM)" && wc -c < "$(WASM)" | tr -d ' \t' || echo 0)
+
 web:
 	@case "$(SMOLBOX_MODEL_SOURCE)" in \
 		hub|local) ;; \
@@ -129,10 +144,15 @@ web:
 		/|/*/) ;; \
 		*) echo "error: SMOLBOX_BASE must start and end with '/', got '$(SMOLBOX_BASE)'" >&2; exit 1 ;; \
 	esac
-	@echo "web: model source is $(SMOLBOX_MODEL_SOURCE), base is $(SMOLBOX_BASE)"
+	@echo "web: model source is $(SMOLBOX_MODEL_SOURCE), base is $(SMOLBOX_BASE), smolbox.wasm is $(WASM_BYTES) bytes"
+	@# Not an error when it is 0: `make web` has never needed the VM to exist, and
+	@# the only cost of building without it is a bar with no percentage on a host
+	@# that sends no length of its own. Say so rather than failing.
+	@test "$(WASM_BYTES)" != "0" || echo "web: note: $(WASM) is missing, so the download bar will run indeterminate on a static host"
 	mkdir -p web/dist
 	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist \
-		--define SMOLBOX_BASE='"$(SMOLBOX_BASE)"'
+		--define SMOLBOX_BASE='"$(SMOLBOX_BASE)"' \
+		--define SMOLBOX_WASM_BYTES='"$(WASM_BYTES)"'
 	cp web/index.html web/dist/index.html
 	@# Both pages link this; it holds the tokens, the controls and the terminal
 	@# styling they share (the agent page grew a terminal of its own at the

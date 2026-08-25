@@ -11,6 +11,8 @@ import { BridgeChannel, createBridgeSab } from "./fsbridge/protocol.ts";
 import { createBridgeFd } from "./fsbridge/worker-fd.ts";
 import type { Caps, Response } from "./protocol.ts";
 import { StdinChannel, StdioRouter } from "./stdio.ts";
+import type { VmPhase } from "./vm-status.ts";
+import { downloadTotal } from "./wasm-size.ts";
 
 // Relative on purpose, and it stays relative under a base prefix (src/base.ts):
 // a worker resolves a bare URL against its own script, and worker.js sits at the
@@ -22,8 +24,11 @@ const WASM_URL = "smolbox.wasm";
 // so a character can straddle two calls. See the onOutput hook below.
 const consoleText = new TextDecoder();
 
-function postLog(msg: string): void {
-  postMessage({ type: "log", message: msg });
+// The message is for the console; the phase is for the two pages, which used to
+// have to recognise these strings to know what the VM was doing. See
+// vm-status.ts for what that cost.
+function postLog(msg: string, phase?: VmPhase): void {
+  postMessage({ type: "log", message: msg, phase });
 }
 
 const stdin = StdinChannel.create();
@@ -184,8 +189,8 @@ function patchPollOneoff(wasiInstance: WASI, ch: StdinChannel): void {
 // Stream it and report progress to the main thread, which shows a loading bar;
 // the worker can still receive postMessage here because wasi.start() has not
 // run yet. One message per percentage point keeps a fast localhost fetch to
-// ~100 messages, and a missing Content-Length (chunked encoding) falls back to
-// one message per MiB so the bar still moves.
+// ~100 messages, and a run with no denominator falls back to one message per
+// MiB so the bar still moves.
 async function fetchWasm(): Promise<ArrayBuffer> {
   const resp = await fetch(WASM_URL);
   if (!resp.ok) {
@@ -193,19 +198,13 @@ async function fetchWasm(): Promise<ArrayBuffer> {
   }
   // The bytes this reader yields are decoded, so on a compressed response
   // Content-Length (the encoded size) would put the bar past 100% and pin it
-  // there. serve.ts sends the identity size in X-Uncompressed-Length; prefer
-  // it, and treat an encoded response without it as unknown-length rather than
-  // trusting a number that measures the wrong thing.
-  const encoded = resp.headers.get("content-encoding");
-  const total =
-    Number(resp.headers.get("x-uncompressed-length")) ||
-    (encoded ? 0 : Number(resp.headers.get("content-length"))) ||
-    0;
+  // there. Where the denominator comes from instead — a header when the server
+  // sends one, the build flag when it does not, which is every static host —
+  // is downloadTotal's decision. See wasm-size.ts.
+  let total = downloadTotal(resp.headers);
   if (!resp.body) {
     const bytes = await resp.arrayBuffer();
-    if (total) {
-      postMessage({ type: "progress", loaded: total, total });
-    }
+    postMessage({ type: "progress", loaded: bytes.byteLength, total: bytes.byteLength });
     return bytes;
   }
   const reader = resp.body.getReader();
@@ -220,6 +219,13 @@ async function fetchWasm(): Promise<ArrayBuffer> {
     }
     chunks.push(value);
     loaded += value.byteLength;
+    // More bytes than the denominator allows for means the denominator is not
+    // this artifact's — a wasm rebuilt since `make web` measured it. Drop it
+    // and finish indeterminate, which is the same honesty the bar already
+    // shows when nobody supplied one at all.
+    if (total && loaded > total) {
+      total = 0;
+    }
     const pct = total ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
     if (pct !== lastPct || (total === 0 && loaded - lastMiB >= 1 << 20)) {
       lastPct = pct;
@@ -233,12 +239,15 @@ async function fetchWasm(): Promise<ArrayBuffer> {
     bytes.set(chunk, off);
     off += chunk.byteLength;
   }
-  postMessage({ type: "progress", loaded, total });
+  // The last word on the size is the count, not the estimate: whatever the
+  // denominator was, the download is over and this many bytes arrived. A bar
+  // driven off a flag that was a little stale lands on 100% rather than near it.
+  postMessage({ type: "progress", loaded, total: loaded });
   return bytes.buffer;
 }
 
 async function run(): Promise<void> {
-  postLog("fetching wasm");
+  postLog("fetching wasm", "fetching");
   const bytes = await fetchWasm();
   const fds: Array<Fd | undefined> = [
     new StdinFd(stdin),
@@ -256,11 +265,11 @@ async function run(): Promise<void> {
   ];
   const wasiInstance = new WASI(["smolbox.wasm"], [], fds as Fd[]);
   patchPollOneoff(wasiInstance, stdin);
-  postLog("instantiating wasm");
+  postLog("instantiating wasm", "instantiating");
   const result = await WebAssembly.instantiate(bytes, {
     wasi_snapshot_preview1: wasiInstance.wasiImport,
   });
-  postLog("booting the VM");
+  postLog("booting the VM", "booting");
   const instance = result.instance as unknown as {
     exports: { memory: WebAssembly.Memory; _start: () => unknown };
   };

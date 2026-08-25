@@ -514,6 +514,27 @@ Two things the e2e suites read that must keep working: the per-file model progre
 (`[smolagent] loading <file>: <pct>%`, counted by `model-cache.spec.ts`) and the chips'
 `data-state` attribute (`settings.spec.ts`, `agent-console.spec.ts`).
 
+### The VM's phase is named by the worker, not guessed from its log line
+`web/src/vm-status.ts` owns the mapping from a phase to what either page shows, and
+`web/src/worker.ts` tags the phase onto the log message it already posts. Both pages used to work
+out where the VM was by comparing that message against the string `"fetching wasm"`, which left the
+VM page's header frozen on "booting the VM" and the agent page's chip frozen on "downloading" — see
+§10.26. Two rules keep it fixed: **the worker names its phase, callers never parse the text**, and
+**both pages listen for `ready` and `exit`**, because the worker boots the VM on its own and a
+display that waits for the start button before it will say so is describing the button. A log line
+with *no* phase is the boot watchdog's stall report and is still shown verbatim; it is the only
+diagnostic the VM page has for a VM that never comes up.
+
+The download bar needs a denominator and the response cannot always supply one: GitHub Pages serves
+`smolbox.wasm` gzipped and sends no `X-Uncompressed-Length` (which is `web/serve.ts`'s own header),
+and nothing in the browser can recover the identity size. So `make web` measures the file and bakes
+it in as `SMOLBOX_WASM_BYTES` — the third build define, same shape and same reason as `SMOLBOX_BASE`
+— and `downloadTotal()` in `web/src/wasm-size.ts` consults it *last*, behind both headers, because
+it is the only source that can go stale. **A rule with teeth: never give the bar a denominator that
+measures the encoded bytes.** And `hidden` on a `<progress>` needs `progress[hidden] {display:none}`
+in `web/style.css` to survive the `display: block` above it — an author `display` outranks the UA
+sheet's, which is how a finished bar stayed on screen for two weeks.
+
 ### Testing
 - `tests/integration/` and `tests/conformance/` are behind the `integration` build tag and require
   `dist/smolbox.wasm`. The integration suite is session-lifecycle only; all behaviour lives in the
