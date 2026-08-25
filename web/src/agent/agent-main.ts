@@ -6,6 +6,7 @@
 // The loop itself lives in conversation.ts, which knows nothing about the DOM or
 // about WebGPU — that is what lets CI drive it against FakeModelClient.
 
+import { asset } from "../base.ts";
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { Session } from "../session.ts";
@@ -18,6 +19,7 @@ import { dialectFor } from "./dialects/index.ts";
 import {
   DEFAULT_MODEL_KEY,
   type Dtype,
+  LOCAL_MODEL_PATH,
   type ModelEntry,
   dtypeBlockers,
   modelFor,
@@ -43,7 +45,7 @@ let currentModelKey = unavailableReason(modelFor(DEFAULT_MODEL_KEY))
   ? selectableModels()[0]!.key
   : DEFAULT_MODEL_KEY;
 
-const probeFor = (repo: string) => `/models/${repo}/config.json`;
+const probeFor = (repo: string) => `${LOCAL_MODEL_PATH}${repo}/config.json`;
 
 const SYSTEM_PROMPT = `You are smolbox, an assistant with access to a Linux sandbox.
 
@@ -92,7 +94,7 @@ function modelIsFine(): void {
   status.model("ready", modelLabel);
 }
 
-const vmWorker = new Worker("/worker.js", { type: "module" });
+const vmWorker = new Worker(asset("worker.js"), { type: "module" });
 const session = new Session(vmWorker);
 const mount = new MountHost();
 

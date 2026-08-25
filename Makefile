@@ -2,6 +2,7 @@ SHELL := /bin/bash
 
 BIN         := bin
 DIST        := dist
+SITE        := _site
 WASM        := $(DIST)/smolbox.wasm
 DOCKER_SOCK := /var/run/docker.sock
 
@@ -9,7 +10,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all everything build wasm vm-image builder-image require-docker web web-local serve compress generate model models gemma-kernels \
+.PHONY: all everything build wasm vm-image builder-image require-docker web web-local site serve compress generate model models gemma-kernels \
         test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
         test-e2e-agent-smoke test-e2e-agent-firefox \
         test-conformance lint clean
@@ -101,19 +102,48 @@ build:
 # offered model a visitor can actually load.
 SMOLBOX_MODEL_SOURCE ?= hub
 
+# Where the site is served from. `/` (the default) is what `make serve` hosts
+# and what a custom domain or a user/org Pages site gets; a project Pages site
+# lives under the repo name, so that deployment builds with `/smolbox/`.
+#
+# Baked into the bundle for the same reason as the model source above: web/dist
+# is static and `make compress` writes .br/.gz variants beside every file, so
+# there is nothing left for a server to rewrite on the way out. See
+# web/src/base.ts.
+#
+#   make web                          the root
+#   SMOLBOX_BASE=/smolbox/ make web   https://<user>.github.io/smolbox/
+SMOLBOX_BASE ?= /
+
 web:
 	@case "$(SMOLBOX_MODEL_SOURCE)" in \
 		hub|local) ;; \
 		*) echo "error: SMOLBOX_MODEL_SOURCE must be 'hub' or 'local', got '$(SMOLBOX_MODEL_SOURCE)'" >&2; exit 1 ;; \
 	esac
-	@echo "web: model source is $(SMOLBOX_MODEL_SOURCE)"
+	@# A base must start and end with a slash. base.ts normalises anything else
+	@# rather than throwing — a page that refuses to start is the worse failure —
+	@# so this is where a typo gets caught, while there is still a human reading.
+	@# `/` is spelled out separately: the glob `/*/` needs two slashes, so the
+	@# default — the most common value there is — would not match it.
+	@case "$(SMOLBOX_BASE)" in \
+		/|/*/) ;; \
+		*) echo "error: SMOLBOX_BASE must start and end with '/', got '$(SMOLBOX_BASE)'" >&2; exit 1 ;; \
+	esac
+	@echo "web: model source is $(SMOLBOX_MODEL_SOURCE), base is $(SMOLBOX_BASE)"
 	mkdir -p web/dist
-	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist
+	bun build web/src/worker.ts web/src/main.ts --target=browser --outdir web/dist \
+		--define SMOLBOX_BASE='"$(SMOLBOX_BASE)"'
 	cp web/index.html web/dist/index.html
 	@# Both pages link this; it holds the tokens, the controls and the terminal
 	@# styling they share (the agent page grew a terminal of its own at the
 	@# console panel, and two copies of those rules had already drifted once).
 	cp web/style.css web/dist/style.css
+	@# Cross-origin isolation for a host that cannot send COOP/COEP itself.
+	@# Copied rather than bundled: a service worker registered as a module is
+	@# still unsupported in Firefox, and Firefox is the browser this project
+	@# cares about (it is the one without showDirectoryPicker). Shipped in every
+	@# build because it does nothing when the server already sends the headers.
+	cp web/coi-serviceworker.js web/dist/coi-serviceworker.js
 	@# The VM artifacts stay in dist/ and are served from there (web/serve.ts
 	@# resolves them via DIST_DIR); web/dist holds only the bundles.
 	mkdir -p web/dist/agent web/dist/ort
@@ -121,7 +151,8 @@ web:
 	@# process.env would not survive a browser build, which has no process.
 	bun build web/src/agent/agent-main.ts web/src/agent/model-worker.ts \
 		--target=browser --outdir web/dist/agent \
-		--define SMOLBOX_MODEL_SOURCE='"$(SMOLBOX_MODEL_SOURCE)"'
+		--define SMOLBOX_MODEL_SOURCE='"$(SMOLBOX_MODEL_SOURCE)"' \
+		--define SMOLBOX_BASE='"$(SMOLBOX_BASE)"'
 	cp web/agent.html web/dist/agent/index.html
 	@# onnxruntime-web otherwise pulls these from jsdelivr at runtime; serving them
 	@# locally keeps the page pinned to the installed version and works offline.
@@ -195,6 +226,56 @@ web-local:
 	@SMOLBOX_MODEL_SOURCE=local $(MAKE) web
 	@echo "note: web/dist now loads weights from dist/models; 'make web' restores the hub build"
 
+# The directory a static host publishes: one flat tree with the site at its root,
+# rather than the two `make serve` stitches together (web/dist for the bundles,
+# dist/ for the VM). GitHub Pages uploads a directory and serves it verbatim —
+# there is no server there to do the stitching, so the build does it.
+#
+# What lands in it and what does not:
+#
+#   web/dist/*         the bundles, the two pages, the service worker, /ort/
+#   dist/smolbox.wasm  the VM, at the root, where worker.js resolves it
+#   .nojekyll          or Pages runs the tree through Jekyll and drops every
+#                      path beginning with an underscore
+#
+# No .br/.gz: they are dead weight on a host that will not negotiate them (Pages
+# picks the encoding itself and has never heard of the siblings `make compress`
+# writes), and they would roughly double a payload that has a 1 GB ceiling. Any
+# left over from a previous `make compress` are deleted rather than copied.
+#
+# No weights: a hub build reads every checkpoint from huggingface.co, which is
+# the whole reason `hub` is the default (web/src/agent/model-source.ts). The
+# local shelf is ~11 GB against Pages' 1 GB limit, so the guard below refuses
+# rather than letting the upload fail eleven times over.
+#
+# The one number to keep an eye on is smolbox.wasm itself, at ~150 MB. The site
+# total is far under the 1 GB cap, but a single file that size is larger than
+# anything GitHub documents for Pages, so the deploy workflow HEADs it after
+# publishing rather than assuming. If that check ever fails, the fallback is to
+# publish the gzip variant instead and inflate it in the page: `make compress`
+# already writes dist/smolbox.wasm.gz at ~58 MB, DecompressionStream("gzip") is
+# in every browser this project supports, and web/src/worker.ts already streams
+# the download through a reader it could pipe through one. That costs a
+# decompression pass on every cold load, which is why it is a fallback and not
+# the default.
+site:
+	@if [ "$(SMOLBOX_MODEL_SOURCE)" != "hub" ]; then \
+		echo "error: 'site' builds a deployment, which reads weights from the hub;" >&2; \
+		echo "       SMOLBOX_MODEL_SOURCE=$(SMOLBOX_MODEL_SOURCE) would need dist/models published" >&2; \
+		echo "       (~11 GB, against a 1 GB GitHub Pages limit)" >&2; \
+		exit 1; \
+	fi
+	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first" >&2; exit 1; }
+	$(MAKE) web SMOLBOX_BASE=$(SMOLBOX_BASE) SMOLBOX_MODEL_SOURCE=hub
+	rm -rf $(SITE)
+	mkdir -p $(SITE)
+	cp -R web/dist/. $(SITE)/
+	find $(SITE) \( -name '*.br' -o -name '*.gz' \) -delete
+	cp $(WASM) $(SITE)/smolbox.wasm
+	touch $(SITE)/.nojekyll
+	@echo ""
+	@echo "site: $(SITE)/ is $$(du -sh $(SITE) | cut -f1) and serves from $(SMOLBOX_BASE)"
+
 serve:
 	bun web/serve.ts
 
@@ -258,4 +339,4 @@ lint:
 	bunx --bun tsc --noEmit -p web/tsconfig.json
 
 clean:
-	rm -rf $(DIST) $(BIN) web/dist
+	rm -rf $(DIST) $(BIN) web/dist $(SITE)

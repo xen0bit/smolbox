@@ -145,17 +145,20 @@ export async function handle(request: Request): Promise<Response> {
  *
  * Three tiers. HTML is `no-cache`: it is tiny, and it is the anchor every other
  * resource revalidates against, so a stale one strands the whole page on an old
- * bundle. `/ort/` is `immutable`: `make web` copies it verbatim out of
- * node_modules, so it cannot change unless bun.lock does, and a new version
- * arrives under a filename carrying its own hash. Everything else revalidates
- * daily, because a rebuild rewrites it in place under the same name.
+ * bundle. coi-serviceworker.js joins it there for a stronger reason: a stale
+ * service worker keeps controlling every request on the origin, so a bad one
+ * that got cached is a site that cannot be fixed by redeploying it. `/ort/` is
+ * `immutable`: `make web` copies it verbatim out of node_modules, so it cannot
+ * change unless bun.lock does, and a new version arrives under a filename
+ * carrying its own hash. Everything else revalidates daily, because a rebuild
+ * rewrites it in place under the same name.
  *
  * Weights are in the "everything else" tier and stay there: an entry that size
  * never reaches the HTTP cache in the first place, which is exactly why they
  * are cached in IndexedDB instead (web/src/agent/model-cache.ts).
  */
 export function cacheControl(pathname: string): string {
-  if (pathname.endsWith("index.html")) {
+  if (pathname.endsWith("index.html") || pathname.endsWith("/coi-serviceworker.js")) {
     return "no-cache";
   }
   if (pathname.startsWith("/ort/")) {

@@ -1,0 +1,151 @@
+# Publishes the browser runtime to GitHub Pages.
+#
+# The payload is `make site`: the two pages, their bundles, the onnxruntime
+# builds and dist/smolbox.wasm, in one flat tree. No weights — a deployment is a
+# `hub` build, so every checkpoint comes from huggingface.co and the visitor
+# needs nothing from us but the page (see web/src/agent/model-source.ts).
+#
+# Two things about Pages shape this file, and both are handled in the build
+# rather than here, because there is no server on the other end to handle them:
+#
+#   No response headers. Pages sends no Cross-Origin-Opener-Policy and no
+#   Cross-Origin-Embedder-Policy and offers no way to add them, so nothing that
+#   needs SharedArrayBuffer — the terminal, the FS bridge, onnxruntime's
+#   threaded builds — would work. web/coi-serviceworker.js installs them from a
+#   service worker instead.
+#
+#   No root. A project site is served from https://<user>.github.io/<repo>/, so
+#   the bundle is built with SMOLBOX_BASE set to that prefix (web/src/base.ts).
+#   The prefix is read from the deployment itself rather than hardcoded, so a
+#   fork, a rename, or a move to a custom domain deploys correctly with no edit
+#   here.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one in flight: a half-uploaded
+# site is a broken site.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.18"
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ hashFiles('bun.lock') }}
+
+      - name: Install web deps
+        run: bun install --frozen-lockfile
+
+      # Turns Pages on if it is not on already, and — the reason it is here —
+      # reports the URL the site will be served from. `base_path` is the path
+      # component of that URL, which is exactly what SMOLBOX_BASE wants.
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      # The same key ci.yml uses, so the ~150 MB VM is built once per change to
+      # the things that determine it and reused everywhere else.
+      - name: Cache dist/smolbox.wasm
+        uses: actions/cache@v4
+        with:
+          path: dist/smolbox.wasm
+          key: smolbox-wasm-${{ hashFiles('vm/Dockerfile', 'guest/**', 'build/Dockerfile.c2w', 'go.mod', 'go.sum') }}
+
+      # `make wasm` drives BuildKit through the runner's Docker daemon, which
+      # ubuntu-latest has. Skipped outright on a cache hit — it is the long pole
+      # in this job by a wide margin.
+      - name: Build wasm (if not cached)
+        run: |
+          if [ ! -f dist/smolbox.wasm ]; then
+            make wasm
+          fi
+
+      # base_path is "/" for a user/org site or a custom domain and "/<repo>/"
+      # for a project site; `make web` requires both slashes, so a bare "/repo"
+      # is normalised here rather than being left to fail the build's check.
+      - name: Build site
+        run: |
+          base="${{ steps.pages.outputs.base_path }}"
+          case "$base" in
+            "" ) base="/" ;;
+            */ ) ;;
+            *  ) base="$base/" ;;
+          esac
+          echo "building for base $base"
+          make site SMOLBOX_BASE="$base"
+
+      # Pages caps a published site at 1 GB. A hub build is ~230 MB of which
+      # ~150 MB is the VM, so this is not close — but it is the number that
+      # would grow silently if weights ever ended up in the payload, and a
+      # failure here is much easier to read than one from the upload.
+      - name: Check the payload against the Pages limit
+        run: |
+          bytes=$(du -sb _site | cut -f1)
+          echo "_site is $(du -sh _site | cut -f1) ($bytes bytes)"
+          echo "largest files:"
+          find _site -type f -printf '%s\t%p\n' | sort -rn | head -5 | \
+            awk -F'\t' '{printf "  %6.1f MB  %s\n", $1/1048576, $2}'
+          if [ "$bytes" -gt 1000000000 ]; then
+            echo "::error::_site exceeds the 1 GB GitHub Pages limit"
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      # The deploy step reports success as soon as the artifact is published,
+      # which says nothing about whether Pages will actually serve a 150 MB
+      # file — a size larger than anything GitHub documents for a Pages site.
+      # So ask it for one, and fail loudly rather than leaving a site that
+      # loads and then stalls on the VM download.
+      - name: Smoke-test the published site
+        run: |
+          url="${{ steps.deployment.outputs.page_url }}"
+          url="${url%/}"
+          for path in "/" "/agent/" "/coi-serviceworker.js"; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 5 \
+              --retry-all-errors "$url$path")
+            echo "$path -> $code"
+            [ "$code" = "200" ] || { echo "::error::$path returned $code"; exit 1; }
+          done
+          # The VM, by its Content-Length rather than by downloading it.
+          len=$(curl -sSI --retry 5 --retry-delay 5 --retry-all-errors "$url/smolbox.wasm" \
+            | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
+          echo "/smolbox.wasm -> ${len:-no content-length}"
+          if [ -z "$len" ] || [ "$len" -lt 1000000 ]; then
+            echo "::error::Pages is not serving the VM artifact; see the note in Makefile's site target"
+            exit 1
+          fi

@@ -212,6 +212,12 @@ describe("cacheControl", () => {
     expect(cacheControl("/agent/index.html")).toBe("no-cache");
   });
 
+  test("the service worker never sticks either", () => {
+    // A stale one keeps controlling every request on the origin, so a cached
+    // bad worker is a site a redeploy cannot fix.
+    expect(cacheControl("/coi-serviceworker.js")).toBe("no-cache");
+  });
+
   test("the pinned onnxruntime build is immutable", () => {
     expect(cacheControl("/ort/ort-wasm-simd-threaded.jsep.wasm")).toContain("immutable");
   });
