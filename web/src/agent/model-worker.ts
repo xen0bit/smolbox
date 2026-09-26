@@ -19,7 +19,9 @@ import {
 } from "@huggingface/transformers";
 
 import { asset } from "../base.ts";
+import { type PromptCodec, loadBonsai } from "./bonsai-kernels.ts";
 import { GemmaKernelEngine } from "./gemma-kernels.ts";
+import type { KernelEngine } from "./kernel-engine.ts";
 import { ModelCache } from "./model-cache.ts";
 import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
 import {
@@ -143,7 +145,11 @@ let model: PreTrainedModel | null = null;
 // The other engine. Exactly one of `model` and `kernels` is ever set; which one
 // is decided by the registry entry's backend, and nothing above this worker
 // knows the difference.
-let kernels: GemmaKernelEngine | null = null;
+let kernels: KernelEngine | null = null;
+// Set instead of `tokenizer` for a backend whose checkpoint has no
+// transformers.js tokenizer at all: the Bonsai GGUF carries its tokenizer and
+// template in its own metadata, so the engine supplies both (bonsai-kernels.ts).
+let codec: PromptCodec | null = null;
 // The kernel path has no InterruptableStoppingCriteria to hand to a library —
 // it is our own loop — so cancellation is a flag it polls.
 let cancelRequested = false;
@@ -267,7 +273,32 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // The revision is passed so the hub path honours the pin the registry exists
   // to hold; it is ignored for a local load, where the path carries no revision.
   //
-  // The tokenizer is loaded the same way for BOTH backends. The kernel engine
+  if (entry.backend === "bonsai-kernels") {
+    // No AutoTokenizer: this repo is one GGUF and nothing else. The engine
+    // reads the tokenizer and template out of the file's metadata.
+    tokenizer = null;
+    chatTemplate = null;
+    const url = bonsaiWeightUrl(entry, local);
+    const loadedEngine = await loadBonsai(url, (p) => {
+      if (typeof p.fraction === "number") {
+        postProgress(p.message ?? "weights", Math.round(p.fraction * 100));
+      }
+    });
+    kernels = loadedEngine.engine;
+    codec = loadedEngine.codec;
+    post({ type: "log", message: `bonsai kernels on ${kernels.info()}` });
+    post({
+      type: "ready",
+      source: local ? "local" : "hub",
+      loadMs: Math.round(performance.now() - started),
+      modelKey: entry.key,
+      dtype,
+    });
+    return;
+  }
+  codec = null;
+
+  // The tokenizer is loaded the same way for both of the backends that have one. The kernel engine
   // has one of its own, but it renders the chat template with `tools: null` and
   // decodes with skip_special_tokens — neither of which this project can use, so
   // the prompt and the decode come from here regardless of what runs the
@@ -298,6 +329,24 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
     modelKey: entry.key,
     dtype,
   });
+}
+
+/**
+ * Where the Bonsai engine reads its one GGUF from.
+ *
+ * Always a full URL ending in `.gguf`: the engine treats any id with that
+ * suffix as the file itself, so a hub load names the pinned revision here
+ * rather than trusting the engine's default of `main`. The local path is
+ * resolved against the worker's own URL, as the engine would.
+ */
+function bonsaiWeightUrl(entry: ModelEntry, local: boolean): string {
+  const file = entry.ggufFile;
+  if (!file) {
+    throw new Error(`${entry.key}: a bonsai-kernels entry must name its ggufFile`);
+  }
+  return local
+    ? new URL(`${LOCAL_MODEL_PATH}${entry.repo}/${file}`, (globalThis as { location?: { href: string } }).location?.href).href
+    : `https://huggingface.co/${entry.repo}/resolve/${entry.revision}/${file}`;
 }
 
 function loadWeights(entry: ModelEntry, dtype: Dtype): Promise<PreTrainedModel> {
@@ -396,17 +445,37 @@ async function loadChatTemplate(entry: ModelEntry, local: boolean): Promise<stri
   }
 }
 
+/** The refusal the loop elides history for and retries once. */
+function promptTooLong(promptTokens: number, limit: number): WorkerError {
+  return new WorkerError(
+    `prompt is ${promptTokens} tokens; ${loaded?.label ?? "this model"} is held to ${limit} ` +
+      `(its context window, or the loop's working budget, whichever is smaller). ` +
+      `Shorten the conversation — lowering the prompt budget is what makes the loop do that.`,
+    "prompt-too-long",
+    limit,
+    promptTokens,
+  );
+}
+
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
-  if (!tokenizer || !(model || kernels)) {
+  if (!(tokenizer || codec) || !(model || kernels)) {
     // Either nothing was ever loaded — an error — or a device loss dropped the
     // session and this is the request that pays for rebuilding it.
     await reload();
   }
-  if (!tokenizer || !(model || kernels)) {
+  if (!(tokenizer || codec) || !(model || kernels)) {
     throw new Error("generate before ready");
   }
   stopper.reset();
   cancelRequested = false;
+
+  if (codec) {
+    await generateWithCodec(req, codec);
+    return;
+  }
+  if (!tokenizer) {
+    throw new Error("generate before ready");
+  }
 
   const prompt = tokenizer.apply_chat_template(req.messages, {
     tools: req.tools,
@@ -428,21 +497,16 @@ async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promi
   const promptTokens = (inputs.input_ids as { dims: number[] }).dims.at(-1) ?? 0;
   const limit = loaded ? maxPromptTokens(loaded) : Infinity;
   if (promptTokens > limit) {
-    throw new WorkerError(
-      `prompt is ${promptTokens} tokens; ${loaded?.label ?? "this model"} is held to ${limit} ` +
-        `(its context window, or the loop's working budget, whichever is smaller). ` +
-        `Shorten the conversation — lowering the prompt budget is what makes the loop do that.`,
-      "prompt-too-long",
-      limit,
-      promptTokens,
-    );
+    throw promptTooLong(promptTokens, limit);
   }
 
   const started = performance.now();
   const maxNewTokens = req.maxNewTokens ?? loaded?.generation?.max_new_tokens ?? 256;
 
   if (kernels) {
-    await generateWithKernels(req, prompt, inputs, maxNewTokens, started, {
+    const tok = tokenizer;
+    const promptIds = ((inputs as { input_ids: { tolist(): number[][] } }).input_ids.tolist()[0] ?? []).map(Number);
+    await generateWithKernels(req, prompt, promptIds, (ids) => tok.decode(ids, { skip_special_tokens: false }), maxNewTokens, started, {
       promptTokens,
       limitTokens: Number.isFinite(limit) ? limit : 0,
     });
@@ -610,6 +674,30 @@ async function prefillAndGenerate(
 }
 
 /**
+ * A turn on a backend that brought its own codec (bonsai-kernels.ts).
+ *
+ * The same guard and the same kernel loop as the transformers.js-tokenized
+ * path; only where the prompt's ids come from differs.
+ */
+async function generateWithCodec(
+  req: Extract<ModelRequest, { type: "generate" }>,
+  c: PromptCodec,
+): Promise<void> {
+  const prompt = c.render(req.messages, req.tools);
+  const promptIds = c.encode(prompt);
+  const promptTokens = promptIds.length;
+  const limit = loaded ? maxPromptTokens(loaded) : Infinity;
+  if (promptTokens > limit) {
+    throw promptTooLong(promptTokens, limit);
+  }
+  const maxNewTokens = req.maxNewTokens ?? loaded?.generation?.max_new_tokens ?? 256;
+  await generateWithKernels(req, prompt, promptIds, (ids) => c.decode(ids), maxNewTokens, performance.now(), {
+    promptTokens,
+    limitTokens: Number.isFinite(limit) ? limit : 0,
+  });
+}
+
+/**
  * The kernel backend's half of generate().
  *
  * Everything before this point — the chat template with its tool schema, the
@@ -630,24 +718,21 @@ async function prefillAndGenerate(
 async function generateWithKernels(
   req: Extract<ModelRequest, { type: "generate" }>,
   prompt: string,
-  inputs: unknown,
+  promptIds: number[],
+  decode: (ids: number[]) => string,
   maxNewTokens: number,
   started: number,
   /** The prompt guard's two numbers, so the loop can calibrate off this engine too. */
   measured: { promptTokens: number; limitTokens: number },
 ): Promise<void> {
-  const tok = tokenizer!;
   const engine = kernels!;
-  const promptIds = ((inputs as { input_ids: { tolist(): number[][] } }).input_ids.tolist()[0] ?? []).map(
-    Number,
-  );
 
   const produced: number[] = [];
   let emitted = "";
   try {
     for await (const id of engine.stream(promptIds, maxNewTokens, () => cancelRequested)) {
       produced.push(id);
-      const text = tok.decode(produced, { skip_special_tokens: false });
+      const text = decode(produced);
       if (text.startsWith(emitted)) {
         post({ type: "token", id: req.id, text: text.slice(emitted.length) });
       }
@@ -694,6 +779,7 @@ async function handleRunFailure(err: unknown): Promise<Error> {
   model = null;
   kernels = null;
   tokenizer = null;
+  codec = null;
   // Before the session, not after: the cache's buffers belong to the device that
   // just failed, and a cache that outlived its session would be handed to the
   // rebuilt one as though it described something it has never seen.

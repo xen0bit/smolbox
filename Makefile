@@ -10,7 +10,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all everything build wasm vm-image builder-image require-docker web web-local site serve compress generate model models gemma-kernels \
+.PHONY: all everything build wasm vm-image builder-image require-docker web web-local site serve compress generate model models gemma-kernels bonsai-kernels \
         test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
         test-e2e-agent-smoke test-e2e-agent-firefox \
         test-conformance lint clean
@@ -37,8 +37,9 @@ RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IM
 
 # The order is load-bearing, not cosmetic:
 #
-#   gemma-kernels before      the kernel engine is a .js file under dist and
-#     compress                gets encoded like everything else.
+#   gemma-kernels and         the kernel engines are .js files under dist and
+#     bonsai-kernels before   get encoded like everything else.
+#     compress
 #   compress before models    weights are excluded from compression anyway, so
 #                             putting the 11 GB pull last means a dropped
 #                             connection costs you the download and not also
@@ -52,6 +53,7 @@ everything:
 	$(MAKE) wasm
 	$(MAKE) web
 	$(MAKE) gemma-kernels
+	$(MAKE) bonsai-kernels
 	$(MAKE) compress
 	$(MAKE) models
 	@echo ""
@@ -219,15 +221,21 @@ models:
 	fi; \
 	echo ""; \
 	echo "all downloadable registry entries are in $(DIST)/models"; \
-	echo "note: gemma4-e2b also needs 'make gemma-kernels' for the engine"
+	echo "note: gemma4-e2b also needs 'make gemma-kernels', and bonsai2-27b 'make bonsai-kernels', for their engines"
 
-# The Gemma 4 WebGPU kernel engine. Downloaded rather than vendored: the Space
-# that publishes it declares no license, so a pinned pull into gitignored dist/
-# is the honest way to depend on it (web/fetch-kernels.ts). web/serve.ts serves
-# it at /kernels/ straight out of dist, exactly as it does the weights, and the
-# agent page imports it dynamically and says to run this when it is absent.
+# The Gemma 4 WebGPU kernel engine, pulled at a pinned revision into dist/kernels
+# (web/fetch-kernels.ts) — a build artifact of an upstream project, kept out of
+# git like the wasm and the weights. web/serve.ts serves it at /kernels/, `make
+# site` ships it with the deployment, and the agent page imports it dynamically
+# and says to run this when it is absent.
 gemma-kernels:
-	bun web/fetch-kernels.ts
+	bun web/fetch-kernels.ts gemma
+
+# The Ternary Bonsai 2 engine, the same way. Its Space publishes no module at
+# all, so the fetcher cuts the engine out of the Space's index.html
+# (web/src/agent/bonsai-extract.ts, PLAN §10.28).
+bonsai-kernels:
+	bun web/fetch-kernels.ts bonsai
 
 # Writes a .br and a .gz beside every compressible artifact in dist/. serve.ts
 # picks them up automatically; without them it serves identity and nothing
@@ -287,9 +295,12 @@ site:
 	fi
 	@test -f "$(WASM)" || { echo "error: $(WASM) missing; run 'make wasm' first" >&2; exit 1; }
 	$(MAKE) web SMOLBOX_BASE=$(SMOLBOX_BASE) SMOLBOX_MODEL_SOURCE=hub
+	$(MAKE) gemma-kernels
+	$(MAKE) bonsai-kernels
 	rm -rf $(SITE)
 	mkdir -p $(SITE)
 	cp -R web/dist/. $(SITE)/
+	cp -R $(DIST)/kernels $(SITE)/kernels
 	find $(SITE) \( -name '*.br' -o -name '*.gz' \) -delete
 	cp $(WASM) $(SITE)/smolbox.wasm
 	touch $(SITE)/.nojekyll

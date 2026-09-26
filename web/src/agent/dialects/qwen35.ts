@@ -74,7 +74,7 @@ function coerce(value: string): unknown {
 }
 
 /** The calls inside one `<tool_call>` body. */
-function parseXmlCall(body: string): ParsedCall {
+export function parseXmlCall(body: string): ParsedCall {
   const name = FUNCTION_NAME.exec(body)?.[1];
   if (!name) {
     throw new ToolCallParseError(

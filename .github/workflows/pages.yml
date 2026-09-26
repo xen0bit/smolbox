@@ -135,7 +135,8 @@ jobs:
         run: |
           url="${{ steps.deployment.outputs.page_url }}"
           url="${url%/}"
-          for path in "/" "/agent/" "/coi-serviceworker.js"; do
+          for path in "/" "/agent/" "/coi-serviceworker.js" \
+              "/kernels/gemma4/gemma-4-e2b.js" "/kernels/bonsai/ternary-bonsai-2.js"; do
             code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 5 \
               --retry-all-errors "$url$path")
             echo "$path -> $code"

@@ -76,8 +76,17 @@ if (dtypeArg && !entry.dtypes.includes(dtypeArg as Dtype)) {
 }
 const dtype = (dtypeArg as Dtype | undefined) ?? entry.dtypes[0]!;
 const layout = entry.weights ?? "onnx";
-const weights = weightFiles(dtype, layout, entry.components);
+// A GGUF is the whole checkpoint: tokenizer, template and config live in its
+// metadata, and the repo has no config.json or tokenizer.json to ask for.
+const gguf = layout === "gguf";
+if (gguf && !entry.ggufFile) {
+  say(`${entry.key}: a gguf entry must name its ggufFile`);
+  process.exit(1);
+}
+const weights = gguf ? { required: [entry.ggufFile!], optional: [] } : weightFiles(dtype, layout, entry.components);
 const extras = layout === "safetensors" ? SAFETENSORS_EXTRA_FILES : [];
+const baseRequired = gguf ? [] : REQUIRED_FILES;
+const baseOptional = gguf ? [] : OPTIONAL_FILES;
 
 const outRoot = path.join("dist", "models", entry.repo);
 
@@ -192,10 +201,10 @@ say(
 );
 
 let total = 0;
-for (const rel of [...REQUIRED_FILES, ...extras, ...weights.required]) {
+for (const rel of [...baseRequired, ...extras, ...weights.required]) {
   total += await fetchFile(rel, false);
 }
-for (const rel of [...OPTIONAL_FILES, ...weights.optional]) {
+for (const rel of [...baseOptional, ...weights.optional]) {
   total += await fetchFile(rel, true);
 }
 say(`done: ${human(total)}`);

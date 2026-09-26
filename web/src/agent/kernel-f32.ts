@@ -35,8 +35,7 @@
 // are untouched, because they were never f16 to begin with.
 //
 // WHY REWRITE RATHER THAN FORK. The engine is a pinned, downloaded artifact
-// (web/fetch-kernels.ts explains why it is not vendored: the Space declares no
-// license). `Gemma4Mobile.load()` exposes no dtype option, so there is no seam
+// (pulled at a pinned revision by web/fetch-kernels.ts). `Gemma4Mobile.load()` exposes no dtype option, so there is no seam
 // to pass this through. Rewriting the fetched text keeps the artifact on disk
 // byte-identical to what the Space published, keeps the f16 fast path exactly as
 // it was on adapters that have the feature, and confines the change to three

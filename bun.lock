@@ -6,6 +6,7 @@
       "name": "smolbox",
       "dependencies": {
         "@bjorn3/browser_wasi_shim": "0.4.2",
+        "@huggingface/jinja": "0.5.9",
         "@huggingface/transformers": "^4.2.0",
       },
       "devDependencies": {
