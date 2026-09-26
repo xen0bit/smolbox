@@ -58,4 +58,13 @@ RUN for i in $(seq 1 10); do \
         echo "assets clone attempt $i failed, retrying"; rm -rf /assets; sleep 3; \
     done
 
+# The embedded Dockerfile's two rust:1.74.1-bullseye stages apt-install tools the
+# image already ships, and apt upgrades them from bullseye-security. Bullseye is
+# past LTS: that suite's index still lists deb11u* builds whose pool files 404,
+# so the install fails. Drop the suite in those stages and build from the patched
+# copy (`make wasm` passes --dockerfile). Exactly two lines must match. §10.27.
+RUN c2w --show-dockerfile > /c2w.Dockerfile \
+    && sed -i 's|^RUN apt-get update -y && apt-get install -y make curl git gcc xz-utils$|RUN sed -i "/debian-security/d" /etc/apt/sources.list \&\& apt-get update -y \&\& apt-get install -y make curl git gcc xz-utils|' /c2w.Dockerfile \
+    && test "$(grep -c '^RUN sed -i "/debian-security/d" /etc/apt/sources.list' /c2w.Dockerfile)" = 2
+
 ENTRYPOINT ["/usr/local/bin/c2w"]

@@ -90,10 +90,16 @@ Everything gate = `make lint test` then `make test-integration` + `make test-con
    reach for it.
 2. `build/Dockerfile.c2w` — **builds** the VM: installs docker CLI + buildx + the pinned c2w release
    (checksum-verified). It also clones `container2wasm/container2wasm@v0.8.4` to `/assets`.
-3. `make wasm` runs `c2w --assets /assets smolbox/vm:dev /out/smolbox.wasm` against the host daemon.
+3. `make wasm` runs `c2w --assets /assets --dockerfile /c2w.Dockerfile smolbox/vm:dev /out/smolbox.wasm`
+   against the host daemon.
 
 **Gotcha:** c2w v0.8.4's embedded Dockerfile clones a nonexistent `ktock/container2wasm -b v0.8.4`
 branch; the `--assets /assets` named context shadows that broken stage. Never drop the flag.
+
+**Gotcha:** c2w's two `rust:1.74.1-bullseye` stages apt-install from `bullseye-security`, whose
+index outlived its pool after bullseye left LTS (every fetch 404s). `build/Dockerfile.c2w` dumps the
+embedded Dockerfile to `/c2w.Dockerfile` with that suite dropped, and `make wasm` builds from it via
+`--dockerfile`. Never drop that flag either (PLAN §10.27).
 
 Rebuilds are cached by BuildKit; editing `guest/` alone makes `make wasm` cheap.
 

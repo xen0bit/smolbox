@@ -80,7 +80,7 @@ wasm: vm-image builder-image
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(PWD)/$(DIST):/out \
-		$(C2W_IMAGE) --assets /assets $(VM_IMAGE) /out/smolbox.wasm
+		$(C2W_IMAGE) --assets /assets --dockerfile /c2w.Dockerfile $(VM_IMAGE) /out/smolbox.wasm
 	@$(RECLAIM_DIST)
 
 build:

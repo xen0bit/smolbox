@@ -1348,3 +1348,35 @@ after    bar=[66% … 95.3 MiB of 145.5 MiB (66%)]      chip=[loading | VM downl
 
 (`hidden*` is the attribute being set while defect 3 kept the element painted — the driver was
 reading `el.hidden`, which is why the "before" column understates how bad the VM page looked.)
+
+### 10.27 Bullseye left LTS, and c2w's emulator stages stopped building (2026-09-25)
+
+The `pages` workflow (run 36134877527, `workflow_dispatch` on `b23aecf`) failed in `make wasm`, in
+c2w's embedded `bochs-dev-common` stage:
+
+```
+E: Failed to fetch http://deb.debian.org/debian-security/pool/updates/main/g/git/git_2.30.2-1%2bdeb11u5_amd64.deb  404  Not Found
+```
+
+It reproduces outside CI against a bare `rust:1.74.1-bullseye`, so it is not a flaky mirror. Debian
+11's LTS has ended. `deb.debian.org/debian-security/dists/bullseye-security/Release` still serves an
+index (dated 2026-09-12) listing `deb11u*` builds, but their pool files are gone, and
+`archive.debian.org` has no `bullseye-security` yet. The main `bullseye` suite still resolves on
+both hosts.
+
+The stage runs `apt-get install -y make curl git gcc xz-utils`, and the image already ships all of
+those tools (git is installed at `deb11u2`). apt only fetched anything because the security index
+offered newer versions. With the `debian-security` line removed from `/etc/apt/sources.list`, the
+same install succeeds from `bullseye` main.
+
+The fix does not touch c2w itself. c2w builds from its **embedded** Dockerfile, and `/assets` is
+only a named build context. Its `--dockerfile` flag replaces that file, though, so
+`build/Dockerfile.c2w` dumps it with `c2w --show-dockerfile` to `/c2w.Dockerfile` and rewrites the
+two identical install lines (one each in `tinyemu-dev-common` and `bochs-dev-common`, both
+bullseye). `make wasm` passes `--dockerfile /c2w.Dockerfile`. The rewrite asserts that it matched
+exactly twice, so a c2w bump that changes those lines fails `make builder-image` instead of
+building the unpatched file.
+
+This only drops security updates for build-time tools in a throwaway builder stage. Nothing from
+those stages reaches the guest except the compiled emulator. When `archive.debian.org` picks up
+`bullseye-security` this could be repointed instead, but there is nothing to gain from that.

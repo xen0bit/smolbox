@@ -48,13 +48,15 @@ files already inside the VM.
 
 Run with the host Docker socket mounted, because c2w drives BuildKit through the host daemon and
 reads the source image from its image store. The `--assets /assets` flag is a **required workaround**
-(§2.11.1): it shadows the broken `assets-base` stage in c2w's embedded Dockerfile.
+(§2.11.1): it shadows the broken `assets-base` stage in c2w's embedded Dockerfile. `--dockerfile
+/c2w.Dockerfile` is the second one (§10.27): a copy of that embedded file, patched at builder-image
+time to drop the dead `bullseye-security` suite.
 
 ```
 docker run --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v $(PWD)/dist:/out \
-  smolbox/c2w-builder:dev --assets /assets smolbox/vm:dev /out/smolbox.wasm
+  smolbox/c2w-builder:dev --assets /assets --dockerfile /c2w.Dockerfile smolbox/vm:dev /out/smolbox.wasm
 ```
 
 This is why `make wasm` depends on `make vm-image` — the tag must already exist locally.
