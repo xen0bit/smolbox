@@ -26,6 +26,8 @@ export interface ChatMessage {
   content: string;
   tool_calls?: ToolCallRecord[];
   tool_call_id?: string;
+  /** Only for a dialect with `replayReasoning`; see Dialect. */
+  reasoning_content?: string;
 }
 
 /** Page -> worker. */

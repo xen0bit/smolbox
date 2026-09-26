@@ -7,6 +7,7 @@ import {
   MIN_PREFILL_CHUNK_TOKENS,
   PREFILL_CHUNK_BUDGET_BYTES,
   dtypeBlockers,
+  localProbePath,
   models,
   maxPromptChars,
   maxPromptTokens,
@@ -266,5 +267,32 @@ describe("dtypeBlockers", () => {
     const gemma = modelFor("gemma4-e2b-onnx");
     expect(gemma.inlineBytes).toBeUndefined();
     expect(dtypeBlockers(gemma, "q4", new Set())).toEqual([]);
+  });
+});
+
+describe("GGUF entries", () => {
+  const gguf = models.filter((m) => m.weights === "gguf");
+
+  test("there is one, and every one names its file", () => {
+    expect(gguf.length).toBeGreaterThan(0);
+    for (const m of gguf) {
+      expect(m.ggufFile, m.key).toMatch(/\.gguf$/);
+    }
+  });
+
+  test("the local probe asks for the file the loader reads, not a config.json the repo lacks", () => {
+    // A GGUF repo has no config.json; probing for one missed every time and a
+    // local build fell back to a 5.9 GB hub download (PLAN §10.28).
+    for (const m of gguf) {
+      expect(localProbePath(m)).toEndWith(`${m.repo}/${m.ggufFile}`);
+    }
+    const onnx = models.find((m) => (m.weights ?? "onnx") === "onnx")!;
+    expect(localProbePath(onnx)).toEndWith(`${onnx.repo}/config.json`);
+  });
+
+  test("the bonsai engine only ever gets a GGUF", () => {
+    for (const m of models.filter((e) => e.backend === "bonsai-kernels")) {
+      expect(m.weights, m.key).toBe("gguf");
+    }
   });
 });

@@ -43,4 +43,16 @@ export interface Dialect {
    * rendering the real template over both shapes.
    */
   historyStyle?: "raw" | "structured";
+  /**
+   * Whether past assistant turns carry their reasoning back into the prompt.
+   *
+   * Off by default: most templates drop or ignore it, and replaying it grows
+   * every prompt. On for a backend whose cache cannot be rewound — Ternary
+   * Bonsai 2's recurrent state — where the only way to reuse the cache is for
+   * the next prompt to reproduce the last completion token for token. Its
+   * template re-renders `reasoning_content` in exactly the bytes the model
+   * wrote, so with this set a structured turn replays `content: prose` plus
+   * `reasoning_content`, and the prefix holds (PLAN §10.28).
+   */
+  replayReasoning?: boolean;
 }

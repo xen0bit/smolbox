@@ -44,7 +44,7 @@ pure and drive it with `FakeModelClient`.
 
 | Command | Purpose |
 |---|---|
-| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm web gemma-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
+| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm web gemma-kernels bonsai-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
 | `make lint` | golangci-lint (v2) + `bunx --bun tsc --noEmit` |
 | `make test` | Go unit tests (no Docker) |
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
@@ -55,7 +55,7 @@ pure and drive it with `FakeModelClient`.
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page into `web/dist`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
-| `SMOLBOX_MODEL_SOURCE=local make web` (or `make web-local`) | the same bundle, reading weights from `dist/models` instead of huggingface.co. **The default is `hub`**, and a hub build disables any registry entry that needs something built here — today only `gemma4-e2b`, whose kernel engine is not on the hub. `make web` puts the hub build back |
+| `SMOLBOX_MODEL_SOURCE=local make web` (or `make web-local`) | the same bundle, reading weights from `dist/models` instead of huggingface.co. **The default is `hub`**, and a hub build disables any registry entry marked `requiresLocalBuild` — none today; both kernel engines ship with the site. `make web` puts the hub build back |
 | `make compress` | write a `.br` + `.gz` beside every compressible artifact in `dist/` and `web/dist`; `web/serve.ts` serves them by negotiation and falls back to identity when absent |
 | `make test-web` | `bun test web` (protocol + session + fsbridge + tool-surface + serve negotiation unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
@@ -63,7 +63,9 @@ pure and drive it with `FakeModelClient`.
 | `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by a `local` build of the agent page (M8) |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
 | `make models` | pull **every** downloadable registry entry; keeps going past a failure and reports at the end |
-| `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` (not vendored — its Space has no license) |
+| `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` |
+| `make bonsai-kernels` | extract the pinned Ternary Bonsai 2 kernel engine from its Space's `index.html` into `dist/kernels/bonsai` |
+| `make site` | the GitHub Pages payload: the hub build of the pages, `smolbox.wasm`, and both kernel engines |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; builds through `web-local` so it reads the disk rather than the hub; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
@@ -325,16 +327,18 @@ first-person deliberation as the reply. `splitThinking` knows three shapes: `non
 model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
 `<think>`, so the completion starts inside the block — LFM2.5).
 
-### There are two inference engines now, and only one interface
+### There are three inference engines now, and only one interface
 `ModelEntry.backend` picks between them. `transformers` is onnxruntime-web through
 transformers.js; `gemma4-kernels` is the webml-community WebGPU engine, which reads safetensors
-itself and carries its own WGSL. They meet at `ModelClient` and nowhere else — the loop, the
+itself and carries its own WGSL; `bonsai-kernels` is the same runtime's build for Ternary Bonsai 2,
+reading one GGUF. They meet at `ModelClient` and nowhere else — the loop, the
 dialects, the tool registry and the UI cannot tell them apart, and it should stay that way.
 
-The kernel engine is **downloaded, not vendored**: its Space declares no license, so
-`make gemma-kernels` pulls a pinned revision into gitignored `dist/kernels/` and the worker imports
-it dynamically (`gemma-kernels.ts`). Do not commit it, and do not turn that dynamic import into a
-static one — `make web` must work on a checkout that has never run the fetch.
+The kernel engines are **pulled at a pinned revision** into gitignored `dist/kernels/` (`make
+gemma-kernels`, `make bonsai-kernels`), and `make site` ships them with the Pages deployment, so
+both kernel entries are selectable there. The worker imports each dynamically (`gemma-kernels.ts`,
+`bonsai-kernels.ts`); do not turn that into a static import — `make web` must work on a checkout
+that has never run the fetch. The Pages smoke test HEADs both engines after every deploy.
 
 Two of its own behaviours are deliberately bypassed and both would silently break tool calling if
 restored: its `encodePrompt` renders the chat template with `tools: null`, and its `generate()`
@@ -355,6 +359,28 @@ still import the artifact untouched, because f16 is faster where it exists. The 
 each match exactly once or the load fails loudly — **if you bump `REVISION` in `fetch-kernels.ts`,
 run `bun test web/src/agent/kernel-f32.test.ts`**, which applies them to the real artifact. PLAN
 §10.17.
+
+### Ternary Bonsai 2: a GGUF, a codec, and a cache that cannot rewind
+`bonsai2-27b` runs on `web/src/agent/bonsai-kernels.ts`, and three things about it differ from
+every other entry (PLAN §10.28):
+
+- **The engine is cut out of a page, not downloaded as a module.** The Space inlines it into
+  `index.html` ahead of app code that touches the DOM at top level. `bonsai-extract.ts` cuts at
+  the `export{…as TernaryBonsai2…}` statement, and the cut must match exactly once. If you bump
+  the Space `revision` in `web/fetch-kernels.ts`, re-run `make bonsai-kernels` and
+  `bun test web/src/agent/bonsai-extract.test.ts`, which checks the real artifact when present.
+- **No AutoTokenizer.** The repo is a GGUF and nothing else. The worker takes a `PromptCodec`
+  from the engine (its tokenizer, plus the GGUF's template rendered with `@huggingface/jinja` and
+  *our* tools) instead of a transformers.js tokenizer. `make model` fetches only `ggufFile`.
+- **The cache cannot be rewound, so history must replay reasoning.** The model's linear-attention
+  state has no truncate, and a prompt that does not extend the last one token for token is
+  prefilled from scratch (~50 tok/s without `shader-f16`). `Dialect.replayReasoning` makes
+  history carry `reasoning_content`, which the template re-renders byte for byte. The prefix
+  invariant is tested against the real template in `bonsai.test.ts`; if you touch the loop's
+  history shape, that test is the one that says whether this model got 20 s slower per turn.
+
+Without `shader-f16`, the engine's prefill graph is slower than token-at-a-time decode, so the
+loader sets `QWEN35_NO_PREFILL_GRAPH=1` on those adapters only (measured 37 → 50 tok/s).
 
 **`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
@@ -453,7 +479,7 @@ would cap that model's prompt at ~1400 tokens for memory it does not allocate.
 
 ### Dialects: verified means a transcript exists
 `Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `hermes`,
-`gemma4` and `qwen3.5` are verified; `llama` is marked unverified and says so in the UI. Promote a
+`gemma4`, `qwen3.5` and `bonsai` are verified; `llama` is marked unverified and says so in the UI. Promote a
 dialect by capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded
 as a type.
 

@@ -39,13 +39,14 @@ describe("what each source can offer", () => {
     }
   });
 
-  test("the Gemma kernel entry is the one a hub build holds back", () => {
-    // Its weights are on the hub like everyone else's — it is the engine that
-    // is not. If this ever changes, the entry loses requiresLocalBuild rather
-    // than this test losing its assertion.
-    expect(unavailableReason(modelFor("gemma4-e2b"), "hub")).toBeDefined();
-    expect(unavailableReason(modelFor("gemma4-e2b"), "local")).toBeUndefined();
-    expect(unavailableReason(modelFor("gemma4-e2b-onnx"), "hub")).toBeUndefined();
+  test("the kernel entries are offered on a hub build, because the site ships their engines", () => {
+    // Both engines are imports from /kernels/, which `make site` publishes with
+    // the deployment (PLAN §10.28). Holding them back on the hub build is what
+    // used to keep them out of the Pages dropdown.
+    for (const key of ["gemma4-e2b", "bonsai2-27b"]) {
+      expect(unavailableReason(modelFor(key), "hub"), key).toBeUndefined();
+      expect(selectableModels("hub").map((m) => m.key)).toContain(key);
+    }
   });
 
   test("the reason names something to run, since it is shown to a reader", () => {

@@ -131,7 +131,7 @@ resp, err := session.Exec(ctx, protocol.Request{
 ## Getting started
 
 ```
-make everything  # the whole served set: wasm, web, gemma-kernels, compress, models
+make everything  # the whole served set: wasm, web, gemma-kernels, bonsai-kernels, compress, models
 make wasm        # build the guest image and convert it to dist/smolbox.wasm
 make model       # optional: pull the default checkpoint (LFM2.5 2.6B) -> dist/models, for a local build
 make build       # build the smolbox CLI
@@ -153,18 +153,19 @@ file out of the VM, `:help` lists them. The agent page needs a GPU.
 Where it reads weights from is a build flag, `SMOLBOX_MODEL_SOURCE`, and it defaults to `hub`: every
 checkpoint comes from huggingface.co, which is what a visitor to a deployment gets and needs no
 `make model` at all. `SMOLBOX_MODEL_SOURCE=local make web` reads them from `dist/models` instead —
-for debugging a checkpoint off the disk, and what the opt-in GPU suites build. A hub build greys out
-any entry that needs something built here rather than fetched: today that is the Gemma 4 kernel
-build alone, whose 2.5 GB of weights are on the hub but whose WebGPU engine comes from
-`make gemma-kernels`. Every other registry entry is servable from the hub, checked by HEAD against
-each pinned revision.
+for debugging a checkpoint off the disk, and what the opt-in GPU suites build. Two entries run on
+WebGPU kernel engines rather than onnxruntime — Gemma 4 E2B and Ternary Bonsai 2 27B. Their weights
+come from the hub like everything else; the engines come from `make gemma-kernels` and `make
+bonsai-kernels`, and `make site` ships both with the deployment. Every registry entry is servable
+from the hub, checked by HEAD against each pinned revision.
 
 `make wasm` needs a local Docker daemon — the converter drives BuildKit through it.
 
 ### Deploying it
 
 `make site` assembles everything a static host needs into `_site/`: both pages, their bundles, the
-onnxruntime builds and `dist/smolbox.wasm`, in one flat tree with the site at its root. It is a hub
+onnxruntime builds, both WebGPU kernel engines and `dist/smolbox.wasm`, in one flat tree with the
+site at its root. It is a hub
 build by definition — no weights are published, because a visitor gets every checkpoint from
 huggingface.co — so it comes to ~230 MB rather than ~11 GB.
 

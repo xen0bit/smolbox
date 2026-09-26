@@ -20,7 +20,7 @@ import { dialectFor } from "./dialects/index.ts";
 import {
   DEFAULT_MODEL_KEY,
   type Dtype,
-  LOCAL_MODEL_PATH,
+  localProbePath,
   type ModelEntry,
   dtypeBlockers,
   modelFor,
@@ -46,7 +46,6 @@ let currentModelKey = unavailableReason(modelFor(DEFAULT_MODEL_KEY))
   ? selectableModels()[0]!.key
   : DEFAULT_MODEL_KEY;
 
-const probeFor = (repo: string) => `${LOCAL_MODEL_PATH}${repo}/config.json`;
 
 const SYSTEM_PROMPT = `You are smolbox, an assistant with access to a Linux sandbox.
 
@@ -511,9 +510,9 @@ function scrollLog(): void {
 
 // -------------------------------------------------------------- page plumbing
 
-async function haveLocalWeights(repo: string): Promise<boolean> {
+async function haveLocalWeights(entry: ModelEntry): Promise<boolean> {
   try {
-    return (await fetch(probeFor(repo), { method: "HEAD" })).ok;
+    return (await fetch(localProbePath(entry), { method: "HEAD" })).ok;
   } catch {
     return false;
   }
@@ -720,7 +719,7 @@ const handle: SmolagentHandle = {
     // The probe is a local-build question now. On a hub build there is nothing
     // to probe for — /models/ is not part of a deployment — and asking would be
     // a 404 per load whose answer is ignored either way.
-    const useLocal = local ?? (MODEL_SOURCE === "local" && (await haveLocalWeights(entry.repo)));
+    const useLocal = local ?? (MODEL_SOURCE === "local" && (await haveLocalWeights(entry)));
     // Asked for here rather than on page load: this is the moment someone has
     // committed to putting gigabytes on their disk, and Firefox prompts.
     requestPersistence();

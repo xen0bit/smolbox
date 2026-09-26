@@ -141,28 +141,22 @@ test("switching models re-derives untouched knobs and keeps touched ones", async
   expect(after.promptBudgetChars).toBe(before.promptBudgetChars);
 });
 
-// The model-source flag, seen from the page rather than from a unit test.
+// The kernel entries, seen from the page rather than from a unit test.
 //
-// `make test-e2e` builds with the default (hub), which is the case that matters:
-// the Gemma kernel entry is listed — dropping it would make a checkpoint that
-// exists look like one that never did — and cannot be picked, because its engine
-// is served from this origin and a deployment has no dist/kernels. The ONNX
-// build of the same model sits next to it enabled, which is the point: the block
-// is about the engine, not the weights.
-//
-// It reads the source off the page rather than assuming it, so that running this
-// suite by hand after `make web-local` reports the truth instead of a failure
-// about a build nobody asked for. See web/src/agent/model-source.ts.
-test("the model source decides whether the kernel entry can be chosen", async ({ page }) => {
+// `make test-e2e` builds with the default (hub), which is what Pages deploys.
+// Both kernel engines ship with the site (`make site` copies dist/kernels), so
+// both entries must be selectable there — they used to be listed disabled as
+// "needs a local build", which kept them out of the deployed dropdown in
+// practice. PLAN §10.28.
+test("the kernel entries can be chosen on either model source", async ({ page }) => {
   await open(page);
   const source = await page.evaluate(() => (globalThis as ModelSourceGlobal).__smolagent!.modelSource());
-  const kernels = page.locator('#model option[value="gemma4-e2b"]');
-  await expect(kernels).toHaveCount(1);
-  if (source === "hub") {
-    await expect(kernels).toBeDisabled();
-    await expect(kernels).toContainText("needs a local build");
-  } else {
+  expect(["hub", "local"]).toContain(source);
+  for (const key of ["gemma4-e2b", "bonsai2-27b"]) {
+    const kernels = page.locator(`#model option[value="${key}"]`);
+    await expect(kernels).toHaveCount(1);
     await expect(kernels).toBeEnabled();
+    await expect(kernels).not.toContainText("needs a local build");
   }
   await expect(page.locator('#model option[value="gemma4-e2b-onnx"]')).toBeEnabled();
 });

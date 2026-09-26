@@ -162,7 +162,8 @@ reader and its own tokenizer. It is **downloaded, not vendored**: the Space
 declares no license, so `make gemma-kernels` pulls a pinned revision
 (`158f16ae`) into gitignored `dist/kernels/` and the page imports it at runtime.
 `web/serve.ts` serves it at `/kernels/`, exactly as it serves weights at
-`/models/`. If the licensing is ever clarified this becomes a one-line change.
+`/models/`. (Corrected at §10.28: the no-license reasoning here was wrong-headed and has been
+dropped; `make site` now ships the engine with the deployment.)
 
 **Two things the engine does that smolbox cannot use**, which is why
 `gemma-kernels.ts` exists rather than a three-line call to its `generate()`:
@@ -1246,7 +1247,8 @@ cross-origin isolated, so a cross-origin module import would need CORP headers n
 Its registry entry therefore carries `requiresLocalBuild`, and on a hub build the dropdown shows the
 option **disabled with the reason** rather than dropping it. Dropping it would make a checkpoint
 that exists look like one that never did; `loadModel()` and `setModel()` refuse it as well, so the
-path survives for debugging without being reachable from the page.
+path survives for debugging without being reachable from the page. (Superseded at §10.28: both
+kernel engines now ship with the site, and neither entry carries `requiresLocalBuild`.)
 
 ### 10.26 The progress bar Pages took away, and the two displays that stopped at the download (2026-08-25)
 
@@ -1380,3 +1382,123 @@ building the unpatched file.
 This only drops security updates for build-time tools in a throwaway builder stage. Nothing from
 those stages reaches the guest except the compiled emulator. When `archive.debian.org` picks up
 `bullseye-security` this could be repointed instead, but there is nothing to gain from that.
+
+### 10.28 Ternary Bonsai 2 27B on the WebGPU kernels (2026-09-25)
+
+The model is `prism-ml/Ternary-Bonsai-2-27B-gguf` @ `b072e1d3`, an Apache-2.0 ternary quantization
+of Qwen3.8-27B (hybrid attention, about 75% linear). The engine comes from
+`webml-community/ternary-bonsai-2-webgpu-kernels` @ `94320c9d`. It is the same runtime family as
+the Gemma 4 kernels (§10.17), and the model lands as registry entry `bonsai2-27b`. All numbers
+below were measured on this machine (RTX 4070 Ti SUPER, 16 GB, headless Chromium with
+`--use-angle=vulkan`). The adapter reports `shaderF16: false`, `subgroups: true` and
+`subgroupMatrix: true`.
+
+**The engine is not published as a module.** The Space is one static `index.html` (1.55 MB). Its
+second `<script type="module">` is the engine, an ES module ending in
+`export{…,zl as TernaryBonsai2,…};`, with the page's own app code appended after it. That app
+code reads the DOM at top level, so the whole block cannot be imported in a worker.
+`web/src/agent/bonsai-extract.ts` cuts at the export statement, anchored on the exported *name*
+because minified identifiers change per rebuild. The cut must match exactly once. `make
+bonsai-kernels` pulls it into gitignored `dist/kernels/bonsai/` at a pinned revision.
+
+**It maps onto the Gemma seam with less adaptation, not more.** `TernaryBonsai2.load(url, {onProgress})`
+returns a session whose `model`, `generationState`, `eosTokenIds`, `reset()`, `dispose()` and
+`deviceInfo()` are public fields. Gemma exposes the same things behind underscores. The
+prefix-cache bookkeeping moved out of `gemma-kernels.ts` into `kernel-engine.ts` and now serves
+both engines. Two things carried over unchanged, and both would break tool calling: the engine
+renders its own template with `tools: null`, and it decodes with `skip_special_tokens`. So the
+prompt is rendered here instead.
+
+**There is no transformers.js tokenizer to load.** The repo is GGUF files and nothing else: no
+`tokenizer.json` and no `config.json`. The tokenizer and the 8 952-byte chat template live in
+the GGUF metadata. The engine's tokenizer exposes the template at `tokenizer.config.chat_template`.
+So this backend brings a `PromptCodec` (render, encode, decode): the template is rendered with
+`@huggingface/jinja` (now a direct dependency, pinned to the 0.5.9 transformers.js already uses)
+and our tool schema, and ids go through the engine's tokenizer. A `gguf` weight layout names its
+one file (`ModelEntry.ggufFile`), and `make model` fetches only that file.
+
+**It loads and it calls tools.** PTQ1_0 (5.95 GB) loads in 31–37 s from local disk and decodes at
+**40–47 tok/s**. Its first turn, with smolbox's system prompt and generated schema:
+
+```
+The user is asking about the number of files in their folder and the largest file. …
+</think>
+
+<tool_call>
+<function=run_terminal_command>
+<parameter=cmd>
+find /mnt/host -type f | wc -l; echo "---"; find /mnt/host -type f -printf '%s %p\n' | sort -rn | head -5
+</parameter>
+</function>
+</tool_call>
+```
+
+That is qwen3.5's XML grammar (§10.20) inside a scratchpad the prompt opened: the template ends
+the generation prompt with a bare `<think>\n`, so a completion starts *inside* it. That is
+lfm2.5's shape, not qwen3.5's "tagged" one, so this is a new dialect, `bonsai`, that reuses
+qwen3.5's call parser with `prompt-opened` thinking. It is `structured`, because the template
+rebuilds calls from `tool_calls` and wraps results in `<tool_response>`. It is marked verified
+off the two CAPTURED turns in `bonsai.test.ts`. (The call itself uses GNU `find -printf`, which
+busybox lacks; that is the model's mistake to correct, not the parser's.)
+
+**Prefill without `shader-f16` is the cost, and it is linear.** Every fast ternary prefill kernel
+in the engine declares `requires: shader-f16 + subgroup-matrix`. Without f16, the batched prefill
+graph falls back to f32 kernels that are *slower* than feeding the prompt a token at a time
+through the decode path:
+
+| path | 761 tok | 1 762 tok | 3 762 tok |
+|---|---|---|---|
+| prefill graph (default) | 37.7 tok/s | 37.5 | 36.9 |
+| `QWEN35_NO_PREFILL_GRAPH=1` | **51.1 tok/s** | 50.4 | 48.9 |
+
+The engine reads that flag from `globalThis.process.env`. `bonsai-kernels.ts` sets it only when
+the adapter lacks `shader-f16`, on an object with `env` alone, so that neither this engine nor
+transformers.js mistakes the worker for Node. Even so, the first turn's ~900-token prompt costs
+~18 s. A GPU exposing f16 takes the engine's intended fast path, and nothing here has measured
+that.
+
+**The cache cannot be rewound, so the prompt must never be rewritten.** Linear attention keeps a
+recurrent state: `canTruncateTo(k)` is false and `rewindableLengthAtMost` is 0. A turn reuses
+the cache only if its prompt *extends* the previous prompt plus completion token for token.
+Otherwise the whole conversation is prefilled again, which is ~20 s per tool round trip at the
+rates above. The template renders each past assistant turn as
+`<think>\n{reasoning_content}\n</think>\n\n{content}` plus the rebuilt call. With the reasoning
+replayed, turn 2 shared **993 of 993** tokens with turn 1's prompt and completion. Without it the
+match stopped at 892, where an empty scratchpad was rendered in place of the real one. That is
+`Dialect.replayReasoning`: history carries `content: prose` and `reasoning_content`. It is the
+opposite of the model card's advice for llama.cpp tool loops (drop reasoning to keep context
+small), because here the choice is between a longer prompt that is already cached and a shorter
+one that has to be prefilled again. `bonsai.test.ts` pins the invariant through the real
+`Conversation` and the real template text, with a control that turns the flag off.
+
+**The engine's cache bookkeeping, measured rather than assumed.** On EOS, the cache holds the
+prompt plus every yielded token. EOS itself is never yielded or forwarded, so the next rendered
+prompt's `<|im_end|>` is simply new input. At the cap, the cache holds the prompt plus all but
+the last yielded token, which was sampled but never fed back. That is exactly the rule the
+Gemma adapter already applied, which is why the logic could be shared rather than forked.
+
+**Through the real page, end to end.** `SMOLBOX_WEBGPU=1 SMOLBOX_MODEL=bonsai2-27b` on
+`tests/e2e/agent.spec.ts` passes: a 30.0 s load from disk, then three well-formed calls against
+the real VM (`ls -la /mnt/host`; a combined `ls`/`head`/`cat` of the subdirectory and the link;
+`cat sub/nested.txt`) and an answer built from what they returned. That includes noticing that
+the fixture's sizes and mode bits are nonsense while its contents are fine. It took 1.3 min in
+total. The first run of that spec failed first, and usefully: the page decides local versus hub
+by HEADing `config.json`, which a GGUF repo does not have, so a local build silently streamed
+5.9 GB from the hub (a 175 s load). `localProbePath()` now probes the file the loader reads.
+
+**Limits.** The engine allocates its generation state at `min(model, 16 384)` positions, so
+`contextTokens` is 16 384, not the card's 262 144. The model card lists occasional malformed calls
+and `// // //` loops as a known open issue. The template raises unless exactly one system message
+comes first, which the loop already guarantees.
+
+**Both kernel engines now ship with the Pages site.** Until this change the project treated the two
+Spaces' missing license declarations as a bar to publishing their engines: they were fetched into
+gitignored `dist/kernels/`, the site did not include them, and both kernel entries carried
+`requiresLocalBuild`, so the deployed dropdown listed them disabled ("needs a local build"). That
+reasoning was overcautious, and the owner overruled it. `make site` now runs `gemma-kernels` and
+`bonsai-kernels` and copies `dist/kernels` into `_site/kernels/`. Neither entry is gated any more, so
+both are selectable on a hub build. The Pages smoke test HEADs both engines after every deploy, and
+`settings.spec.ts` asserts the entries are enabled on the hub build that `make test-e2e` serves. The
+hub path itself was exercised by accident before it was deployed: the first GPU run's probe bug
+(above) streamed the 5.9 GB GGUF from huggingface.co and reached `ready (hub, …)` in 175 s, which is
+what a Pages visitor does.

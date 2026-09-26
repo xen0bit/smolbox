@@ -82,11 +82,13 @@ export interface GenerationDefaults {
  * `transformers` is onnxruntime-web through transformers.js — the path every
  * entry took until Gemma 4. `gemma4-kernels` is the hand-written WebGPU engine
  * from the webml-community/gemma-4-webgpu-kernels Space, which reads safetensors
- * directly and carries its own WGSL. They share nothing but the ModelClient
- * interface, which is the point: the loop, the dialects and the UI cannot tell
- * them apart.
+ * directly and carries its own WGSL. `bonsai-kernels` is the same runtime's
+ * build for Ternary Bonsai 2 (webml-community/ternary-bonsai-2-webgpu-kernels),
+ * which reads one GGUF and brings its own tokenizer. They share nothing but the
+ * ModelClient interface, which is the point: the loop, the dialects and the UI
+ * cannot tell them apart.
  */
-export type Backend = "transformers" | "gemma4-kernels";
+export type Backend = "transformers" | "gemma4-kernels" | "bonsai-kernels";
 
 /**
  * How the weights are laid out in the repo, for the fetcher.
@@ -94,8 +96,10 @@ export type Backend = "transformers" | "gemma4-kernels";
  * `onnx` is `onnx/model_<dtype>.onnx` plus its optional external data blob.
  * `safetensors` is a plain `model.safetensors` at the root, with the
  * quantization baked into the checkpoint rather than chosen at load time.
+ * `gguf` is one self-contained file, named by `ggufFile`, carrying the
+ * tokenizer and chat template in its metadata — no config or tokenizer files.
  */
-export type WeightLayout = "onnx" | "safetensors";
+export type WeightLayout = "onnx" | "safetensors" | "gguf";
 
 export interface ModelEntry {
   key: string;
@@ -186,6 +190,12 @@ export interface ModelEntry {
   /** How its weights are laid out in the repo. Absent means the ONNX layout. */
   weights?: WeightLayout;
   /**
+   * The one file a `gguf` entry is. A GGUF repo usually publishes several packs
+   * of the same model side by side, so the entry names which — the fetcher and
+   * the loader both read it, so they cannot disagree.
+   */
+  ggufFile?: string;
+  /**
    * What has to be built locally before this entry can run, and why.
    *
    * Absent for everything the browser can load unaided, which is almost all of
@@ -193,14 +203,10 @@ export interface ModelEntry {
    * CORS at the pinned revision, checked by HEAD rather than assumed — including
    * the Google one, which is not gated.
    *
-   * Present when something OTHER than the weights has to come off this origin.
-   * The Gemma kernel entry is the case: its 2.46 GB of safetensors are on the
-   * hub and the engine reads them from there quite happily, but the engine
-   * itself is a dynamic import of /kernels/gemma4/gemma-4-e2b.js, which exists
-   * only after `make gemma-kernels`. It is not vendored and cannot be served
-   * from the hub by the page: the Space that publishes it declares no license
-   * (web/fetch-kernels.ts), and this page is cross-origin isolated, so a
-   * cross-origin module import would need CORP headers nobody has promised.
+   * Present when something OTHER than the weights has to come off this origin
+   * and a hub deployment does not ship it. No entry needs it today: the two
+   * kernel engines are dynamic imports from /kernels/, and `make site` ships
+   * both with the deployment (PLAN §10.28), so a hub build offers them too.
    *
    * The string is shown to whoever hits the limit, so write it as an answer
    * rather than a flag name. See unavailableReason() in model-source.ts, which
@@ -456,12 +462,8 @@ export const models: ModelEntry[] = [
     dialect: "gemma4",
     backend: "gemma4-kernels",
     weights: "safetensors",
-    // The only entry a hub-only build cannot offer, and not because of its
-    // weights: those are on the hub, ungated, and the engine reads them straight
-    // from there. It is the ENGINE that has to be local. See requiresLocalBuild.
-    requiresLocalBuild:
-      "its WebGPU kernel engine is served from this origin rather than the hub — " +
-      "build with SMOLBOX_MODEL_SOURCE=local after `make gemma-kernels`",
+    // The weights stream from the hub, ungated; the engine comes off this
+    // origin at /kernels/, which `make site` ships with the deployment.
     // No requiresFeatures. This entry declared `shader-f16` from M12 to §10.17
     // on the strength of a true observation — every variant of
     // com.xenova.gemma4.DenseGemv is guarded on it — and a false inference from
@@ -518,6 +520,41 @@ export const models: ModelEntry[] = [
       max_new_tokens: 2048,
     },
     note: "Same model as the kernel build, on onnxruntime — measured ~3.4x slower and ~1.3 GB larger. Kept as the reference path. Large: ~3.6 GB at q4.",
+  },
+  {
+    key: "bonsai2-27b",
+    label: "Ternary Bonsai 2 27B (PTQ1_0, WebGPU kernels)",
+    // prism-ml's ternary quantization of Qwen3.8-27B — weights in {-1, 0, +1}
+    // with f16 group scales — on the webml-community kernel engine built for
+    // it. The largest model here by an order of magnitude, and the only one
+    // whose card reports a tool-calling benchmark (BFCL v3, 74.9). PLAN §10.28.
+    repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
+    revision: "b072e1d3b35a0a630cece372c2127528e0994386",
+    weights: "gguf",
+    // Two packs of the same weights. PTQ1_0 (1.75 bits/weight, 5.95 GB) is the
+    // one the Space loads and the one the card says wins decode on Ada-class
+    // GPUs; PQ2_0 (7.21 GB) trades footprint for cheaper unpacking.
+    ggufFile: "Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    // From the GGUF's own tokenizer, read on the device: 248 320.
+    vocabSize: 248_320,
+    // The engine samples on the GPU and never downloads a logits tensor.
+    prefillLogits: "last",
+    // Baked into the file; the engine ignores it. Present because pickDtype is
+    // shared, exactly as for gemma4-e2b — the pack is named in the label.
+    dtypes: ["q4"],
+    approxBytes: 5_946_648_928,
+    // Not the model's 262 144: the engine allocates its generation state at
+    // min(model, 16 384) positions, and that is the window this page gets.
+    contextTokens: 16_384,
+    dialect: "bonsai",
+    backend: "bonsai-kernels",
+    // It reasons at length before calling (xhigh by default in its template),
+    // so the page's 256-token default would cut it off mid-thought. The kernel
+    // path is greedy regardless; only the length is honoured.
+    generation: { do_sample: false, max_new_tokens: 2048 },
+    // Like gemma4-e2b: the GGUF streams from the hub, ungated, and the engine
+    // comes off this origin, shipped with the deployment by `make site`.
+    note: "27B at ternary precision on the webml-community WebGPU kernels. ~5.9 GB download. Without shader-f16, the prompt is read at ~50 tok/s, so a long tool output takes a while. Locally: `make bonsai-kernels` for the engine, `make model MODEL=bonsai2-27b` for the weights.",
   },
 ];
 
@@ -719,6 +756,20 @@ export const REQUIRED_FILES = ["config.json", "tokenizer.json", "tokenizer_confi
  * `make serve` hosts the site at the root.
  */
 export const LOCAL_MODEL_PATH = asset("models/");
+
+/**
+ * The file whose presence under LOCAL_MODEL_PATH says `make model` ran for this
+ * entry.
+ *
+ * `config.json` for every layout that has one. A GGUF repo has none — the file
+ * is the whole checkpoint — so probing config.json there always missed, and a
+ * local build quietly pulled 5.9 GB from the hub instead of reading the disk
+ * (PLAN §10.28). It probes the file the loader will actually read.
+ */
+export function localProbePath(entry: ModelEntry): string {
+  const file = entry.weights === "gguf" && entry.ggufFile ? entry.ggufFile : "config.json";
+  return `${LOCAL_MODEL_PATH}${entry.repo}/${file}`;
+}
 
 /**
  * The chat template, when a repo keeps it out of tokenizer_config.json.

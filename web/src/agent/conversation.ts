@@ -276,8 +276,15 @@ export class Conversation {
           continue;
         }
 
+        // A dialect that replays reasoning stores the turn split, in the shape
+        // its template re-renders byte for byte; everything else keeps the
+        // model's own text. See Dialect.replayReasoning.
+        const replay = this.opts.dialect.replayReasoning
+          ? { content: prose, reasoning_content: reasoning ?? "" }
+          : null;
+
         if (calls.length === 0) {
-          this.history.push({ role: "assistant", content: result.text });
+          this.history.push({ role: "assistant", ...(replay ?? { content: result.text }) });
           this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning, toolCalls: 0 });
           return;
         }
@@ -293,7 +300,7 @@ export class Conversation {
           structured
             ? {
                 role: "assistant",
-                content: prose,
+                ...(replay ?? { content: prose }),
                 tool_calls: calls.map((c, n) => ({
                   id: ids[n]!,
                   type: "function" as const,

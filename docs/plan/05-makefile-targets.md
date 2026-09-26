@@ -13,7 +13,7 @@
 | `test-e2e-antares` | **M13.** Playwright against `/scan/` with `FakeModelClient` replaying a captured Antares transcript — **in CI, no GPU** |
 | `build` | `go build ./cmd/smolbox` → `bin/smolbox` |
 | `web` | bundle `web/src/{worker,main}.ts` and the agent entries → `web/dist`, and copy both pages, `web/style.css` (the tokens, controls and terminal styling they share) and `web/coi-serviceworker.js`. Three build flags: `SMOLBOX_MODEL_SOURCE` (`hub`/`local`), `SMOLBOX_BASE` (the path prefix the site is served from, default `/`) and `SMOLBOX_WASM_BYTES` (measured from `dist/smolbox.wasm`, not set by hand) |
-| `site` | `_site/` — the tree a static host publishes: `web/dist` plus `dist/smolbox.wasm` at the root, `.nojekyll`, no `.br`/`.gz`, no weights. Hub builds only; ~230 MB against a 1 GB GitHub Pages limit. Driven by `.github/workflows/pages.yml` |
+| `site` | `_site/` — the tree a static host publishes: `web/dist` plus `dist/smolbox.wasm` at the root and both kernel engines under `kernels/` (fetched by `gemma-kernels` and `bonsai-kernels`), `.nojekyll`, no `.br`/`.gz`, no weights. Hub builds only; ~230 MB against a 1 GB GitHub Pages limit. Driven by `.github/workflows/pages.yml` |
 | `serve` | `bun web/serve.ts` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; serves `smolbox.wasm`, `js/`, `models/` and `kernels/` from `DIST_DIR` (default `dist/`) |
 | `generate` | `go run ./cmd/gen-tool-api` → rewrites `docs/schema/*.json` from the Go wire types |
 | `test` | Go unit tests; no Docker required |
