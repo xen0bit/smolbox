@@ -6,8 +6,9 @@
 // The guest console is the transport. stdout and stderr both go to one pipe,
 // which is why the protocol Scanner has to skip kernel noise; requests go to
 // the guest's stdin. The read-only host mount is applied at the wazero
-// filesystem boundary (WithReadOnlyDirMount), never by guest configuration,
-// so even a compromised guest cannot write through to the host.
+// filesystem boundary (a read-only DirFS behind confinedFS), never by guest
+// configuration, so even a compromised guest cannot write through to the host
+// or follow a host symlink out of the mounted directory.
 package vm
 
 import (
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/experimental/sysfs"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/xen0bit/smolbox/internal/hostfs"
 	"github.com/xen0bit/smolbox/internal/protocol"
@@ -101,7 +103,12 @@ func Boot(ctx context.Context, opts Options) (*Session, error) {
 		if guest == "" {
 			guest = "/mnt/host"
 		}
-		fsConfig = fsConfig.WithReadOnlyDirMount(m.HostPath, guest)
+		mount, err := newConfinedFS(m.HostPath)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("vm: mount %s: %w", m.HostPath, err)
+		}
+		fsConfig = fsConfig.(sysfs.FSConfig).WithSysFSMount(mount, guest)
 	}
 
 	// Guest stdin is a real os.Pipe whose write end lives for the whole

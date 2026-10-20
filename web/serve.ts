@@ -1,5 +1,6 @@
 import { serve } from "bun";
-import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
  * A served directory: `$name` from the environment when set, otherwise a path
@@ -56,19 +57,12 @@ export async function handle(request: Request): Promise<Response> {
     return new Response("forbidden", { status: 403, headers: isolationHeaders });
   }
 
-  const mounts: [string, URL][] = [
-    // The bundles served by default live in web/dist; everything that
-    // `make wasm`/`make model(s)`/`make gemma-kernels` produces lives in
-    // dist/, so those paths are served from DIST_DIR.
-    ["/smolbox.wasm", new URL("smolbox.wasm", artifactRoot)],
-    ["/models/", new URL("models/", artifactRoot)],
-    ["/kernels/", new URL("kernels/", artifactRoot)],
-  ];
-  const mount = mounts.find(([prefix]) => pathname.startsWith(prefix));
-  const root = mount ? mount[1] : distRoot;
-  const rel = mount ? pathname.slice(mount[0].length) : "." + pathname;
+  const target = resolveRequestPath(pathname, artifactRoot, distRoot);
+  if (!target) {
+    return new Response("forbidden", { status: 403, headers: isolationHeaders });
+  }
 
-  const file = Bun.file(new URL(rel, root));
+  const file = Bun.file(target);
   if (!(await file.exists())) {
     return new Response("not found: " + pathname, { status: 404, headers: isolationHeaders });
   }
@@ -77,7 +71,7 @@ export async function handle(request: Request): Promise<Response> {
   // writes. Nothing is compressed on the fly: these artifacts run to 117 MB
   // and encoding them per request would cost seconds of CPU each time and
   // force a chunked response.
-  const chosen = await negotiate(file, new URL(rel, root), request);
+  const chosen = await negotiate(file, target, request);
 
   // Caching: almost every URL here can change without a filename change
   // (`make web` and `make wasm` rewrite the bundles and the VM in place;
@@ -138,6 +132,38 @@ export async function handle(request: Request): Promise<Response> {
   // `negotiate` returns identity whenever the request carries a Range, so the
   // range arithmetic below always runs against the identity bytes.
   return serveFile(chosen.file, request.headers.get("range"), validators);
+}
+
+/**
+ * Maps a decoded request path to the file it names, or null when that file
+ * would lie outside the directory serving it.
+ *
+ * The bundles live in web/dist; everything `make wasm`/`make model(s)`/`make
+ * gemma-kernels` produces lives in dist/, so those paths come from DIST_DIR.
+ * `/smolbox.wasm` is one file and matches exactly. The two directory mounts
+ * match on a whole segment and are resolved with `path.join`, which treats a
+ * leading `/` in the remainder as one more segment. That is the point:
+ * `new URL(rel, root)` read `/models//etc/passwd` as the absolute path
+ * `/etc/passwd`, and `/smolbox.wasm/etc/passwd` the same way. The containment
+ * check is lexical on purpose — a dist/models that is itself a symlink to a
+ * bigger disk is a normal setup and must keep working (PLAN §10.29).
+ */
+export function resolveRequestPath(pathname: string, artifactRoot: URL, bundleRoot: URL): URL | null {
+  if (pathname === "/smolbox.wasm") {
+    return new URL("smolbox.wasm", artifactRoot);
+  }
+  const mounts: [string, URL][] = [
+    ["/models/", new URL("models/", artifactRoot)],
+    ["/kernels/", new URL("kernels/", artifactRoot)],
+  ];
+  const mount = mounts.find(([prefix]) => pathname.startsWith(prefix));
+  const [prefix, root] = mount ?? ["/", bundleRoot];
+  const base = fileURLToPath(root);
+  const resolved = path.join(base, pathname.slice(prefix.length));
+  if (!resolved.startsWith(base.endsWith(path.sep) ? base : base + path.sep)) {
+    return null;
+  }
+  return pathToFileURL(resolved);
 }
 
 /**

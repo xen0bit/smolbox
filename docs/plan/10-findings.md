@@ -1502,3 +1502,43 @@ both are selectable on a hub build. The Pages smoke test HEADs both engines afte
 hub path itself was exercised by accident before it was deployed: the first GPU run's probe bug
 (above) streamed the 5.9 GB GGUF from huggingface.co and reached `ready (hub, …)` in 175 s, which is
 what a Pages visitor does.
+
+### 10.29 Two ways out of a served directory: the dev server and the host mount (2026-10-19)
+
+A whole-codebase security review, run against the threat model of a rogue agent in the guest, found
+two places where a path could leave the directory meant to bound it. One was a real host file read;
+the other turned out narrower than it first looked, and the measurement is why.
+
+**`web/serve.ts` served any file on the host.** Request paths were resolved with
+`new URL(rel, root)`, where `rel` was the request path minus a mount prefix. The URL resolver treats a
+`rel` beginning with `/` as absolute and discards `root`, and the `..` filter never sees it, because
+there is no `..`. So `/models//etc/passwd`, `/kernels//etc/passwd` and `/smolbox.wasm/etc/passwd`
+(the last because the prefix was matched with a bare `startsWith`) all returned `/etc/passwd`, and
+`%2F` worked as well. All three returned 200 with the file's contents against the shipped server.
+The server binds `0.0.0.0` by default, so anything on the LAN could read the developer's home
+directory. This is a host bug rather than a guest one, since the guest has no network.
+`resolveRequestPath` now matches `/smolbox.wasm` exactly, resolves the directory mounts with
+`path.join` (which reads a leading `/` as one more segment), and refuses anything that lands outside
+the root. The check is lexical on purpose: `dist/models` symlinked to a bigger disk is a reasonable
+setup. The bind address is unchanged, because the container deployment depends on it.
+
+**The wazero mount followed host symlinks out, though only for a guest that asks.**
+`WithReadOnlyDirMount` is a `ReadFS` over `DirFS`. wazero cleans every path and rejects `..` and
+absolute paths before the FS sees them (`atPath`: `path.Clean` + `fs.ValidPath`), so lexical
+traversal was never open, even to a guest speaking raw 9p. But `DirFS` then opens with host
+syscalls, which follow symlinks. `TestDirFSFollowsHostSymlinksOut` reads a file outside the mount
+through a relative link with the stock FS. Through the VM the exposure turned out smaller:
+`tests/integration/mount_test.go` puts relative, absolute and directory links to an outside sentinel
+in a temporary mount, and `cat` of each fails with **ENOENT** *before* the fix. The guest kernel sees
+the link as a link, reads its target, and resolves it inside the guest namespace, where
+`/mnt/outside` does not exist. So the host follows a link only when the guest opens the link's own
+path rather than its target, which an ordinary process never does and a root guest driving the 9p
+transport directly could. That threat (root in the guest, not just `sh`) is in scope here, so
+`confinedFS` (`internal/vm/confine.go`) now resolves each path with `filepath.EvalSymlinks` and
+answers `EACCES` when it leaves the mount. `Lstat` and `Readlink` resolve only the parents, so the link
+is still listed and `ls -l` still shows its target string. The root is itself resolved, so a mount
+reached through a symlink works. The check runs before the open, which leaves a window, and only the
+host user can use it: the guest cannot write to the mount.
+
+What the readlink target still tells the guest is the host path an absolute link points at (for
+example `/home/<user>/…`). That is information, not access, and it was visible before this change.

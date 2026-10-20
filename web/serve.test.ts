@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 
-import { acceptsEncoding, cacheControl } from "./serve.ts";
+import { acceptsEncoding, cacheControl, resolveRequestPath } from "./serve.ts";
 
 let dist: string;
 let proc: Bun.Subprocess;
@@ -204,6 +204,58 @@ describe("range requests", () => {
       WASM_BODY.subarray(1000, 1016),
     );
   });
+});
+
+describe("resolveRequestPath", () => {
+  const artifacts = new URL("file:///srv/dist/");
+  const bundles = new URL("file:///srv/web/dist/");
+  const resolve = (p: string) => resolveRequestPath(p, artifacts, bundles)?.href ?? null;
+
+  test("routes each prefix to its directory", () => {
+    expect(resolve("/smolbox.wasm")).toBe("file:///srv/dist/smolbox.wasm");
+    expect(resolve("/models/org/repo/config.json")).toBe("file:///srv/dist/models/org/repo/config.json");
+    expect(resolve("/kernels/gemma4/gemma-4-e2b.js")).toBe("file:///srv/dist/kernels/gemma4/gemma-4-e2b.js");
+    expect(resolve("/agent/index.html")).toBe("file:///srv/web/dist/agent/index.html");
+  });
+
+  test("never lets a leading slash in the remainder name an absolute path", () => {
+    expect(resolve("/models//etc/passwd")).toBe("file:///srv/dist/models/etc/passwd");
+    expect(resolve("/kernels//etc/passwd")).toBe("file:///srv/dist/kernels/etc/passwd");
+    expect(resolve("//etc/passwd")).toBe("file:///srv/web/dist/etc/passwd");
+  });
+
+  test("matches /smolbox.wasm exactly, not as a directory prefix", () => {
+    expect(resolve("/smolbox.wasm/etc/passwd")).toBe("file:///srv/web/dist/smolbox.wasm/etc/passwd");
+    expect(resolve("/smolbox.wasm.br")).toBe("file:///srv/web/dist/smolbox.wasm.br");
+  });
+
+  test("refuses anything that resolves above its root", () => {
+    expect(resolve("/models/../../etc/passwd")).toBeNull();
+    expect(resolve("/../etc/passwd")).toBeNull();
+  });
+});
+
+describe("path confinement, through the real server", () => {
+  let outside: string;
+
+  beforeAll(async () => {
+    outside = await mkdtemp(path.join(tmpdir(), "smolbox-serve-outside-"));
+    await writeFile(path.join(outside, "secret.txt"), "SMOLBOX-SERVE-SENTINEL");
+  });
+
+  afterAll(async () => {
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  for (const prefix of ["/models/", "/kernels/", "/smolbox.wasm", "/"]) {
+    test(`${prefix} cannot reach a file outside the served tree`, async () => {
+      for (const p of [`${prefix}/${outside}/secret.txt`, `${prefix}${encodeURIComponent(`/${outside}/secret.txt`)}`]) {
+        const r = await fetch(`${base}${p}`);
+        expect(await r.text()).not.toContain("SMOLBOX-SERVE-SENTINEL");
+        expect(r.status).not.toBe(200);
+      }
+    });
+  }
 });
 
 describe("cacheControl", () => {

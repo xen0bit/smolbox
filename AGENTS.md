@@ -115,9 +115,21 @@ path mishandles it. End the session with the `shutdown` op (`Session.Close`), no
 closing stdin is only the forced-termination fallback.
 
 ### The read-only mount is enforced at the host FS boundary
-`internal/vm` mounts with `wazero.WithReadOnlyDirMount(host, "/mnt/host")`; the browser uses an
-`ERRNO_ROFS`-returning `Fd`. Writes surface in the guest as `can't create ...: Invalid argument`.
-Do not rely on guest-side `mount -o ro`.
+`internal/vm` mounts a read-only wazero `DirFS` wrapped in `confinedFS` (`internal/vm/confine.go`);
+the browser uses an `ERRNO_ROFS`-returning `Fd`. Writes surface in the guest as `can't create ...:
+Invalid argument`. Do not rely on guest-side `mount -o ro`.
+
+### Host symlinks never lead out of the mount
+wazero's `DirFS` opens with the host's syscalls, which follow symlinks, so a link already in the
+user's folder (`.env -> ../secrets/.env`) used to be a way out at the host boundary. `confinedFS`
+resolves every path with `filepath.EvalSymlinks` and answers `EACCES` when it lands outside the
+mounted directory; `Lstat`/`Readlink` resolve only the parents, so the link itself is still listed.
+The guest kernel normally follows links on its own side and never asks the host to — the
+integration test shows `cat` of an escaping link failing with ENOENT even without the check — but a
+guest speaking 9p directly is not bound by that, so the check belongs on the host. The containment
+is against the *resolved* mount root, so mounting a folder through a symlink works. Do not swap
+back to `WithReadOnlyDirMount`; `TestDirFSFollowsHostSymlinksOut` is the control that shows why
+(PLAN §10.29).
 
 ### Guest `..` above the mount root resolves inside the guest, never to the host
 The wazero `WithReadOnlyDirMount` doc warns it does not by itself prevent `../` traversal. In
@@ -381,6 +393,13 @@ every other entry (PLAN §10.28):
 
 Without `shader-f16`, the engine's prefill graph is slower than token-at-a-time decode, so the
 loader sets `QWEN35_NO_PREFILL_GRAPH=1` on those adapters only (measured 37 → 50 tok/s).
+
+**`web/serve.ts` resolves request paths with `resolveRequestPath`, never `new URL(rel, root)`.**
+The URL resolver reads a remainder starting with `/` as an absolute path, so `/models//etc/passwd`
+and `/smolbox.wasm/etc/passwd` served the host's `/etc/passwd`, and the server binds `0.0.0.0` by
+default. `path.join` plus a prefix check keeps every response inside its directory; the check is
+lexical so a `dist/models` symlinked to another disk still works. `serve.test.ts` drives the
+escapes through the real server (PLAN §10.29).
 
 **`web/serve.ts` must keep supporting `Range`.** The engine streams a 2.5 GB safetensors file in
 256 KB chunks; a server that ignores `Range` hands back the whole file per chunk and it dies
