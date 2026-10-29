@@ -345,14 +345,17 @@ test.describe("agent chat loop", () => {
       const budget = events.find((e) => e.kind === "budget")!;
 
       const stored = JSON.parse((await learned(page))!) as Record<string, number>;
-      expect(stored["lfm2.5-2.6b"]).toBe(budget.chars!);
+      expect(stored[SCRIPTS_MODEL]).toBe(budget.chars!);
       // The dialog shows the learned ceiling, not the registry's arithmetic.
       await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
 
       // And it is still there in the next session, which is the whole point:
       // the first chat on a machine pays for the discovery, no later one does.
+      // The ceiling is per model and the page reopens on the registry default,
+      // so select the model that learned it before reading the field.
       await page.reload();
       await page.waitForFunction(() => Boolean((globalThis as AgentGlobal).__smolagent));
+      await page.evaluate((key) => (globalThis as AgentGlobal).__smolagent!.setModel(key), SCRIPTS_MODEL);
       await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
     });
 
