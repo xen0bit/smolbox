@@ -337,7 +337,7 @@ test.describe("agent chat loop", () => {
 
       // The page says what happened, because the retry is otherwise tens of
       // seconds of a model reload with nothing on screen.
-      await expect(page.locator("#log .msg.note").last()).toContainText("ran out of memory");
+      await expect(page.locator("#log .msg.note").last()).toContainText("GPU device was lost");
     });
 
     test("the size the GPU died at is remembered for next time", async ({ page }) => {

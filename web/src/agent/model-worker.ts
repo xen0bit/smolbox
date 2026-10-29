@@ -24,6 +24,7 @@ import { loadLfm3 } from "./lfm3-kernels.ts";
 import type { PromptCodec } from "./prompt-codec.ts";
 import { GemmaKernelEngine } from "./gemma-kernels.ts";
 import type { KernelEngine } from "./kernel-engine.ts";
+import { flattenMessage, isDeviceLoss } from "./device-loss.ts";
 import { ModelCache } from "./model-cache.ts";
 import { type ModelErrorCode, type ModelRequest, type ModelResponse, describeError } from "./messages.ts";
 import {
@@ -463,6 +464,13 @@ function promptTooLong(promptTokens: number, limit: number): WorkerError {
 }
 
 async function generate(req: Extract<ModelRequest, { type: "generate" }>): Promise<void> {
+  const lostWhileIdle = kernels?.deviceLost();
+  if (lostWhileIdle !== undefined) {
+    // The engine saw its device go between turns. Running on it would fail in
+    // whatever way the first dead buffer chose; dropping it now makes this the
+    // request that rebuilds the session, exactly as after a failed run.
+    await handleRunFailure(lostWhileIdle);
+  }
   if (!(tokenizer || codec) || !(model || kernels)) {
     // Either nothing was ever loaded — an error — or a device loss dropped the
     // session and this is the request that pays for rebuilding it.
@@ -775,10 +783,12 @@ async function generateWithKernels(
  * adapter, or one already sharing the GPU with something else, can still run out.
  */
 async function handleRunFailure(err: unknown): Promise<Error> {
-  const message = err instanceof Error ? err.message : String(err);
-  if (!looksLikeDeviceLoss(message)) {
-    return err instanceof Error ? err : new Error(message);
+  const lost = kernels?.deviceLost();
+  if (!isDeviceLoss(err) && lost === undefined) {
+    return err instanceof Error ? err : new Error(String(err));
   }
+  const message =
+    lost === undefined || isDeviceLoss(err) ? flattenMessage(err) : `${flattenMessage(err)}: ${flattenMessage(lost)}`;
   const dead = model;
   const deadKernels = kernels;
   model = null;
@@ -801,10 +811,6 @@ async function handleRunFailure(err: unknown): Promise<Error> {
       `The model will be reloaded on the next message; the conversation so far is kept.`,
     "device-lost",
   );
-}
-
-function looksLikeDeviceLoss(message: string): boolean {
-  return /previous error|device (is )?lost|failed to allocate|mapAsync|OrtRun/i.test(message);
 }
 
 /** Rebuilds the session the last load() described, after a device loss. */

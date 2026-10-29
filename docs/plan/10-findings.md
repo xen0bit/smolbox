@@ -1760,3 +1760,42 @@ and CI rebuilds and tests the image from current packages rather than the cached
 Why the epoll notification is lost at all (emulated interrupt delivery, or the guest kernel's
 epoll on a pipe) is not established. The fix does not depend on knowing. Any agent code that
 blocks while waiting on the guest should do so with a timer armed.
+
+### 10.33 A device lost under LFM3 that nothing recognised, and a warm-up the first prompt raced (2026-10-29)
+
+**The report.** The deployed site on an AMD RDNA 3 adapter (Vulkan, `shader-f16` and `subgroups`;
+this is the f16 path, which §10.30 never ran because the local adapter has no `shader-f16`).
+LFM3 loaded from the hub in 21 s. Then the first message ("Create a feature complete Python HTTP
+API") failed with `AggregateError: Pipelined generation and in-flight cleanup both failed`, thrown
+from the engine's pipelined decode. The console had `vkQueueSubmit failed with
+VK_ERROR_DEVICE_LOST`, so the device was gone.
+
+**What was ours: the loss was never recognised.** The worker's recovery is to drop the session,
+rebuild it on the next request, and have the loop retry the turn once (§10.10). It only runs for a
+failure `looksLikeDeviceLoss` matched, and that tested the outer message only. The engine's
+`AggregateError` names no cause: the `DeviceLostError` is in its `errors`. So the page showed a raw
+stack and kept a dead session, and every later message would have failed against it.
+`device-loss.ts` now searches the error tree (`errors` and `cause`) and accepts the engine's
+`DeviceLostError` by name. `KernelEngine` also listens to the session's own `lost` promise, the
+engine's authoritative signal, which covers a loss whose run error says nothing and a loss
+between turns. The note the page shows on that retry no longer asserts out-of-memory as the cause.
+
+**What was ours: the first prompt raced the engine's warm-up.** `from_pretrained` reports Ready and
+*then* starts `warmRemainingPrefill` without awaiting it. That builds a prefill graph per block
+length (16, 32, 48, 64, 128, 256, 512) on the same generation cache the first prompt uses. The
+engine's own page leaves a person typing in that gap. This page sends a queued message the moment
+the model is ready. Instrumented on the RTX 4070 Ti SUPER: the warm-up ran 8082→8411 ms, and the
+first prompt's 640-token prefill (blocks 512 + 128) started at 8129 ms, inside it. The builds are
+pooled per block length, so they did not duplicate. But compiling and allocating the remaining
+graphs overlapped real prefill and decode work, a combination the engine's own page does not
+exercise. `loadLfm3` now awaits `warmRemainingPrefill` itself, which joins the in-flight builds.
+Measured afterwards: warm-up ended at 8460 ms, the first prefill started at 8478 ms, and the load
+was ~0.35 s longer.
+
+**What is not established.** The GPU fault was not reproduced. The NVIDIA adapter here ran the
+reported prompt through six tool rounds (~2000 positions) without error, both before and after the
+change. Whether the race caused the loss on AMD, or the f16 kernels fault there on their own, needs
+that hardware. The decisive check is whether the engine's own Space
+(`webml-community/LFM3-1.7B-WebGPU-Pi`) survives the same prompt on the same machine. If it does
+not, the fault is upstream, and the recognised loss above is what keeps the page usable: reload,
+retry once, and a clear message if the retry dies too.

@@ -430,6 +430,11 @@ loader sets `QWEN35_NO_PREFILL_GRAPH=1` on those adapters only (measured 37 → 
   have controls in `lfm3.test.ts`, against the real template.
 - **The decode depth the engine tunes at load is passed on explicitly**, because
   `streamTokenIdsFromCache` called directly does not pick it up.
+- **The load awaits the engine's background prefill warm-up** (`finishWarmup`). `from_pretrained`
+  reports ready and then keeps building graphs on the cache the first prompt uses (§10.33).
+- **A device loss can hide inside an `AggregateError`.** The pipelined decode wraps it with its
+  cleanup failure, so classify failures with `isDeviceLoss` (`device-loss.ts`), which searches the
+  whole error tree. Never test only `err.message`, or the reload-and-retry path never runs.
 
 The engine refuses any GGUF tensor type but F32, Q4_0, Q4_K and Q6_K, so of Liquid's seven packs
 only `Q4_K_M` (the entry) and `QAD-Q4_0` load.

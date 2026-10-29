@@ -43,6 +43,13 @@ export interface KernelSession {
   deviceInfo(): DeviceInfo;
   reset(): void;
   dispose(): void;
+  /**
+   * Settles when the engine sees its device lost, for an engine that says so.
+   *
+   * The engine resolves it with the reason rather than rejecting, and a run that
+   * was in flight may fail with an error that does not mention it (PLAN §10.33).
+   */
+  readonly lost?: Promise<unknown>;
 }
 
 export class KernelEngine {
@@ -52,7 +59,21 @@ export class KernelEngine {
   // agent loop re-sends the entire history on every tool round trip.
   private lastIds: number[] = [];
 
-  private constructor(private readonly model: KernelSession) {}
+  private lostWith: unknown = undefined;
+
+  private constructor(private readonly model: KernelSession) {
+    model.lost?.then(
+      (reason) => {
+        this.lostWith = reason ?? new Error("the GPU device was lost");
+      },
+      () => {},
+    );
+  }
+
+  /** What the engine reported when its device was lost, or undefined while it is alive. */
+  deviceLost(): unknown {
+    return this.lostWith;
+  }
 
   /**
    * Wraps an already-built engine. The seam CI needs.

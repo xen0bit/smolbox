@@ -410,7 +410,8 @@ function onEvent(ev: AgentEvent): void {
         // happening — otherwise it reads as a hang partway through an answer.
         status.model("loading", "rebuilding after a GPU error");
         bubble("note", "gpu")!.textContent =
-          `the GPU ran out of memory prefilling ~${ev.was} chars of prompt, which takes the inference ` +
+          `the GPU device was lost running ~${ev.was} chars of prompt (running out of memory is the usual ` +
+          `cause), which takes the inference ` +
           `session with it. Rebuilding it and retrying this turn with a ${ev.chars}-char budget; ` +
           `this model will start there on this machine from now on.`;
         // A device loss is the only hard evidence anyone has about what this
