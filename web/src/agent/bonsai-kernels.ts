@@ -7,7 +7,7 @@
 //  - It reads a single GGUF, not a transformers repo. The tokenizer and the chat
 //    template live in the GGUF's metadata and there is no tokenizer.json on the
 //    hub for AutoTokenizer to load, so the prompt codec comes from the engine
-//    too (see PromptCodec below).
+//    too (see prompt-codec.ts).
 //  - It is not published as a module. The Space inlines it into index.html;
 //    `make bonsai-kernels` cuts it out (bonsai-extract.ts) into dist/kernels,
 //    and `make site` ships it. The import below stays dynamic so `make web`
@@ -20,14 +20,12 @@
 // skip_special_tokens, exactly as Gemma's does, and both would break tool
 // calling for the same reasons (gemma-kernels.ts). So only the forward pass is
 // the engine's; the template is rendered here, with the tool schema, by the
-// same jinja implementation transformers.js uses. PLAN §10.28.
-
-import { Template } from "@huggingface/jinja";
+// same jinja implementation transformers.js uses (prompt-codec.ts). PLAN §10.28.
 
 import { asset } from "../base.ts";
 import { adapterHasShaderF16 } from "./kernel-f32.ts";
 import { type DeviceInfo, type KernelSession, KernelEngine } from "./kernel-engine.ts";
-import type { ChatMessage } from "./messages.ts";
+import { type GgufTokenizer, type PromptCodec, codecFor } from "./prompt-codec.ts";
 
 /** Where `make bonsai-kernels` puts the extracted engine, under the site's base. */
 export const BONSAI_BUNDLE_PATH = asset("kernels/bonsai/ternary-bonsai-2.js");
@@ -43,23 +41,9 @@ export const BONSAI_BUNDLE_PATH = asset("kernels/bonsai/ternary-bonsai-2.js");
  */
 export const NO_PREFILL_GRAPH_FLAG = "QWEN35_NO_PREFILL_GRAPH";
 
-/** A prompt's way in and a completion's way out, for a backend with no AutoTokenizer. */
-export interface PromptCodec {
-  render(messages: readonly ChatMessage[], tools: readonly unknown[]): string;
-  encode(prompt: string): number[];
-  decode(ids: readonly number[]): string;
-}
-
-/** The engine's tokenizer, as far as this file uses it. */
-export interface BonsaiTokenizer {
-  config: { chat_template?: string; bos_token?: string; eos_token?: string };
-  encode(text: string, opts: { add_special_tokens: boolean }): { ids: number[] };
-  decode(ids: readonly number[], opts: { skip_special_tokens: boolean }): string;
-}
-
 /** The slice of a loaded TernaryBonsai2 session this file uses. */
 export interface BonsaiSession extends KernelSession {
-  readonly tokenizer: BonsaiTokenizer;
+  readonly tokenizer: GgufTokenizer;
   deviceInfo(): DeviceInfo;
 }
 
@@ -77,34 +61,6 @@ interface BonsaiModule {
       modelUrl: string,
       opts: { onProgress?(p: BonsaiProgress): void },
     ): Promise<BonsaiSession>;
-  };
-}
-
-/**
- * Builds the codec from the engine's tokenizer and the GGUF's own template.
- *
- * Exported for the unit tests, which run it against a fake tokenizer and the
- * real template text — the rendering is the part of this backend that CI can
- * check, and a template that silently drops the tools is exactly the failure
- * the engine's own renderer has.
- */
-export function codecFor(tokenizer: BonsaiTokenizer): PromptCodec {
-  const source = tokenizer.config.chat_template;
-  if (!source) {
-    throw new Error("the Bonsai GGUF carries no chat_template in its tokenizer metadata");
-  }
-  const template = new Template(source);
-  return {
-    render: (messages, tools) =>
-      template.render({
-        messages: messages as unknown as Record<string, unknown>[],
-        tools: tools as unknown as Record<string, unknown>[],
-        add_generation_prompt: true,
-        bos_token: tokenizer.config.bos_token ?? "",
-        eos_token: tokenizer.config.eos_token ?? "",
-      }),
-    encode: (prompt) => tokenizer.encode(prompt, { add_special_tokens: false }).ids,
-    decode: (ids) => tokenizer.decode(ids, { skip_special_tokens: false }),
   };
 }
 

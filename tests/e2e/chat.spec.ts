@@ -13,6 +13,7 @@ import { expect, test } from "@playwright/test";
 
 import { BOOT_TIMEOUT_MS, installMount, walkFixture, type FixtureNode } from "./harness.ts";
 
+const SCRIPTS_MODEL = "lfm2.5-2.6b";
 const scriptsPath = fileURLToPath(new URL("../agent/scripts.json", import.meta.url));
 const mountDir = fileURLToPath(new URL("../../testdata/mount", import.meta.url));
 
@@ -58,6 +59,10 @@ async function boot(page: import("@playwright/test").Page) {
   const fixture = (await walkFixture(mountDir)) as FixtureNode;
   await installMount(page, fixture, "__smolagent");
 
+  // The scripts are LFM2-family output, so the dialect is pinned to the one
+  // they were captured from rather than inherited from whatever the registry's
+  // default happens to be.
+  await page.evaluate((key) => (globalThis as AgentGlobal).__smolagent!.setModel(key), SCRIPTS_MODEL);
   await page.evaluate((s) => (globalThis as AgentGlobal).__smolagent!.useFake(s), scripts);
   await page.evaluate(
     (t) => (globalThis as AgentGlobal).__smolagent!.bootVm(t),
@@ -153,7 +158,12 @@ test.describe("agent chat loop", () => {
     const events = await send(page, "loop forever");
 
     expect(events.filter((e) => e.kind === "tool-end")).toHaveLength(3);
+    // At the cap the loop asks for an answer instead of ending on a tool
+    // result, and the log says the turn answered rather than that it failed.
+    const answer = events.filter((e) => e.kind === "assistant").at(-1);
+    expect(answer?.text).toBe("The commands printed 1, 2 and 3.");
     expect(events.at(-1)).toMatchObject({ kind: "stopped", reason: "iteration-cap" });
+    await expect(page.locator("#log .msg.note").last()).toContainText("answered from what it had");
   });
 
   test("stop interrupts a turn in flight", async ({ page }) => {
@@ -335,14 +345,17 @@ test.describe("agent chat loop", () => {
       const budget = events.find((e) => e.kind === "budget")!;
 
       const stored = JSON.parse((await learned(page))!) as Record<string, number>;
-      expect(stored["lfm2.5-2.6b"]).toBe(budget.chars!);
+      expect(stored[SCRIPTS_MODEL]).toBe(budget.chars!);
       // The dialog shows the learned ceiling, not the registry's arithmetic.
       await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
 
       // And it is still there in the next session, which is the whole point:
       // the first chat on a machine pays for the discovery, no later one does.
+      // The ceiling is per model and the page reopens on the registry default,
+      // so select the model that learned it before reading the field.
       await page.reload();
       await page.waitForFunction(() => Boolean((globalThis as AgentGlobal).__smolagent));
+      await page.evaluate((key) => (globalThis as AgentGlobal).__smolagent!.setModel(key), SCRIPTS_MODEL);
       await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
     });
 

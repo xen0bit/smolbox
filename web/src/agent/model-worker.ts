@@ -19,7 +19,9 @@ import {
 } from "@huggingface/transformers";
 
 import { asset } from "../base.ts";
-import { type PromptCodec, loadBonsai } from "./bonsai-kernels.ts";
+import { loadBonsai } from "./bonsai-kernels.ts";
+import { loadLfm3 } from "./lfm3-kernels.ts";
+import type { PromptCodec } from "./prompt-codec.ts";
 import { GemmaKernelEngine } from "./gemma-kernels.ts";
 import type { KernelEngine } from "./kernel-engine.ts";
 import { ModelCache } from "./model-cache.ts";
@@ -147,8 +149,9 @@ let model: PreTrainedModel | null = null;
 // knows the difference.
 let kernels: KernelEngine | null = null;
 // Set instead of `tokenizer` for a backend whose checkpoint has no
-// transformers.js tokenizer at all: the Bonsai GGUF carries its tokenizer and
-// template in its own metadata, so the engine supplies both (bonsai-kernels.ts).
+// transformers.js tokenizer at all: the Bonsai and LFM3 GGUFs carry their
+// tokenizer and template in their own metadata, so the engine supplies both
+// (prompt-codec.ts).
 let codec: PromptCodec | null = null;
 // The kernel path has no InterruptableStoppingCriteria to hand to a library —
 // it is our own loop — so cancellation is a flag it polls.
@@ -273,20 +276,22 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
   // The revision is passed so the hub path honours the pin the registry exists
   // to hold; it is ignored for a local load, where the path carries no revision.
   //
-  if (entry.backend === "bonsai-kernels") {
+  if (entry.backend === "bonsai-kernels" || entry.backend === "lfm3-kernels") {
     // No AutoTokenizer: this repo is one GGUF and nothing else. The engine
     // reads the tokenizer and template out of the file's metadata.
     tokenizer = null;
     chatTemplate = null;
-    const url = bonsaiWeightUrl(entry, local);
-    const loadedEngine = await loadBonsai(url, (p) => {
+    const url = ggufWeightUrl(entry, local);
+    const onProgress = (p: { message?: string; fraction?: number }) => {
       if (typeof p.fraction === "number") {
         postProgress(p.message ?? "weights", Math.round(p.fraction * 100));
       }
-    });
+    };
+    const lfm3 = entry.backend === "lfm3-kernels";
+    const loadedEngine = lfm3 ? await loadLfm3(url, onProgress) : await loadBonsai(url, onProgress);
     kernels = loadedEngine.engine;
     codec = loadedEngine.codec;
-    post({ type: "log", message: `bonsai kernels on ${kernels.info()}` });
+    post({ type: "log", message: `${lfm3 ? "lfm3" : "bonsai"} kernels on ${kernels.info()}` });
     post({
       type: "ready",
       source: local ? "local" : "hub",
@@ -332,17 +337,17 @@ async function load(local: boolean, modelKey: string, dtype: Dtype): Promise<voi
 }
 
 /**
- * Where the Bonsai engine reads its one GGUF from.
+ * Where a GGUF engine (Bonsai, LFM3) reads its one file from.
  *
  * Always a full URL ending in `.gguf`: the engine treats any id with that
  * suffix as the file itself, so a hub load names the pinned revision here
  * rather than trusting the engine's default of `main`. The local path is
  * resolved against the worker's own URL, as the engine would.
  */
-function bonsaiWeightUrl(entry: ModelEntry, local: boolean): string {
+function ggufWeightUrl(entry: ModelEntry, local: boolean): string {
   const file = entry.ggufFile;
   if (!file) {
-    throw new Error(`${entry.key}: a bonsai-kernels entry must name its ggufFile`);
+    throw new Error(`${entry.key}: a ${entry.backend} entry must name its ggufFile`);
   }
   return local
     ? new URL(`${LOCAL_MODEL_PATH}${entry.repo}/${file}`, (globalThis as { location?: { href: string } }).location?.href).href
@@ -674,7 +679,7 @@ async function prefillAndGenerate(
 }
 
 /**
- * A turn on a backend that brought its own codec (bonsai-kernels.ts).
+ * A turn on a backend that brought its own codec (prompt-codec.ts).
  *
  * The same guard and the same kernel loop as the transformers.js-tokenized
  * path; only where the prompt's ids come from differs.

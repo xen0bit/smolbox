@@ -44,7 +44,7 @@ pure and drive it with `FakeModelClient`.
 
 | Command | Purpose |
 |---|---|
-| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm web gemma-kernels bonsai-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
+| `make` / `make all` / `make everything` | **the default goal.** The whole served set from a clean checkout: `build wasm web gemma-kernels bonsai-kernels lfm3-kernels compress models`, in that order. `all` is an alias, so the conventional name and the bare command cannot drift. Includes an ~11 GB weight pull as its last, resumable step |
 | `make lint` | golangci-lint (v2) + `bunx --bun tsc --noEmit` |
 | `make test` | Go unit tests (no Docker) |
 | `make vm-image` | build guest image `smolbox/vm:dev` from `vm/Dockerfile` |
@@ -55,23 +55,24 @@ pure and drive it with `FakeModelClient`.
 | `make generate` | rewrite `docs/schema/*.json` from the Go wire types — the only sanctioned way to change them |
 | `make build` | `bin/smolbox` CLI (`exec`, `repl`) |
 | `make web` / `make serve` | bundle browser worker + page into `web/dist`; Bun dev server with COOP/COEP serving artifacts from `DIST_DIR` (default `dist/`) |
-| `SMOLBOX_MODEL_SOURCE=local make web` (or `make web-local`) | the same bundle, reading weights from `dist/models` instead of huggingface.co. **The default is `hub`**, and a hub build disables any registry entry marked `requiresLocalBuild` — none today; both kernel engines ship with the site. `make web` puts the hub build back |
+| `SMOLBOX_MODEL_SOURCE=local make web` (or `make web-local`) | the same bundle, reading weights from `dist/models` instead of huggingface.co. **The default is `hub`**, and a hub build disables any registry entry marked `requiresLocalBuild` — none today; every kernel engine ships with the site. `make web` puts the hub build back |
 | `make compress` | write a `.br` + `.gz` beside every compressible artifact in `dist/` and `web/dist`; `web/serve.ts` serves them by negotiation and falls back to identity when absent |
 | `make test-web` | `bun test web` (protocol + session + fsbridge + tool-surface + serve negotiation unit tests) |
 | `make test-e2e` | Playwright: boots `dist/smolbox.wasm` in headless Chromium — `echo hello`, OPFS mount smoke, and the full conformance table (M5) |
 | `make test-e2e-firefox` | Playwright **in Firefox**: mounts `testdata/mount` through the `<input webkitdirectory>` picker fallback and reads it from the guest |
-| `make model` | pull the pinned LFM2 checkpoint (1.22 GB) into `dist/models` — needed by a `local` build of the agent page (M8) |
+| `make model` | pull the default registry entry (LFM3 1.7B, a 1.10 GB GGUF) into `dist/models` — needed by a `local` build of the agent page |
 | `make model MODEL=<key>` | pull a specific registry entry; `MODEL=--list` shows them |
 | `make models` | pull **every** downloadable registry entry; keeps going past a failure and reports at the end |
 | `make gemma-kernels` | download the pinned Gemma 4 WebGPU kernel engine into `dist/kernels` |
 | `make bonsai-kernels` | extract the pinned Ternary Bonsai 2 kernel engine from its Space's `index.html` into `dist/kernels/bonsai` |
-| `make site` | the GitHub Pages payload: the hub build of the pages, `smolbox.wasm`, and both kernel engines |
+| `make lfm3-kernels` | download the pinned LFM3 kernel engine into `dist/kernels/lfm3`, adding the one getter the worker needs (`lfm3-expose.ts`) |
+| `make site` | the GitHub Pages payload: the hub build of the pages, `smolbox.wasm`, and the three kernel engines |
 | `make test-e2e-agent` | Playwright: the agent against the **real** model at `/agent/`. **Opt-in** (`SMOLBOX_WEBGPU=1`), needs a real GPU and `make model`; builds through `web-local` so it reads the disk rather than the hub; **never runs in CI** |
 | `make clean` | remove `dist/ bin/ web/dist/` |
 
 Everything gate = `make lint test` then `make test-integration` + `make test-conformance` (both need
 `dist/smolbox.wasm`). M5 also gates `make test-web` + `make test-e2e`. M8's `make test-e2e-agent` is
-**not** part of the gate — it needs a GPU and 1.22 GB of weights, so run it by hand when touching
+**not** part of the gate — it needs a GPU and ~1.1 GB of weights, so run it by hand when touching
 `web/src/agent/`.
 
 ## How the VM is built (the two Dockerfiles)
@@ -113,6 +114,13 @@ Keep stdin as a persistent `os.Pipe` whose write end stays open for the VM's lif
 `internal/vm/vm.go`). Never use an `io.Pipe` reader for stdin — wazero's nonblocking
 path mishandles it. End the session with the `shutdown` op (`Session.Close`), not by closing stdin;
 closing stdin is only the forced-termination fallback.
+
+### The guest agent never blocks without a timer armed
+`smolagentd` is PID 1 inside an emulator that can lose an epoll wakeup. A bare `<-waitCh` with no
+timer armed let the Go runtime park in `epoll_wait(-1)`, and a lost notification then hung the VM
+past its own `timeout_ms`. A pcre2 security update made it reproducible (PLAN §10.31–§10.32). Wait
+through `awaitWithHeartbeat`, or anything else that keeps a ticker armed, never on a bare channel.
+Do not "fix" a hang like this by pinning a package back.
 
 ### The read-only mount is enforced at the host FS boundary
 `internal/vm` mounts a read-only wazero `DirFS` wrapped in `confinedFS` (`internal/vm/confine.go`);
@@ -183,6 +191,14 @@ The File System Access API has no symlink concept, so `MountHost` keeps a path�
 before the directory handle, and the worker's readdir/stat report `FILETYPE_SYMBOLIC_LINK`. The e2e
 fixture derives it from `testdata/mount`'s real symlink, keeping the single-conformance-table
 invariant. When adding a symlink to the fixture, the browser must see it via this table, not OPFS.
+
+### The shim's Filestat writes the wrong layout; `WasiFilestat` is the fix
+browser_wasi_shim 0.4.2 writes `atim`/`mtim`/`ctim` at offsets 38/46/52 instead of WASI's 40/48/56,
+so a real timestamp overwrites the top of `size` and is itself read back misaligned — `hello.txt`
+showed as 8.2 EB dated 2380, and a model reported both. It was invisible while every timestamp was
+zero. `worker-fd.ts` builds every bridge stat as a `WasiFilestat`, which overrides `write_bytes`;
+never construct a bare `wasi.Filestat` for anything with a time on it. `worker-fd.test.ts` reads the
+bytes back at the WASI offsets, with the upstream class as the control (PLAN §10.30).
 
 ### TextDecoder/TextEncoder throw on SharedArrayBuffer views
 Chromium rejects decoding a `Uint8Array` whose buffer is a `SharedArrayBuffer` ("...must not be
@@ -339,18 +355,20 @@ first-person deliberation as the reply. `splitThinking` knows three shapes: `non
 model writes both tags — Qwen3) and `prompt-opened` (the template ends the prompt with a bare
 `<think>`, so the completion starts inside the block — LFM2.5).
 
-### There are three inference engines now, and only one interface
+### There are four inference engines now, and only one interface
 `ModelEntry.backend` picks between them. `transformers` is onnxruntime-web through
 transformers.js; `gemma4-kernels` is the webml-community WebGPU engine, which reads safetensors
 itself and carries its own WGSL; `bonsai-kernels` is the same runtime's build for Ternary Bonsai 2,
-reading one GGUF. They meet at `ModelClient` and nowhere else — the loop, the
+reading one GGUF; `lfm3-kernels` is the same family again for LFM3, also a GGUF, and runs the
+default entry. They meet at `ModelClient` and nowhere else — the loop, the
 dialects, the tool registry and the UI cannot tell them apart, and it should stay that way.
 
 The kernel engines are **pulled at a pinned revision** into gitignored `dist/kernels/` (`make
-gemma-kernels`, `make bonsai-kernels`), and `make site` ships them with the Pages deployment, so
-both kernel entries are selectable there. The worker imports each dynamically (`gemma-kernels.ts`,
-`bonsai-kernels.ts`); do not turn that into a static import — `make web` must work on a checkout
-that has never run the fetch. The Pages smoke test HEADs both engines after every deploy.
+gemma-kernels`, `make bonsai-kernels`, `make lfm3-kernels`), and `make site` ships them with the
+Pages deployment, so every kernel entry is selectable there. The worker imports each dynamically
+(`gemma-kernels.ts`, `bonsai-kernels.ts`, `lfm3-kernels.ts`); do not turn that into a static import
+— `make web` must work on a checkout that has never run the fetch. The Pages smoke test HEADs all
+three engines after every deploy.
 
 Two of its own behaviours are deliberately bypassed and both would silently break tool calling if
 restored: its `encodePrompt` renders the chat template with `tools: null`, and its `generate()`
@@ -393,6 +411,28 @@ every other entry (PLAN §10.28):
 
 Without `shader-f16`, the engine's prefill graph is slower than token-at-a-time decode, so the
 loader sets `QWEN35_NO_PREFILL_GRAPH=1` on those adapters only (measured 37 → 50 tok/s).
+
+### LFM3, the default: a getter added, and history replayed verbatim
+`lfm3-1.7b` runs on `web/src/agent/lfm3-kernels.ts`, and shares Bonsai's GGUF codec
+(`prompt-codec.ts`) and call grammar. Three things are its own (PLAN §10.30):
+
+- **The engine is a real module, with its session behind a private field.**
+  `Lfm3ForCausalLM.from_pretrained()` returns a wrapper exposing only the engine's own agent API,
+  which renders the template itself and parses calls — the layer this project replaces.
+  `lfm3-expose.ts` adds one `_session` getter to that wrapper at fetch time, matched structurally
+  and exactly once. If you bump the Space `revision` in `web/fetch-kernels.ts`, re-run `make
+  lfm3-kernels` and `bun test web/src/agent/lfm3-expose.test.ts`.
+- **History is the model's own text, plus the `<think>` the prompt opened.** The template renders
+  an assistant turn as `<think>` + reasoning + `</think>` + content with no whitespace of its own,
+  so a split-and-rebuild (Bonsai's `replayReasoning`) cannot promise the prefix. The `lfm3` dialect
+  keeps `raw` history, and the codec's `prepareHistory` puts back the opening tag; rendering
+  uses `preserve_thinking: true` so a new user message does not rewrite older turns. Both halves
+  have controls in `lfm3.test.ts`, against the real template.
+- **The decode depth the engine tunes at load is passed on explicitly**, because
+  `streamTokenIdsFromCache` called directly does not pick it up.
+
+The engine refuses any GGUF tensor type but F32, Q4_0, Q4_K and Q6_K, so of Liquid's seven packs
+only `Q4_K_M` (the entry) and `QAD-Q4_0` load.
 
 **`web/serve.ts` resolves request paths with `resolveRequestPath`, never `new URL(rel, root)`.**
 The URL resolver reads a remainder starting with `/` as an absolute path, so `/models//etc/passwd`
@@ -498,7 +538,7 @@ would cap that model's prompt at ~1400 tokens for memory it does not allocate.
 
 ### Dialects: verified means a transcript exists
 `Dialect.verified` is false for anything implemented from documentation. `lfm2`, `lfm2.5`, `hermes`,
-`gemma4`, `qwen3.5` and `bonsai` are verified; `llama` is marked unverified and says so in the UI. Promote a
+`gemma4`, `qwen3.5`, `bonsai` and `lfm3` are verified; `llama` is marked unverified and says so in the UI. Promote a
 dialect by capturing a real transcript, never by reading a vendor doc — that is the M8 lesson encoded
 as a type.
 
@@ -564,6 +604,35 @@ chip and goes indeterminate — never frozen — when a response carries no iden
 Two things the e2e suites read that must keep working: the per-file model progress line
 (`[smolagent] loading <file>: <pct>%`, counted by `model-cache.spec.ts`) and the chips'
 `data-state` attribute (`settings.spec.ts`, `agent-console.spec.ts`).
+
+### The chat log follows the reader, not the stream
+Both the chat log and the terminal follow new output **only while the reader is already at the
+bottom** (`web/src/follow.ts`, unit-tested). They used to set `scrollTop = scrollHeight` on every
+append, so a reader who scrolled up mid-answer was thrown back down with every token. Scrolling up,
+a wheel tick upward or PageUp detaches; reaching the bottom, sending a message or the "↓ latest"
+button re-attaches. A wheel tick detaches *immediately*, not on the following `scroll` event — a
+token landing in between would otherwise yank the view back. Never reintroduce an unconditional
+scroll-to-bottom; call `follower.update()` after changing the log instead.
+
+Streamed tokens are coalesced into one render per animation frame (`scheduleRender`); every render
+rebuilds the bubble from the whole turn, so per-token rendering spends a fast model's main thread on
+layout. Anything that finishes a turn (`assistant`, `tool-start`, `error`, `stopped`) must
+`cancelRender()` first, or a stale frame repaints the preview over the parsed result.
+
+**The model's prose is markdown, rendered from nodes, never markup** (`markdown.ts`): every
+answer there is model text written after reading the user's folder, so `innerHTML` on this path
+would execute whatever a README contains. Reasoning and tool output stay plain text. Tool cards show
+`toolView(rendered)` — the streams without the `exit_code`/`<stdout>` scaffolding, which the card's
+label already carries — and fall back to the rendered text verbatim for any shape it does not
+recognise; `tool-view.test.ts` runs it over every case in `tests/tool/render-cases.json`.
+
+### At the cap, ask for an answer
+When a turn uses `maxIterations` tool calls, `Conversation.wrapUp()` adds `WRAP_UP_PROMPT` as a user
+turn (in history, not emitted as a `user` event) and generates once more; any call in that turn is
+not run. Before this, a model that double-checked once too often — LFM3 does — ended the turn on a
+tool result with no answer at all. A scripted turn for it in `tests/agent/scripts.json` matches on
+the prompt's text, because `FakeModelClient` starts a new script whenever the user-message count
+changes.
 
 ### The VM's phase is named by the worker, not guessed from its log line
 `web/src/vm-status.ts` owns the mapping from a phase to what either page shows, and

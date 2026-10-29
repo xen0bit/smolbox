@@ -16,7 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { openaiTool } from "../../tool.ts";
-import { type BonsaiTokenizer, codecFor } from "../bonsai-kernels.ts";
+import { type GgufTokenizer, codecFor } from "../prompt-codec.ts";
 import { Conversation, DEFAULTS } from "../conversation.ts";
 import { FakeModelClient } from "../fake-model.ts";
 import type { ChatMessage } from "../messages.ts";
@@ -44,7 +44,7 @@ const codec = codecFor({
   config: { chat_template: TEMPLATE },
   encode: () => ({ ids: [] }),
   decode: () => "",
-} satisfies BonsaiTokenizer);
+} satisfies GgufTokenizer);
 
 describe("bonsai parseTurn", () => {
   test("CAPTURED: a call after reasoning the prompt opened", () => {

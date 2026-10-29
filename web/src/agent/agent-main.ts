@@ -7,6 +7,7 @@
 // about WebGPU — that is what lets CI drive it against FakeModelClient.
 
 import { asset } from "../base.ts";
+import { Follower, SCROLL_UP_KEYS } from "../follow.ts";
 import { MountHost, type DirectoryHandleLike } from "../fsbridge/main-host.ts";
 import type { Caps } from "../protocol.ts";
 import { isDownloading, isWorkerPhase, vmChip } from "../vm-status.ts";
@@ -34,7 +35,9 @@ import { Settings } from "./settings.ts";
 import type { ModelClient } from "./model-client.ts";
 import { WorkerModelClient } from "./model-client.ts";
 import type { ParsedCall, StreamPreview } from "./parse.ts";
+import { renderMarkdown } from "./markdown.ts";
 import { ToolRegistry } from "./tool-registry.ts";
+import { toolView } from "./tool-view.ts";
 import type { TemplateTool } from "./user-tools.ts";
 
 // The registry's default, unless this build cannot offer it — a hub build must
@@ -62,6 +65,47 @@ const sendEl = el("send");
 const stopEl = el("stop");
 const startEl = el("start");
 const pickEl = el("pick");
+const jumpEl = el("jump");
+const newChatEl = el("new-chat");
+const activityEl = el("activity");
+// The welcome card. It lives inside the log so the log is never a blank box,
+// and CSS hides it as soon as there is a message (`#log:has(.msg)`).
+const emptyEl = el("empty");
+
+/**
+ * The log follows the conversation only while the reader is at the bottom.
+ *
+ * It used to jump to the bottom on every streamed token, so scrolling up to
+ * read a tool result mid-answer was a fight the reader lost dozens of times a
+ * second. See follow.ts; the button is how a detached reader gets back.
+ */
+const follower = logEl
+  ? new Follower(logEl, (following) => {
+      if (jumpEl) {
+        jumpEl.hidden = following;
+      }
+    })
+  : null;
+logEl?.addEventListener("scroll", () => follower?.onScroll(), { passive: true });
+logEl?.addEventListener(
+  "wheel",
+  (ev) => {
+    if ((ev.deltaY ?? 0) < 0) {
+      follower?.onUserScrollUp();
+    }
+  },
+  { passive: true },
+);
+// A drag on a touch screen has no direction until the scroll event says so;
+// detaching on any drag is the safe reading, and the scroll event re-attaches
+// a reader who dragged to the bottom.
+logEl?.addEventListener("touchmove", () => follower?.onUserScrollUp(), { passive: true });
+logEl?.addEventListener("keydown", (ev) => {
+  if (SCROLL_UP_KEYS.has(ev.key ?? "")) {
+    follower?.onUserScrollUp();
+  }
+});
+jumpEl?.addEventListener("click", () => follower?.jump());
 
 /**
  * The three things that can be up, loading or broken independently.
@@ -191,7 +235,7 @@ function bubble(cls: string, who: string): Element | null {
   wrap.appendChild(label);
   wrap.appendChild(body);
   logEl.appendChild(wrap);
-  logEl.scrollTop = logEl.scrollHeight;
+  follower?.update();
   return body;
 }
 
@@ -241,6 +285,9 @@ const runner: ToolRunner = {
 };
 
 let events: AgentEvent[] = [];
+// Whether this message has had an answer yet, so the cap's note can say the
+// right thing: a turn that answered at the limit did not fail.
+let answered = false;
 let streaming: Element | null = null;
 
 const convo = new Conversation(
@@ -279,24 +326,31 @@ function onEvent(ev: AgentEvent): void {
     case "user":
       bubble("user", "you")!.textContent = ev.text;
       endStream();
+      answered = false;
       break;
     case "token": {
       turnRaw += ev.text;
-      renderStream(convo.options().dialect.preview(turnRaw));
+      activity.tokens++;
+      scheduleRender();
       break;
     }
     case "assistant":
       // The parsed turn supersedes the preview: same content, but split by a
       // parser that has seen the whole completion rather than a prefix of it.
+      cancelRender();
       finishStream(ev.text, ev.reasoning ?? "", ev.toolCalls);
+      answered ||= Boolean(ev.text) && ev.toolCalls === 0;
       break;
     case "tool-start": {
+      cancelRender();
       endStream();
+      const cmdText = String(ev.call.args.cmd ?? ev.call.name);
+      activity.phase = `running ${cmdText.length > 48 ? `${cmdText.slice(0, 47)}…` : cmdText}`;
       const body = bubble("tool", "tool · running…");
       if (body) {
         const cmd = document.createElement("span");
         cmd.className = "cmd";
-        cmd.textContent = `$ ${String(ev.call.args.cmd ?? ev.call.name)}`;
+        cmd.textContent = `$ ${cmdText}`;
         const out = document.createElement("span");
         out.className = "pending";
         out.textContent = "waiting for the guest…";
@@ -309,24 +363,25 @@ function onEvent(ev: AgentEvent): void {
     case "tool-end": {
       const cmdText = `$ ${ev.request?.cmd ?? String(ev.call.args.cmd ?? "")}`;
       const label = `tool · exit ${ev.exitCode}`;
+      activity.phase = "reading the result";
+      let body = pendingTool?.body ?? null;
       if (pendingTool) {
         setLabel(pendingTool.body, label, ev.exitCode === 0 ? "tool" : "tool bad");
-        (pendingTool.body.firstChild as Element).textContent = cmdText;
-        pendingTool.out.className = "";
-        pendingTool.out.textContent = ev.rendered;
+        pendingTool.out.remove();
         pendingTool = null;
-        break;
+      } else {
+        body = bubble(ev.exitCode === 0 ? "tool" : "tool bad", label);
+        if (body) {
+          const cmd = document.createElement("span");
+          cmd.className = "cmd";
+          body.appendChild(cmd);
+        }
       }
-      const body = bubble(ev.exitCode === 0 ? "tool" : "tool bad", label);
       if (body) {
-        const cmd = document.createElement("span");
-        cmd.className = "cmd";
-        cmd.textContent = cmdText;
-        const out = document.createElement("span");
-        out.textContent = ev.rendered;
-        body.appendChild(cmd);
-        body.appendChild(out);
+        (body.firstChild as Element).textContent = cmdText;
+        body.appendChild(toolOutput(ev.rendered));
       }
+      follower?.update();
       break;
     }
     case "elided":
@@ -340,16 +395,16 @@ function onEvent(ev: AgentEvent): void {
         (ev.times > 1 ? `, ${ev.times} times this session — each one re-prefills the conversation` : "");
       break;
     case "budget":
-      endStream();
       if (ev.reason === "measured") {
         // Not a failure: a turn that worked reported what its prompt really
-        // cost in tokens, and the character budget stopped guessing. Quiet on
-        // purpose — nothing is wrong and nothing is being retried.
-        bubble("note", "context")!.textContent =
-          `measured this conversation's real characters-per-token; prompt budget tightened from ` +
-          `~${ev.was} to ~${ev.chars} chars to match what the model actually counts.`;
+        // cost in tokens, and the character budget stopped guessing. It arrives
+        // on nearly every turn, so it goes to the console rather than between
+        // the reader and the answer — nothing is wrong and nothing is retried.
+        log(`prompt budget measured: ~${ev.was} -> ~${ev.chars} chars`);
         break;
       }
+      cancelRender();
+      endStream();
       if (ev.reason === "device-lost") {
         // The retry is about to sit through a full reload, so say what is
         // happening — otherwise it reads as a hang partway through an answer.
@@ -372,13 +427,17 @@ function onEvent(ev: AgentEvent): void {
       }
       break;
     case "stopped":
+      cancelRender();
       endStream();
       bubble("note", "stopped")!.textContent =
-        ev.reason === "iteration-cap"
-          ? "stopped: hit the tool-call limit for this turn"
-          : "stopped by you";
+        ev.reason === "cancelled"
+          ? "stopped by you"
+          : answered
+            ? `used all ${convo.options().maxIterations} tool calls for this message, so the model answered from what it had`
+            : "stopped: hit the tool-call limit for this turn";
       break;
     case "error":
+      cancelRender();
       endStream();
       bubble("error", "error")!.textContent = ev.message;
       break;
@@ -405,11 +464,116 @@ function renderStream(p: StreamPreview): void {
   const think = p.reasoning ? thinkingBlock(streaming) : null;
   if (think) {
     think.body.textContent = p.reasoning;
-    think.summary.textContent = `thinking… (${p.reasoning.length} chars)`;
+    // The latest line of the scratchpad, live, so a model that thinks for a
+    // while visibly makes progress without the whole page of it being open.
+    think.summary.textContent = `thinking · ${reasoningTail(p.reasoning)}`;
   }
-  proseNode(streaming).textContent = p.text;
+  renderMarkdown(document, proseNode(streaming), p.text);
   statusNode(streaming).textContent = p.pendingCall ? "preparing a tool call…" : "";
-  scrollLog();
+  activity.phase = p.pendingCall ? "writing a tool call" : p.text ? "answering" : "thinking";
+  renderActivity();
+  follower?.update();
+}
+
+/** The last line of a scratchpad, cut to fit a summary. */
+function reasoningTail(reasoning: string): string {
+  const line = reasoning.trimEnd().split("\n").at(-1)?.trim() ?? "";
+  return line.length > 90 ? `…${line.slice(-89)}` : line;
+}
+
+// Tokens arrive far faster than a screen refreshes, and every render rebuilds
+// the bubble from the whole turn so far. Coalescing them into one render per
+// frame keeps a fast model from spending its main thread on layout.
+let renderHandle: number | null = null;
+
+function scheduleRender(): void {
+  if (renderHandle !== null) {
+    return;
+  }
+  renderHandle = requestAnimationFrame(() => {
+    renderHandle = null;
+    renderStream(convo.options().dialect.preview(turnRaw));
+  });
+}
+
+function cancelRender(): void {
+  if (renderHandle !== null) {
+    cancelAnimationFrame(renderHandle);
+    renderHandle = null;
+  }
+}
+
+/** A tool result for a person: the streams without their scaffolding. */
+function toolOutput(rendered: string): Element {
+  const out = document.createElement("div");
+  out.className = "tool-out";
+  const v = toolView(rendered);
+  const add = (cls: string, text: string) => {
+    const node = document.createElement("pre");
+    node.className = cls;
+    node.textContent = text;
+    out.appendChild(node);
+  };
+  if (v.raw !== null) {
+    add("stream", v.raw);
+    return out;
+  }
+  for (const note of v.notes) {
+    add("tool-note", note);
+  }
+  if (v.stdout !== null) {
+    add("stream", v.stdout);
+  }
+  if (v.stderr !== null) {
+    add("stream stderr", v.stderr);
+  }
+  if (v.stdout === null && v.stderr === null && v.notes.length === 0) {
+    add("tool-note", "(no output)");
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- activity
+//
+// One line under the composer saying what the agent is doing right now and how
+// fast: the thing a person watching a local model most wants to know, and the
+// thing the log alone cannot say while a turn is still thinking.
+
+const activity = { started: 0, firstToken: 0, tokens: 0, phase: "" };
+let activityTimer: ReturnType<typeof setInterval> | null = null;
+
+function startActivity(): void {
+  activity.started = performance.now();
+  activity.firstToken = 0;
+  activity.tokens = 0;
+  activity.phase = "reading the prompt";
+  renderActivity();
+  activityTimer ??= setInterval(renderActivity, 250);
+}
+
+function stopActivity(): void {
+  if (activityTimer !== null) {
+    clearInterval(activityTimer);
+    activityTimer = null;
+  }
+  const secs = (performance.now() - activity.started) / 1000;
+  if (activityEl) {
+    activityEl.textContent = activity.started ? `done in ${secs.toFixed(1)}s` : "";
+  }
+}
+
+function renderActivity(): void {
+  if (!activityEl || activityTimer === null) {
+    return;
+  }
+  const now = performance.now();
+  if (activity.tokens > 0 && activity.firstToken === 0) {
+    activity.firstToken = now;
+  }
+  const secs = (now - activity.started) / 1000;
+  const decoding = activity.firstToken ? (now - activity.firstToken) / 1000 : 0;
+  const rate = decoding > 0.5 ? ` · ${(activity.tokens / decoding).toFixed(0)} tok/s` : "";
+  activityEl.textContent = `${activity.phase}… ${secs.toFixed(1)}s${rate}`;
 }
 
 /**
@@ -431,7 +595,7 @@ function finishStream(text: string, reasoning: string, toolCalls = 0): void {
     return;
   }
   statusNode(streaming).textContent = "";
-  proseNode(streaming).textContent = text;
+  renderMarkdown(document, proseNode(streaming), text);
   if (reasoning) {
     const think = thinkingBlock(streaming);
     think.body.textContent = reasoning;
@@ -502,12 +666,6 @@ function setLabel(body: Element, text: string, cls: string): void {
   }
 }
 
-function scrollLog(): void {
-  if (logEl) {
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-}
-
 // -------------------------------------------------------------- page plumbing
 
 async function haveLocalWeights(entry: ModelEntry): Promise<boolean> {
@@ -560,11 +718,12 @@ async function logAdapterLimits(): Promise<void> {
     const gb = (n?: number) => (typeof n === "number" ? `${(n / 1024 ** 3).toFixed(2)} GiB` : "?");
     const info = adapter.info;
     const who = info ? [info.vendor, info.architecture].filter(Boolean).join(" ") : "";
-    bubble("note", "adapter")!.textContent =
+    log(
       `${who || "WebGPU adapter"} — maxBufferSize ${gb(adapter.limits?.maxBufferSize)}, ` +
       `maxStorageBufferBindingSize ${gb(adapter.limits?.maxStorageBufferBindingSize)}. ` +
       `Total device memory is not exposed by WebGPU, so an out-of-memory here is only ever ` +
-      `discoverable by reaching it.`;
+      `discoverable by reaching it.`,
+    );
   } catch (err) {
     console.warn("[smolagent] could not read adapter limits:", err);
   }
@@ -582,13 +741,32 @@ function setBusy(on: boolean): void {
   refreshControls();
 }
 
+let wasReady = false;
+
 function refreshControls(): void {
   const ready = vmReady && modelReady;
   if (sendEl) {
     sendEl.disabled = busy || !ready;
+    // One slot, two buttons: send while idle, stop while working. Both stay in
+    // the DOM (the suites and the keyboard reach them by id); only one shows.
+    sendEl.hidden = busy;
   }
   if (stopEl) {
     stopEl.disabled = !busy;
+    stopEl.hidden = !busy;
+  }
+  // The moment the page can first answer, put the caret where the answer is
+  // asked for — not when a turn ends, which would steal focus from a reader
+  // who has clicked into the console meanwhile.
+  if (ready && !wasReady && !busy) {
+    promptEl?.focus();
+    if (activityEl && !activityEl.textContent) {
+      activityEl.textContent = "enter to send · shift+enter for a new line · esc stops a turn";
+    }
+  }
+  wasReady = ready;
+  if (newChatEl) {
+    newChatEl.disabled = busy;
   }
   if (startEl) {
     startEl.disabled = busy;
@@ -728,7 +906,9 @@ const handle: SmolagentHandle = {
     modelReady = true;
     refreshControls();
     status.clearProgress();
-    modelLabel = `${entry.label} (${dtype})`;
+    // A kernel entry has one pack, named in its label; repeating a dtype there
+    // would only say "(q4)" after "Q4_K_M".
+    modelLabel = entry.dtypes.length > 1 ? `${entry.label} (${dtype})` : entry.label;
     status.model("ready", modelLabel, `${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     log(`${entry.label} ready (${ready.source}, ${dtype}, ${ready.loadMs}ms)`);
     return ready;
@@ -769,9 +949,15 @@ const handle: SmolagentHandle = {
   send: async (text: string) => {
     events = [];
     setBusy(true);
+    // Sending is the clearest statement there is that the reader wants to see
+    // what happens next, wherever they had scrolled to.
+    follower?.jump();
+    startActivity();
     try {
       await convo.send(text);
     } finally {
+      cancelRender();
+      stopActivity();
       setBusy(false);
     }
     return events;
@@ -795,7 +981,12 @@ const handle: SmolagentHandle = {
   messages: () => convo.messages(),
   reset: () => {
     convo.reset();
-    logEl?.replaceChildren();
+    if (emptyEl) {
+      logEl?.replaceChildren(emptyEl);
+    } else {
+      logEl?.replaceChildren();
+    }
+    follower?.jump();
   },
   close: (timeoutMs?: number) => session.close(timeoutMs),
 };
@@ -816,8 +1007,14 @@ function DEMO_SCRIPTS(): FakeScript[] {
     {
       name: "demo",
       turns: [
-        { text: `<|tool_call_start|>[${toolName}(cmd="ls -la /mnt/host")]<|tool_call_end|>` },
-        { text: "That is what the folder contains." },
+        // In the default entry's grammar (lfm3), or the demo's call would be
+        // shown as prose by the dialect the page opens on.
+        {
+          text:
+            "The user wants the folder's contents; I will list it.</think>" +
+            `<tool_call>\n<function=${toolName}>\n<parameter=cmd>\nls -la /mnt/host\n</parameter>\n</function>\n</tool_call>`,
+        },
+        { text: "Listed it.</think>That is what the folder contains: `hello.txt`, `link.txt` and `sub/`." },
       ],
     },
   ];
@@ -832,13 +1029,54 @@ el("composer")?.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
     ev.preventDefault?.();
     void submit();
+  } else if (ev.key === "Escape" && busy) {
+    handle.cancel();
   }
 });
+// The composer is a textarea that grows with what is typed, so a pasted error
+// message or a multi-line question is visible while it is being written. The
+// cap lives in CSS (max-height); past it, the box scrolls.
+function fitPrompt(): void {
+  if (promptEl) {
+    promptEl.style.height = "auto";
+    promptEl.style.height = `${promptEl.scrollHeight}px`;
+  }
+}
+promptEl?.addEventListener("input", fitPrompt);
+
+// The welcome card's examples: one click asks, if the page can answer; else it
+// fills the box, so pressing start and then enter is all that is left.
+for (const id of ["ex-1", "ex-2", "ex-3"]) {
+  const example = el(id);
+  example?.addEventListener("click", () => {
+    if (!promptEl) {
+      return;
+    }
+    promptEl.value = example.textContent ?? "";
+    fitPrompt();
+    promptEl.focus();
+    if (vmReady && modelReady && !busy) {
+      void submit();
+    }
+  });
+}
 sendEl?.addEventListener("click", (ev) => {
   ev.preventDefault?.();
   void submit();
 });
 stopEl?.addEventListener("click", () => handle.cancel());
+// A fresh history, and with it a short prompt again: every turn re-reads the
+// whole conversation, so this is also the way to make a slow chat fast.
+newChatEl?.addEventListener("click", () => {
+  if (busy) {
+    return;
+  }
+  handle.reset();
+  if (activityEl) {
+    activityEl.textContent = "";
+  }
+  promptEl?.focus();
+});
 
 async function submit(): Promise<void> {
   const text = promptEl?.value?.trim();
@@ -847,6 +1085,7 @@ async function submit(): Promise<void> {
   }
   if (promptEl) {
     promptEl.value = "";
+    fitPrompt();
   }
   try {
     await handle.send(text);

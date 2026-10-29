@@ -271,3 +271,50 @@ describe("BridgeFd filestat metadata", () => {
     expect(fd_obj!.fd_filestat_get().filestat!.nlink).toBe(1n);
   });
 });
+
+// The fields above are only half of it: the guest reads the bytes write_bytes
+// lays down, and the shim lays its timestamps two to four bytes early, over the
+// top of `size`. A real mtime turned a 21-byte file into 8.2 EB dated 2380
+// (PLAN §10.30), while every test that inspected the object stayed green.
+describe("BridgeFd filestat bytes", () => {
+  /** Reads a filestat back at the WASI offsets, the way the guest does. */
+  function guestView(filestat: wasi.Filestat) {
+    const view = new DataView(new ArrayBuffer(64 + 8));
+    filestat.write_bytes(view, 8);
+    return {
+      ino: view.getBigUint64(8 + 8, true),
+      filetype: view.getUint8(8 + 16),
+      nlink: view.getBigUint64(8 + 24, true),
+      size: view.getBigUint64(8 + 32, true),
+      atim: view.getBigUint64(8 + 40, true),
+      mtim: view.getBigUint64(8 + 48, true),
+      ctim: view.getBigUint64(8 + 56, true),
+    };
+  }
+
+  test("a file with a modification time reaches the guest with its real size and time", () => {
+    const { fd_obj } = root().path_open(0, "hello.txt", 0, 0n, 0n, 0);
+    const filestat = fd_obj!.fd_filestat_get().filestat!;
+    const ns = BigInt(FAKE_MTIME_MS) * 1_000_000n;
+    expect(guestView(filestat)).toEqual({
+      ino: filestat.ino,
+      filetype: FILETYPE_REGULAR_FILE,
+      nlink: 1n,
+      size: filestat.size,
+      atim: ns,
+      mtim: ns,
+      ctim: ns,
+    });
+    expect(filestat.size).toBeGreaterThan(0n);
+  });
+
+  test("control: the shim's own Filestat corrupts both", () => {
+    const upstream = new wasi.Filestat(1n, FILETYPE_REGULAR_FILE, 21n);
+    // A real lastModified, not a round one: a time whose low 16 bits of
+    // nanoseconds are zero writes zeros over `size` and hides the bug.
+    upstream.mtim = upstream.atim = upstream.ctim = 1_786_060_812_345n * 1_000_000n;
+    const read = guestView(upstream);
+    expect(read.size).not.toBe(21n);
+    expect(read.mtim).not.toBe(upstream.mtim);
+  });
+});

@@ -152,6 +152,18 @@ export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dia
 export const MIN_PROMPT_BUDGET_CHARS = 1000;
 
 /**
+ * What the loop says to a model that has used every tool call it was allowed.
+ *
+ * Without it the cap ended the turn on a tool result: the person asked a
+ * question, watched five commands run, and got "stopped" and no answer, even
+ * when the commands had already found it. Measured on LFM3 1.7B, which tends to
+ * double-check a finding with one more command rather than answer (PLAN §10.31).
+ */
+export const WRAP_UP_PROMPT =
+  "You have used all the tool calls available for this message. Do not call any more tools. " +
+  "Answer the question now from the tool results above, and say plainly if they were not enough.";
+
+/**
  * What fraction of a prompt the device died on is safe to try again.
  *
  * The device gives no number back — only that this prompt was too much — so the
@@ -345,6 +357,7 @@ export class Conversation {
         }
       }
 
+      await this.wrapUp();
       this.emit({ kind: "stopped", reason: "iteration-cap" });
     } finally {
       this.running = false;
@@ -375,6 +388,47 @@ export class Conversation {
    *
    * Anything else ends the turn.
    */
+  /**
+   * One last generation after the iteration cap, asking for an answer.
+   *
+   * The nudge goes into the history as a user turn, because that is what the
+   * model saw and the history must describe the prompt; it is not emitted as a
+   * `user` event, because the person did not write it. Any call the model makes
+   * anyway is not run — the cap is the cap — and its prose, if it wrote any, is
+   * still the answer.
+   */
+  private async wrapUp(): Promise<void> {
+    if (this.cancelled) {
+      return;
+    }
+    this.history.push({ role: "user", content: WRAP_UP_PROMPT });
+    const result = await this.generateWithRetry();
+    if (!result) {
+      return;
+    }
+    let prose = "";
+    let reasoning: string | undefined;
+    try {
+      const parsed = this.opts.dialect.parseTurn(result.text);
+      prose = parsed.text;
+      reasoning = parsed.reasoning;
+    } catch {
+      // A malformed call here is a call that would not have run anyway.
+    }
+    this.history.push({
+      role: "assistant",
+      ...(this.opts.dialect.replayReasoning
+        ? { content: prose, reasoning_content: reasoning ?? "" }
+        : { content: result.text }),
+    });
+    if (this.cancelled || result.stopped) {
+      return;
+    }
+    if (prose || reasoning) {
+      this.emit({ kind: "assistant", text: prose, raw: result.text, reasoning, toolCalls: 0 });
+    }
+  }
+
   private async generateWithRetry(): Promise<Awaited<ReturnType<ModelClient["generate"]>> | undefined> {
     const retried = new Set<ModelErrorCode>();
     for (;;) {

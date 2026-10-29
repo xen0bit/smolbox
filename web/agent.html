@@ -11,19 +11,119 @@
     <script src="../coi-serviceworker.js"></script>
     <link rel="stylesheet" href="../style.css" />
     <style>
+      /* An app shell rather than a document: the log takes whatever height the
+         window has, and the composer stays where the hand is. It used to be a
+         60vh box in a scrolling page, so on a tall window the conversation sat
+         in a third of the screen and on a short one the composer scrolled off. */
+      body.app {
+        max-width: 60rem;
+        height: 100vh;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        padding: 0.75rem 1rem 0.5rem;
+      }
+      body.app > header {
+        margin-bottom: 0.5rem;
+        padding-bottom: 0.5rem;
+        align-items: center;
+      }
+      body.app > header .toolbar {
+        margin: 0;
+        flex: 1;
+        min-width: 0;
+      }
+      body.app > header .toolbar button {
+        flex: none;
+      }
+      /* The dropdown gives way first, so the buttons stay on one row with it. */
+      #model {
+        flex: 0 1 18rem;
+        min-width: 8rem;
+        text-overflow: ellipsis;
+      }
+      @media (min-width: 46rem) {
+        body.app > header,
+        body.app > header .toolbar {
+          flex-wrap: nowrap;
+        }
+      }
+      /* Narrow: title and links on one row, the controls on their own below. */
+      @media (max-width: 46rem) {
+        body.app > header .toolbar {
+          order: 3;
+          flex-basis: 100%;
+        }
+        #model {
+          flex: 1 1 100%;
+        }
+        body.app {
+          padding: 0.5rem 0.6rem 0.4rem;
+        }
+      }
+      #log-wrap {
+        position: relative;
+        flex: 1;
+        min-height: 8rem;
+        margin-bottom: 0.5rem;
+      }
       #log {
-        min-height: 18rem;
-        max-height: 60vh;
+        height: 100%;
         overflow-y: auto;
+        overscroll-behavior: contain;
         border: 1px solid var(--line);
         border-radius: 6px;
         padding: 0.75rem;
-        margin-bottom: 0.75rem;
+      }
+      /* Shown only while the reader has scrolled away from a log that is still
+         growing; see src/follow.ts. */
+      #jump {
+        position: absolute;
+        bottom: 0.75rem;
+        left: 50%;
+        transform: translateX(-50%);
+        border-radius: 999px;
+        font-size: 0.8rem;
+        padding: 0.25rem 0.9rem;
+        background: var(--fg);
+        color: var(--bg);
+        border-color: var(--fg);
+        box-shadow: 0 2px 8px rgb(0 0 0 / 20%);
+      }
+      #jump[hidden] {
+        display: none;
+      }
+      #empty {
+        color: var(--muted);
+        font-size: 0.85rem;
+        max-width: 40rem;
+        margin: 1.5rem auto;
+      }
+      #empty h2 {
+        color: var(--fg);
+        margin: 0 0 0.5rem;
+      }
+      #empty .examples {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.4rem;
+        margin: 0.75rem 0;
+      }
+      #empty .examples button {
+        text-align: left;
+        font-size: 0.85rem;
+        border-radius: 999px;
+      }
+      #log:has(.msg) #empty {
+        display: none;
       }
       .msg {
         margin-bottom: 0.9rem;
-        white-space: pre-wrap;
         word-break: break-word;
+      }
+      .msg .body {
+        white-space: pre-wrap;
       }
       .msg .who {
         display: block;
@@ -60,15 +160,104 @@
       }
       /* A tool whose command failed reads differently from one that worked. */
       .msg.bad .body {
-        border-color: #bf8700;
+        border-color: var(--warn);
       }
       /* Tool output is the bulkiest thing in the log and the least often read
          in full; cap it and let it scroll rather than pushing the answer off
          the screen. */
-      .msg.tool .body > span:last-child {
-        display: block;
+      .tool-out pre {
+        margin: 0;
+        font: inherit;
+        white-space: pre-wrap;
+      }
+      /* Columns stay columns: `ls -l` wrapped at a narrow width is unreadable,
+         scrolled sideways it is merely wide. */
+      .tool-out .stream {
+        white-space: pre;
         max-height: 14rem;
-        overflow-y: auto;
+        overflow: auto;
+      }
+      .tool-out .stream + .stream {
+        margin-top: 0.4rem;
+        padding-top: 0.4rem;
+        border-top: 1px dashed var(--line);
+      }
+      .tool-out .stderr {
+        color: var(--bad);
+      }
+      .tool-out .tool-note {
+        color: var(--muted);
+        font-style: italic;
+      }
+
+      /* The model's answer, rendered from its markdown (src/agent/markdown.ts).
+         Built from nodes, never from markup, so these style a closed set. */
+      .prose {
+        white-space: normal;
+      }
+      .prose > :first-child {
+        margin-top: 0;
+      }
+      .prose > :last-child {
+        margin-bottom: 0;
+      }
+      .prose p,
+      .prose ul,
+      .prose ol,
+      .prose blockquote,
+      .prose pre,
+      .prose .table-wrap {
+        margin: 0.5rem 0;
+        font-size: inherit;
+      }
+      .prose p,
+      .prose li {
+        white-space: pre-wrap;
+      }
+      .prose ul,
+      .prose ol {
+        padding-left: 1.4rem;
+      }
+      .prose h4,
+      .prose h5,
+      .prose h6 {
+        margin: 0.8rem 0 0.3rem;
+        font-size: 0.95rem;
+      }
+      .prose pre {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.5rem 0.6rem;
+        overflow-x: auto;
+        font-size: 0.85rem;
+      }
+      .prose pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+      }
+      .prose blockquote {
+        border-left: 3px solid var(--line);
+        padding-left: 0.6rem;
+        color: var(--muted);
+      }
+      .prose .table-wrap {
+        overflow-x: auto;
+      }
+      .prose table {
+        border-collapse: collapse;
+        font-size: 0.85rem;
+      }
+      .prose th,
+      .prose td {
+        border: 1px solid var(--line);
+        padding: 0.25rem 0.6rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      .prose th {
+        background: var(--panel);
       }
       /* Reasoning is collapsed by default: present, inspectable, and not
          competing with the answer for the reader's attention. */
@@ -80,6 +269,9 @@
       .think summary {
         cursor: pointer;
         font-style: italic;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .think-body {
         margin-top: 0.3rem;
@@ -97,12 +289,48 @@
       .pending:empty {
         display: none;
       }
-      form {
+      #composer {
         display: flex;
         gap: 0.5rem;
+        align-items: flex-end;
       }
       #prompt {
         flex: 1;
+        resize: none;
+        font: inherit;
+        line-height: 1.4;
+        padding: 0.45rem 0.7rem;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg);
+        color: inherit;
+        min-height: 2.4rem;
+        max-height: 12rem;
+        overflow-y: auto;
+      }
+      #prompt:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: -1px;
+      }
+      #send,
+      #stop {
+        min-width: 5rem;
+        height: 2.4rem;
+      }
+      #send:not(:disabled) {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      #send[hidden],
+      #stop[hidden] {
+        display: none;
+      }
+      #activity {
+        min-height: 1.2rem;
+        margin: 0.25rem 0 0;
+        font-size: 0.75rem;
+        color: var(--muted);
       }
       /* The status strip: three chips, one per thing that can be up, loading or
          broken independently of the other two. A dot carries the state so it
@@ -127,7 +355,7 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 22rem;
+        max-width: 30rem;
       }
       .chip .dot {
         width: 0.5rem;
@@ -182,9 +410,10 @@
       /* The console: the same VM the model is driving, on the same Session, so
          a command typed here queues behind the agent's rather than racing it. */
       #console-panel {
-        margin-top: 1rem;
+        margin-top: 0.25rem;
         border-top: 1px solid var(--line);
-        padding-top: 0.5rem;
+        padding-top: 0.35rem;
+        flex: none;
       }
       #console-panel > summary {
         cursor: pointer;
@@ -195,8 +424,11 @@
         color: var(--fg);
       }
       #console-panel .term-scroll {
-        min-height: 12rem;
-        max-height: 40vh;
+        min-height: 10rem;
+        max-height: 35vh;
+      }
+      #console-panel .hint {
+        margin: 0.25rem 0;
       }
 
       /* The settings dialog. The first <dialog> on the site; sections inside it
@@ -329,9 +561,16 @@
       }
     </style>
   </head>
-  <body>
+  <body class="app">
     <header>
       <h1>smolbox agent</h1>
+      <div class="toolbar">
+        <select id="model" title="which checkpoint to load"></select>
+        <button id="start" type="button">start</button>
+        <button id="pick" type="button">pick folder</button>
+        <button id="new-chat" type="button" title="clear the conversation; the VM, its files and the loaded model stay">new chat</button>
+        <button id="settings-open" type="button" title="system prompt, sampling, tools, storage">settings</button>
+      </div>
       <!-- Relative, not root-absolute, and one level up because this page is
            served from <base>/agent/ — the pages are copied verbatim and never
            see SMOLBOX_BASE. See web/src/base.ts. -->
@@ -340,13 +579,6 @@
         <a href="./" aria-current="page">chat</a>
       </nav>
     </header>
-
-    <div class="toolbar">
-      <select id="model" title="which checkpoint to load"></select>
-      <button id="start" type="button">start</button>
-      <button id="pick" type="button">pick folder</button>
-      <button id="settings-open" type="button" title="system prompt, sampling, tools, storage">settings</button>
-    </div>
 
     <div class="status-strip">
       <span class="chip" id="chip-vm" data-state="idle"><span class="dot"></span><span class="chip-text">VM</span></span>
@@ -359,13 +591,38 @@
       <span id="progress-label"></span>
     </div>
 
-    <div id="log"></div>
+    <div id="log-wrap">
+      <div id="log" tabindex="0">
+        <div id="empty">
+          <h2>Ask about a folder, answered by a model on your GPU</h2>
+          <p>
+            A local model on WebGPU drives a Linux VM through one
+            <code>run_terminal_command</code> tool. Press <b>start</b> to boot the
+            VM and load the model; <b>pick folder</b> mounts one read-only at
+            <code>/mnt/host</code>. Nothing leaves this browser — the weights
+            download once and are cached.
+          </p>
+          <div class="examples">
+            <button id="ex-1" type="button">How many files are in my folder, and which one is the largest?</button>
+            <button id="ex-2" type="button">Summarise what this project is from its README.</button>
+            <button id="ex-3" type="button">Find every TODO and tell me which file has the most.</button>
+          </div>
+          <p class="hint">
+            The guest has busybox, coreutils, <code>rg</code>, <code>tree</code>
+            and <code>python3</code>. The VM on its own is
+            <a href="../">one level up</a>.
+          </p>
+        </div>
+      </div>
+      <button id="jump" type="button" hidden>↓ latest</button>
+    </div>
 
     <form id="composer">
-      <input id="prompt" type="text" placeholder="ask about the mounted folder…" autocomplete="off" />
+      <textarea id="prompt" rows="1" placeholder="ask about the mounted folder…" autocomplete="off" spellcheck="false"></textarea>
       <button id="send" type="submit">send</button>
-      <button id="stop" type="button" disabled>stop</button>
+      <button id="stop" type="button" disabled hidden>stop</button>
     </form>
+    <p id="activity"></p>
 
     <details id="console-panel">
       <summary>console — the same VM the model is using</summary>
@@ -474,15 +731,6 @@
         </div>
       </details>
     </dialog>
-
-    <p class="hint">
-      A local model on WebGPU drives a Linux VM through one
-      <code>run_terminal_command</code> tool. The folder you pick is mounted
-      read-only at <code>/mnt/host</code>; the guest has busybox, coreutils,
-      <code>rg</code>, <code>tree</code> and <code>python3</code>. Weights load
-      from <code>dist/models</code> after <code>make model</code>, else from the
-      Hugging Face CDN. The VM-only page is <a href="../">one level up</a>.
-    </p>
 
     <script type="module" src="./agent-main.js"></script>
   </body>

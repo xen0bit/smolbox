@@ -28,6 +28,10 @@ declare const window: {
   addEventListener(type: "focus", listener: () => void, options?: { once?: boolean }): void;
 };
 
+/** The chat log coalesces streamed tokens into one render per frame. */
+declare function requestAnimationFrame(callback: (time: number) => void): number;
+declare function cancelAnimationFrame(handle: number): void;
+
 interface Element {
   textContent: string | null;
   className: string;
@@ -51,6 +55,10 @@ interface Element {
   download: string;
   scrollTop: number;
   readonly scrollHeight: number;
+  /** The visible height of a scroll container; the follow rule needs all three. */
+  readonly clientHeight: number;
+  /** The composer grows with what is typed, up to a cap; see agent-main.ts. */
+  style: { height: string };
   readonly children: readonly Element[];
   // The chat log builds assistant bubbles incrementally — reasoning, prose and
   // a status line, each created on demand — so it needs to find and reorder
@@ -71,8 +79,9 @@ interface Element {
   /** Only used to trigger the JSON download on a synthesised anchor. */
   click(): void;
   addEventListener(
-    type: "click" | "keydown" | "change" | "input" | "cancel" | "toggle",
+    type: "click" | "keydown" | "change" | "input" | "cancel" | "toggle" | "scroll" | "wheel" | "touchmove",
     listener: (ev: KeyboardEventLike) => void,
+    options?: { passive?: boolean },
   ): void;
   remove(): void;
 }
@@ -88,6 +97,8 @@ interface FileInputLike extends Element {
 /** Only the fields the agent page reads off a key event. */
 interface KeyboardEventLike {
   key?: string;
+  /** Wheel events only: negative is upward. */
+  deltaY?: number;
   shiftKey?: boolean;
   ctrlKey?: boolean;
   metaKey?: boolean;

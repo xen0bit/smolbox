@@ -1542,3 +1542,221 @@ host user can use it: the guest cannot write to the mount.
 
 What the readlink target still tells the guest is the host path an absolute link points at (for
 example `/home/<user>/…`). That is information, not access, and it was visible before this change.
+
+### 10.30 LFM3 1.7B on its WebGPU kernels, the new default, and a stat that lied about size (2026-10-29)
+
+**What LFM3 is, from the card and the file rather than the blog.** LiquidAI's LFM3-1.7B: 24 layers
+(13 gated short convolutions with kernel 7, 5 sliding-window attention layers with a 256 window, 6
+global), vocab 128 000, context 262 144, LFM Open License v1.0. The GGUF metadata agrees and adds
+what the card leaves out: bos `<|startoftext|>` (124894), eos `<|im_end|>` (124900), sampling
+`temp 0.1, top_k 50, penalty_repeat 1.1`. Liquid publishes seven GGUF packs at
+`LiquidAI/LFM3-1.7B-GGUF@bad5729b` and ONNX builds at `LiquidAI/LFM3-1.7B-ONNX` and
+`onnx-community/LFM3-1.7B-ONNX`, all sharded.
+
+**The optimized kernels exist, but not as a kernels Space.** There is no `lfm3-webgpu-kernels`.
+The engine ships inside webml-community's coding-agent demo, `LFM3-1.7B-WebGPU-Pi@3ad7ce87`, as
+`dist/runtime/Lfm3ForCausalLM.js`, a 1.07 MB module from the same runtime family as the Gemma and
+Bonsai engines. It reads the GGUF directly. Its tensor check accepts types 0/2/12/14 only (F32,
+Q4_0, Q4_K, Q6_K), so `Q4_K_M` (1.10 GB, the Space's default) and `QAD-Q4_0` load and the other five
+packs are refused before download. The entry is `Q4_K_M`. No ONNX entry was added: the kernel path
+is what was asked for, and an onnxruntime twin would be a second 1.3–1.6 GB entry to keep loadable.
+
+**Its front door hides the session.** `from_pretrained()` returns a wrapper class whose only state
+is a private `#e` holding the loaded session. Its public API is `create_session()`, the engine's
+own agent loop, which renders the template, parses calls and hands back messages. That is the layer
+smolbox replaces, and the dialect needs the raw text. The session behind `#e` already has
+KernelSession's shape: public `model`, `generationState`, `eosTokenIds`, `tokenizer`, `reset()`,
+`deviceInfo()`. So `make lfm3-kernels` adds `get _session(){return this.#e}` to the wrapper
+(`lfm3-expose.ts`). The match is structural (`class{#x;constructor(y){this.#x=y}` immediately
+followed by `create_session(`) and must hit exactly once, which it does in the pinned artifact. The
+engine also tunes a decode pipeline depth at load, and only its own `streamTokens` passes it on, so
+`wrapSession` forwards `decodePipelineDepth` to every `streamTokenIdsFromCache` call.
+
+**The grammar is Qwen3.5's; the thinking shape is LFM2.5's.** The card and the template both write
+`<tool_call>\n<function=…>\n<parameter=…>\n…\n</parameter>\n</function>\n</tool_call>`, and the
+generation prompt ends with a bare `<think>` (no newline). That is exactly what `bonsai` parses, so
+`lfm3` reuses its parser. The real model writes no whitespace around `</think>`:
+`…ls -la /mnt/host`.</think><tool_call>`.
+
+**History is raw, not split, and that is the template's doing.** LFM3's template renders an
+assistant turn as `<think>` + reasoning + `</think>` + content + calls, adding no whitespace of its
+own. Rebuilding a turn from parsed parts (Bonsai's `replayReasoning`) would have to reproduce the
+model's whitespace exactly, and the parser trims. Replaying the completion verbatim reproduces it by
+construction: the template emits content as-is. The one byte missing is the `<think>` the prompt
+opened, and `prepareHistory` restores it on any turn that closed its scratchpad. Two more things
+keep the prefix stable:
+
+- The template drops every scratchpad before the latest user message unless `preserve_thinking` is
+  set, which would rewrite the middle of the prompt each time the user speaks. The codec renders
+  with `preserve_thinking: true`, and the engine's own chat policy does the same.
+- Tool results go in as plain `tool` messages; the template wraps them in `<tool_response>`.
+
+`lfm3.test.ts` checks the invariant against the real template over two user turns, with a control
+for each half.
+
+**Measured, on an RTX 4070 Ti SUPER (Vulkan, `subgroups`, no `shader-f16`), local build.** The load
+took 7.3 s cold. The first question ("How many files…, and which one is the largest?") took four
+tool calls and 9.1 s in total, and the follow-up ("What does hello.txt say?") took one call and
+0.8 s. Every call parsed and ran. Cache reuse per prompt: 0/635 (first), 730/866, **0/1705**,
+1902/1937, 2041/2084 (across the new user message), 2274/2291 and 2364/2396. The one miss was not a
+text mismatch: re-rendering the captured history shows an exact text prefix at every step. It is
+the tokenizer. Re-encoding one 2.6 KB completion produced different ids from the ones the model
+sampled, so the id-level prefix broke and that turn was prefilled whole (1705 tokens, under a
+second here). The engine's own `create_session` ledger avoids this by keeping the sampled ids
+whenever their decode is a prefix of the new text. That trick belongs in the worker's codec path
+(it would help Bonsai too) and is left as a follow-up rather than changed here untested on Bonsai.
+`make test-e2e-agent` passes with LFM3 as the default. The dialect is `verified`, with the captured
+turns as `CAPTURED:` cases.
+
+**The stat that lied, found by the capture.** The model's answer gave `hello.txt` (21 bytes) as
+"8,286,623,314,361,712,661 bytes (~8.2 exabytes)", dated Nov 13 2380, and the next run said
+11 691 344 632 653 807 637 bytes, Apr 26 2272. In hex the first is `0x7300000000000015`: the real
+size with junk in its top bytes. The cause is upstream. browser_wasi_shim 0.4.2's
+`Filestat.write_bytes` puts `atim`/`mtim`/`ctim` at offsets 38/46/52, where the WASI `filestat`
+layout has them at 40/48/56. So `atim`'s two low bytes overwrite bytes 38–39 of `size`, and the guest
+reads `mtim` from a window straddling two fields. This stayed hidden for as long as every timestamp
+was zero. §10.22 made the mount send a real `lastModified`, and from then on every file in the
+browser mount had a corrupt size and date. It escaped notice because:
+
+- the §10.22 conformance case asserts the year is "not 1970", which 2380 satisfies;
+- the unit tests inspected the `Filestat` object, never the bytes;
+- wazero, the other driver, never touches the shim.
+
+The fix is a `WasiFilestat` subclass in `worker-fd.ts` that writes the real layout. A byte-level unit
+test reads it back at the WASI offsets, fails with the fix reverted, and has the upstream class as a
+control. The control needed a realistic, non-round mtime: a round one's low 16 bits of nanoseconds
+are zero and hide the bug. A new conformance case, run by both drivers, pins `stat -c %s` at 21 and
+`ls -l`'s size column and year (< 2100). Conformance cases 25 → 26.
+
+### 10.31 The agent page as a product: scrolling, rendering, and the turn that never answered (2026-10-29)
+
+Driven with LFM3 1.7B on the RTX 4070 Ti SUPER (§10.30) through a scripted Playwright session,
+screenshotted before and after at 1280×800 and 390×844, rather than reviewed from the code.
+
+**The scroll hijack, reproduced.** Two seconds into a streamed answer, a 2000 px wheel upward left
+the log at `scrollTop 236` with `scrollHeight 714` and `clientHeight 478`, which is the bottom.
+Both the chat log and the terminal set `scrollTop = scrollHeight` on every append, which is every
+token. `web/src/follow.ts` now follows only while the reader is at the bottom (within 32 px).
+Leaving it detaches; arriving back, sending, or the "↓ latest" button re-attaches. Two details came
+out of the unit tests, not the design:
+
+- A wheel tick has to detach **immediately**, because a token can land between the gesture and its
+  `scroll` event, and that token's update would pull the view back.
+- The `scroll` event echoing our own pin must not count as the reader, because more content may
+  already have arrived by the time it fires.
+
+After the change, the same gesture leaves the reader where they scrolled for the rest of the turn.
+
+**What else the screenshots showed**, and what changed:
+
+- **Markdown shown raw.** Every model here answers in markdown, and the log printed `**1 file**`
+  and pipe-drawn tables verbatim. `markdown.ts` renders the subset these answers use (paragraphs,
+  lists, fenced and inline code, bold and italic, tables, quotes, headings demoted under the page's
+  own) from DOM nodes only. Model text is never parsed as HTML; a test pins a `<script>` in an
+  answer as text. Partial input is the normal case, because it re-renders every frame: an
+  unclosed fence runs to the end, and an unmatched `**` stays literal rather than becoming an empty
+  `<em>` (a bug the tests caught).
+- **A note card on nearly every turn.** "measured this conversation's real characters-per-token…"
+  arrived between the question and the answer each turn, and an adapter-limits card on each load.
+  Both now go to the console. The recoveries (`prompt-too-long`, `device-lost`) still get cards,
+  because something did go wrong there.
+- **Tool cards repeated themselves.** The label said `exit 0` and the body opened with
+  `exit_code: 0` and `<stdout>` tags. The card now shows the streams (stderr in red) with flags and
+  errors as notes, and scrolls sideways instead of wrapping, so `ls -l` columns stay columns on a
+  phone. `toolView` is checked over every case in `render-cases.json`, and falls back to the text
+  verbatim for any shape it does not recognise.
+- **The layout was a document.** The log was a 60vh box inside a scrolling page, the composer
+  scrolled off on short windows, and the settings button wrapped onto its own row. It is now an app
+  shell: the header and toolbar share one row (the model dropdown gives way first), and on a narrow
+  screen the controls move to their own row. The log takes the remaining height and the composer
+  stays pinned. The composer is a textarea that grows to 12rem: Enter sends, Shift+Enter adds a
+  newline, Esc stops. Send and stop share one slot.
+- **Nothing to look at while it thinks.** The reasoning summary was `thinking… (672 chars)`. It now
+  shows the latest line of the scratchpad, live. A line under the composer gives the phase (reading
+  the prompt, thinking, writing a tool call, running `cmd`, answering), the elapsed time and
+  tokens/second, then "done in N s".
+- **An empty box on arrival.** The welcome card explains the page and offers three example
+  questions. A click asks one if the page is ready, and otherwise fills it in.
+- **No way to start over** without reloading the page, even though every turn re-reads the whole
+  history. There is now a "new chat" button.
+- **The engine's weight cache was invisible.** The GGUF engines cache their weights in their own
+  IndexedDB (`gguf-cache-v1`, read from the bundle), so the storage panel neither listed LFM3's
+  1.1 GB nor cleared it. It now lists that cache and clears it with everything else. If the loaded
+  engine holds the database open, the delete completes on the next reload, and the panel says so.
+
+**The turn that never answered.** In one real run LFM3 found the answer in its first two commands,
+checked it three more times and hit `maxIterations` (5). The turn ended on "stopped: hit the
+tool-call limit", with the answer in a tool card and nowhere in the chat. `Conversation.wrapUp()`
+now adds one user turn at the cap (`WRAP_UP_PROMPT`: no more tools, answer from what you have) and
+generates once. A call made in that turn is not run. The nudge stays in the history, because the
+model saw it, but is not shown as something the person typed. The note then says the model answered
+at the limit rather than that it stopped.
+
+**A rebuilt VM that hangs on `grep -r`: image drift, found by rebuilding.** This work rebuilt
+`dist/smolbox.wasm` from unchanged inputs. With that build, the conformance case
+`grep -rn nested /mnt/host` hangs past the guest's own `timeout_ms`, with the VM idle, until Go's
+10-minute test timeout, on every run. The cause is the image:
+
+- The same case against the **deployed** wasm (CI's cached build) passes in 4.6 s, and the whole
+  table passes in 156 s.
+- It is not this branch: it hangs identically from a `main` worktree, and from a CLI built before
+  §10.29's `confinedFS`.
+- It is not load. An early theory blamed concurrent GPU and Chromium runs, and an idle-machine
+  rerun of the full table hung on the same case.
+
+Through `bin/smolbox exec` the same command is intermittent (it hung twice and then passed three
+times), so the trigger is timing-sensitive inside the guest. But only the fresh image ever hangs.
+`apk info -v` diffs the two images to exactly `pcre2 10.43-r0 → r1` and
+`python3 3.12.15 → 3.12.16`. GNU grep links pcre2, so the pcre2 bump is the prime suspect, not
+yet proven.
+
+Why nothing caught it: CI caches `smolbox.wasm` by a hash of `vm/Dockerfile`, `guest/**`,
+`build/Dockerfile.c2w` and `go.mod`/`go.sum`, while Alpine's packages float under the pinned
+`alpine:3.21` digest. So the deployed build had simply not been rebuilt since the pcre2 update.
+**The pcre2 bump was the trigger, not the cause. §10.32 has the cause and the fix.**
+
+### 10.32 The guest agent could sleep through its own command finishing (2026-10-29)
+
+§10.31's hang, run to ground. Pinning `pcre2` back to `10.43-r0` made the case pass (r0: twice in
+4.8 s; r1: every run hits the 3-minute cap). Pinning would have been the wrong fix, though: r1 is
+seven CVE backports, and the trigger proved far more fragile than one library. Through a
+throwaway harness probe on the r1 image:
+
+| command (no `timeout_ms`) | result |
+|---|---|
+| `grep -rn nested /mnt/host` | hangs |
+| `grep -rn nested /mnt/host < /dev/null` | hangs |
+| `grep -F -rn nested /mnt/host` | 472 ms |
+| `LC_ALL=C grep -rn nested /mnt/host` | 415 ms |
+| `exec grep -rn nested /mnt/host` | 542 ms |
+| `grep -rn hello /mnt/host` | 645 ms |
+| the hanging command **with** `timeout_ms: 5000` | 416 ms |
+| same-length commands without grep | ~250 ms |
+
+The same grep runs natively under Docker in 0.7 s. Nothing in that table is a grep or pcre2 bug. It
+is a race whose window moves with memory layout and timing, and the last row says where it is.
+
+**The cause is `smolagentd`, not the image.** With no `timeout_ms`, `exec()` waited on a bare
+`<-waitCh`. At that moment the agent's Go runtime had no timers armed and every goroutine was
+blocked, so it parked in `epoll_wait(-1)`, with sysmon asleep as well. Finishing the command then
+depended on one epoll notification: `cmd.Wait` returns only after its pipe-copy goroutines see EOF,
+and those are woken through epoll. Under the emulator that wakeup can be lost. When it was, PID 1
+slept until the next byte arrived on stdin, and the host was waiting for the response before it
+would send one. That is why the VM sat idle and missed its own `timeout_ms`. With a timeout set,
+the armed timer made every `epoll_wait` finite, and the next poll found the event.
+
+**The fix:** `awaitWithHeartbeat` waits with a 50 ms ticker armed, on both branches (the post-kill
+wait in the timeout path had the same unbounded `<-waitCh`). The runtime can no longer block
+without a deadline, and a lost wakeup costs at most one tick. Measured on the r1 image rebuilt with
+the fix:
+
+- the case passes 3/3 in 4.8 s;
+- the full conformance table passes in 162 s;
+- integration, 80 Chromium e2e, Firefox and the GPU agent suite all pass.
+
+pcre2 stays at the patched r1. The change touches `guest/`, so it also rolls CI's wasm cache key,
+and CI rebuilds and tests the image from current packages rather than the cached one.
+
+Why the epoll notification is lost at all (emulated interrupt delivery, or the guest kernel's
+epoll on a pipe) is not established. The fix does not depend on knowing. Any agent code that
+blocks while waiting on the guest should do so with a timer armed.

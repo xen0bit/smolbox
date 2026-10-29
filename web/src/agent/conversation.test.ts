@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  WRAP_UP_PROMPT,
   type AgentEvent,
   CHARS_PER_TOKEN_ESTIMATE,
   Conversation,
@@ -127,6 +128,33 @@ describe("Conversation", () => {
     await convo.send("go");
     expect(ran).toHaveLength(3);
     expect(events.at(-1)).toEqual({ kind: "stopped", reason: "iteration-cap" });
+  });
+
+  test("at the cap the model is asked for an answer, and gives one", async () => {
+    const { convo, events, ran } = build(
+      [
+        { name: "loop", when: "go", turns: [{ text: call("a") }, { text: call("b") }] },
+        { name: "wrap-up", when: "used all the tool calls", turns: [{ text: "It is a." }] },
+      ],
+      { maxIterations: 2 },
+    );
+    await convo.send("go");
+    expect(ran.map((c) => c.args.cmd)).toEqual(["a", "b"]);
+    const answer = events.filter((e) => e.kind === "assistant").at(-1);
+    expect(answer).toMatchObject({ kind: "assistant", text: "It is a." });
+    expect(events.at(-1)).toEqual({ kind: "stopped", reason: "iteration-cap" });
+    // The nudge is in the history the model saw, and not in the log as if the
+    // person had typed it.
+    expect(convo.messages().some((m) => m.role === "user" && m.content === WRAP_UP_PROMPT)).toBe(true);
+    expect(events.filter((e) => e.kind === "user")).toHaveLength(1);
+  });
+
+  test("a call made in the wrap-up turn is not run", async () => {
+    const { convo, ran } = build([{ name: "loop", turns: Array(20).fill({ text: call("again") }) }], {
+      maxIterations: 2,
+    });
+    await convo.send("go");
+    expect(ran).toHaveLength(2);
   });
 
   test("the budget is handed to the runner on every call", async () => {

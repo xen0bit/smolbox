@@ -133,10 +133,10 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 			// Negative pid kills the whole process group; the SIGKILL exit
 			// reports 137 (128 + 9) on the wire.
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			<-waitCh
+			awaitWithHeartbeat(waitCh)
 		}
 	} else {
-		<-waitCh
+		awaitWithHeartbeat(waitCh)
 	}
 
 	// A timeout kill (or a backgrounded `cmd &`) orphans children to us, PID 1;
@@ -162,6 +162,27 @@ func (a *agent) exec(req *protocol.Request) *protocol.Response {
 	resp.Truncated = outBuf.truncated || errBuf.truncated
 	resp.DurationMS = time.Since(start).Milliseconds()
 	return resp
+}
+
+// heartbeat bounds how long the Go runtime may sleep while a command runs.
+const heartbeat = 50 * time.Millisecond
+
+// awaitWithHeartbeat waits for the child with a timer armed, so the runtime
+// never parks in an unbounded epoll_wait. With no timeout and no timer, every
+// goroutine is blocked, sysmon sleeps, and the pipe-copy goroutines inside
+// cmd.Wait are woken by epoll alone; under the emulator a lost wakeup there
+// left the agent asleep until the next request arrived, which never did
+// (PLAN §10.32). A ticker turns that into a re-poll within one tick.
+func awaitWithHeartbeat(waitCh <-chan error) {
+	tick := time.NewTicker(heartbeat)
+	defer tick.Stop()
+	for {
+		select {
+		case <-waitCh:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // exitCode maps a ProcessState to the wire's exit code: a signal death becomes

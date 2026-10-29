@@ -290,8 +290,8 @@ describe("GGUF entries", () => {
     expect(localProbePath(onnx)).toEndWith(`${onnx.repo}/config.json`);
   });
 
-  test("the bonsai engine only ever gets a GGUF", () => {
-    for (const m of models.filter((e) => e.backend === "bonsai-kernels")) {
+  test("the GGUF engines only ever get a GGUF", () => {
+    for (const m of models.filter((e) => e.backend === "bonsai-kernels" || e.backend === "lfm3-kernels")) {
       expect(m.weights, m.key).toBe("gguf");
     }
   });

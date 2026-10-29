@@ -1,7 +1,8 @@
 // Downloads the WebGPU kernel engines into dist/kernels.
 //
-// Both are published as Hugging Face Spaces (webml-community/gemma-4-webgpu-kernels
-// and webml-community/ternary-bonsai-2-webgpu-kernels). They are pulled at a
+// All three are published as Hugging Face Spaces (webml-community/gemma-4-webgpu-kernels,
+// webml-community/ternary-bonsai-2-webgpu-kernels and
+// webml-community/LFM3-1.7B-WebGPU-Pi). They are pulled at a
 // pinned revision, the same shape as `make model`: dist/ is gitignored build
 // output, the revision is fixed here so a build is reproducible, and a minified
 // megabyte of somebody else's bundle stays out of our history. `make site`
@@ -11,13 +12,14 @@
 //   bun web/fetch-kernels.ts gemma      # one of them
 //
 // The page imports each engine dynamically and says what to run when it is
-// missing (see gemma-kernels.ts, bonsai-kernels.ts), so `make web` still works
+// missing (see gemma-kernels.ts, bonsai-kernels.ts, lfm3-kernels.ts), so `make web` still works
 // on a checkout that has never run this.
 
 import { mkdir, rename, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { extractBonsaiEngine } from "./src/agent/bonsai-extract.ts";
+import { exposeLfm3Session } from "./src/agent/lfm3-expose.ts";
 
 interface Engine {
   /** The Space, and the commit this project has actually run against. */
@@ -59,6 +61,16 @@ const ENGINES: Record<string, Engine> = {
     file: "index.html",
     dest: path.join("dist", "kernels", "bonsai", "ternary-bonsai-2.js"),
     prepare: extractBonsaiEngine,
+  },
+  // A real module this time, published under the Space's dist/runtime. One
+  // getter is added to its public wrapper so the worker can reach the session
+  // behind it (lfm3-expose.ts, PLAN §10.30).
+  lfm3: {
+    space: "webml-community/LFM3-1.7B-WebGPU-Pi",
+    revision: "3ad7ce876d3272d4b3496ad7dd06da5e7e334f2c",
+    file: "dist/runtime/Lfm3ForCausalLM.js",
+    dest: path.join("dist", "kernels", "lfm3", "Lfm3ForCausalLM.js"),
+    prepare: exposeLfm3Session,
   },
 };
 

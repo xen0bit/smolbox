@@ -10,7 +10,7 @@ VM_IMAGE  := smolbox/vm:dev
 C2W_IMAGE := smolbox/c2w-builder:dev
 C2W_VERSION ?= 0.8.4
 
-.PHONY: all everything build wasm vm-image builder-image require-docker web web-local site serve compress generate model models gemma-kernels bonsai-kernels \
+.PHONY: all everything build wasm vm-image builder-image require-docker web web-local site serve compress generate model models gemma-kernels bonsai-kernels lfm3-kernels \
         test test-integration test-web test-e2e test-e2e-firefox test-e2e-agent \
         test-e2e-agent-smoke test-e2e-agent-firefox \
         test-conformance lint clean
@@ -37,8 +37,9 @@ RECLAIM_DIST = docker run --rm -v $(PWD)/$(DIST):/out --entrypoint chown $(VM_IM
 
 # The order is load-bearing, not cosmetic:
 #
-#   gemma-kernels and         the kernel engines are .js files under dist and
-#     bonsai-kernels before   get encoded like everything else.
+#   gemma-kernels,            the kernel engines are .js files under dist and
+#     bonsai-kernels and      get encoded like everything else.
+#     lfm3-kernels before
 #     compress
 #   compress before models    weights are excluded from compression anyway, so
 #                             putting the 11 GB pull last means a dropped
@@ -54,6 +55,7 @@ everything:
 	$(MAKE) web
 	$(MAKE) gemma-kernels
 	$(MAKE) bonsai-kernels
+	$(MAKE) lfm3-kernels
 	$(MAKE) compress
 	$(MAKE) models
 	@echo ""
@@ -221,7 +223,7 @@ models:
 	fi; \
 	echo ""; \
 	echo "all downloadable registry entries are in $(DIST)/models"; \
-	echo "note: gemma4-e2b also needs 'make gemma-kernels', and bonsai2-27b 'make bonsai-kernels', for their engines"
+	echo "note: gemma4-e2b also needs 'make gemma-kernels', bonsai2-27b 'make bonsai-kernels' and lfm3-1.7b 'make lfm3-kernels', for their engines"
 
 # The Gemma 4 WebGPU kernel engine, pulled at a pinned revision into dist/kernels
 # (web/fetch-kernels.ts) — a build artifact of an upstream project, kept out of
@@ -236,6 +238,12 @@ gemma-kernels:
 # (web/src/agent/bonsai-extract.ts, PLAN §10.28).
 bonsai-kernels:
 	bun web/fetch-kernels.ts bonsai
+
+# The LFM3 engine, the same way. It is published as a module; the fetcher adds
+# one getter to its wrapper class so the worker can reach the session behind it
+# (web/src/agent/lfm3-expose.ts, PLAN §10.30).
+lfm3-kernels:
+	bun web/fetch-kernels.ts lfm3
 
 # Writes a .br and a .gz beside every compressible artifact in dist/. serve.ts
 # picks them up automatically; without them it serves identity and nothing
@@ -297,6 +305,7 @@ site:
 	$(MAKE) web SMOLBOX_BASE=$(SMOLBOX_BASE) SMOLBOX_MODEL_SOURCE=hub
 	$(MAKE) gemma-kernels
 	$(MAKE) bonsai-kernels
+	$(MAKE) lfm3-kernels
 	rm -rf $(SITE)
 	mkdir -p $(SITE)
 	cp -R web/dist/. $(SITE)/

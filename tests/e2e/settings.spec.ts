@@ -152,7 +152,7 @@ test("the kernel entries can be chosen on either model source", async ({ page })
   await open(page);
   const source = await page.evaluate(() => (globalThis as ModelSourceGlobal).__smolagent!.modelSource());
   expect(["hub", "local"]).toContain(source);
-  for (const key of ["gemma4-e2b", "bonsai2-27b"]) {
+  for (const key of ["gemma4-e2b", "bonsai2-27b", "lfm3-1.7b"]) {
     const kernels = page.locator(`#model option[value="${key}"]`);
     await expect(kernels).toHaveCount(1);
     await expect(kernels).toBeEnabled();
