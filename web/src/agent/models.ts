@@ -84,11 +84,13 @@ export interface GenerationDefaults {
  * from the webml-community/gemma-4-webgpu-kernels Space, which reads safetensors
  * directly and carries its own WGSL. `bonsai-kernels` is the same runtime's
  * build for Ternary Bonsai 2 (webml-community/ternary-bonsai-2-webgpu-kernels),
- * which reads one GGUF and brings its own tokenizer. They share nothing but the
+ * which reads one GGUF and brings its own tokenizer. `lfm3-kernels` is the
+ * same family again for LiquidAI's LFM3 (webml-community/LFM3-1.7B-WebGPU-Pi),
+ * also a GGUF. They share nothing but the
  * ModelClient interface, which is the point: the loop, the dialects and the UI
  * cannot tell them apart.
  */
-export type Backend = "transformers" | "gemma4-kernels" | "bonsai-kernels";
+export type Backend = "transformers" | "gemma4-kernels" | "bonsai-kernels" | "lfm3-kernels";
 
 /**
  * How the weights are laid out in the repo, for the fetcher.
@@ -245,6 +247,39 @@ export const F16_DTYPES: ReadonlySet<Dtype> = new Set<Dtype>(["q4f16", "fp16"]);
 export const INLINE_WEIGHT_CEILING_BYTES = 1_000_000_000;
 
 export const models: ModelEntry[] = [
+  {
+    key: "lfm3-1.7b",
+    label: "LFM3 1.7B (Q4_K_M, WebGPU kernels)",
+    // Liquid's own GGUF of LFM3-1.7B on the webml-community kernel engine built
+    // for it. Liquid reports it ahead of LFM2.5 2.6B with 35% fewer parameters,
+    // and it was post-trained with agentic RL on real tool harnesses. PLAN §10.30.
+    repo: "LiquidAI/LFM3-1.7B-GGUF",
+    revision: "bad5729bba61d076fff20d2548e62526665af215",
+    weights: "gguf",
+    // The Space's default pack. The engine reads F32, Q4_0, Q4_K and Q6_K
+    // tensors only, so of the seven files in the repo this and QAD-Q4_0 are the
+    // two it can load; the Q5/Q6/Q8/F16/BF16 packs are refused up front.
+    ggufFile: "LFM3-1.7B-Q4_K_M.gguf",
+    // From the GGUF's own tokenizer: 128 000, the same as LFM2.5.
+    vocabSize: 128_000,
+    // The engine samples on the GPU and never downloads a logits tensor.
+    prefillLogits: "last",
+    // Baked into the file; present because pickDtype is shared, as for the
+    // other kernel entries — the pack is named in the label.
+    dtypes: ["q4"],
+    approxBytes: 1_099_627_808,
+    // The generation state the loader asks for (LFM3_MAX_LENGTH), not the
+    // model's 262 144.
+    contextTokens: 32_768,
+    dialect: "lfm3",
+    backend: "lfm3-kernels",
+    // It reasons before it calls. The card asks for temperature 0.1, top_k 50
+    // and repetition_penalty 1.1, which is near enough greedy that the kernel
+    // path's greedy decode — the Space's own setting — stands in for it; only the
+    // length is honoured.
+    generation: { do_sample: false, max_new_tokens: 2048 },
+    note: "Liquid's newest, and the default: 1.7B, reasons before calling, ~1.1 GB download, on the webml-community WebGPU kernels. Locally: `make lfm3-kernels` for the engine, `make model` for the weights.",
+  },
   {
     key: "lfm2-1.2b-tool",
     label: "LFM2 1.2B Tool",
@@ -558,7 +593,7 @@ export const models: ModelEntry[] = [
   },
 ];
 
-export const DEFAULT_MODEL_KEY = "lfm2.5-2.6b";
+export const DEFAULT_MODEL_KEY = "lfm3-1.7b";
 
 // --------------------------------------------------------- the prefill chunk
 //

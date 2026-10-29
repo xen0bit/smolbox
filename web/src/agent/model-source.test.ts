@@ -43,7 +43,7 @@ describe("what each source can offer", () => {
     // Both engines are imports from /kernels/, which `make site` publishes with
     // the deployment (PLAN §10.28). Holding them back on the hub build is what
     // used to keep them out of the Pages dropdown.
-    for (const key of ["gemma4-e2b", "bonsai2-27b"]) {
+    for (const key of ["gemma4-e2b", "bonsai2-27b", "lfm3-1.7b"]) {
       expect(unavailableReason(modelFor(key), "hub"), key).toBeUndefined();
       expect(selectableModels("hub").map((m) => m.key)).toContain(key);
     }

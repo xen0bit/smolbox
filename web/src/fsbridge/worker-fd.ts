@@ -51,6 +51,30 @@ function resolveLink(symPath: string, target: string): string | null {
 }
 
 /**
+ * A Filestat that writes the WASI layout the guest actually reads.
+ *
+ * `filestat` is 64 bytes: dev@0, ino@8, filetype@16, nlink@24, size@32,
+ * atim@40, mtim@48, ctim@56. browser_wasi_shim 0.4.2 writes the three
+ * timestamps at 38, 46 and 52, so atim's low bytes land in the top of `size`
+ * and mtim is read from a window straddling two fields. That was harmless while
+ * every timestamp was zero, and stopped being harmless the moment §10.22 sent a
+ * real mtime: `ls -la` reported `hello.txt` as 8.2 EB, dated 2380, and a model
+ * repeated both to the user (PLAN §10.30).
+ */
+export class WasiFilestat extends wasi.Filestat {
+  override write_bytes(view: DataView, ptr: number): void {
+    view.setBigUint64(ptr, this.dev, true);
+    view.setBigUint64(ptr + 8, this.ino, true);
+    view.setUint8(ptr + 16, this.filetype);
+    view.setBigUint64(ptr + 24, this.nlink, true);
+    view.setBigUint64(ptr + 32, this.size, true);
+    view.setBigUint64(ptr + 40, this.atim, true);
+    view.setBigUint64(ptr + 48, this.mtim, true);
+    view.setBigUint64(ptr + 56, this.ctim, true);
+  }
+}
+
+/**
  * Fills in the three fields the shim's Filestat constructor does not take.
  *
  * `new wasi.Filestat(ino, filetype, size)` leaves `nlink` at 0 and all three
@@ -66,7 +90,7 @@ function resolveLink(symPath: string, target: string): string | null {
  * imprecise.
  */
 function toFilestat(st: StatResponse, path: string): wasi.Filestat {
-  const filestat = new wasi.Filestat(inoOf(path), st.filetype ?? 0, BigInt(st.size ?? 0));
+  const filestat = new WasiFilestat(inoOf(path), st.filetype ?? 0, BigInt(st.size ?? 0));
   filestat.nlink = BigInt(st.nlink ?? 1);
   if (st.mtimeMs !== undefined) {
     const ns = BigInt(Math.round(st.mtimeMs)) * 1_000_000n;

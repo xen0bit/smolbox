@@ -25,6 +25,7 @@ const partial: Record<string, string> = {
   gemma4: 'Let me look. <|tool_call>call:run_terminal_command{cmd:<|"|>ls',
   "qwen3.5": "Let me look. <tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls",
   bonsai: "thinking\n</think>\n\nLet me look. <tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls",
+  lfm3: "thinking</think>Let me look.\n<tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls",
 };
 
 describe("every dialect previews a partial turn", () => {
@@ -65,6 +66,7 @@ const complete: Record<string, string> = {
     "Let me look. <tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>",
   bonsai:
     "thinking\n</think>\n\nLet me look. <tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>",
+  lfm3: "thinking</think>Let me look.\n<tool_call>\n<function=run_terminal_command>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>",
 };
 
 const prose: Record<string, string> = {
@@ -75,6 +77,7 @@ const prose: Record<string, string> = {
   gemma4: "<|channel>thought\ncounting them<channel|>There are three files.",
   "qwen3.5": "<think>counting them</think>There are three files.",
   bonsai: "counting them\n</think>\n\nThere are three files.",
+  lfm3: "counting them</think>There are three files.",
 };
 
 describe("reasoning is previewed as reasoning, never as the answer", () => {

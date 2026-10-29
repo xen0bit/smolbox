@@ -1542,3 +1542,88 @@ host user can use it: the guest cannot write to the mount.
 
 What the readlink target still tells the guest is the host path an absolute link points at (for
 example `/home/<user>/…`). That is information, not access, and it was visible before this change.
+
+### 10.30 LFM3 1.7B on its WebGPU kernels, the new default, and a stat that lied about size (2026-10-29)
+
+**What LFM3 is, from the card and the file rather than the blog.** LiquidAI's LFM3-1.7B: 24 layers
+(13 gated short convolutions with kernel 7, 5 sliding-window attention layers with a 256 window, 6
+global), vocab 128 000, context 262 144, LFM Open License v1.0. The GGUF metadata agrees and adds
+what the card leaves out: bos `<|startoftext|>` (124894), eos `<|im_end|>` (124900), sampling
+`temp 0.1, top_k 50, penalty_repeat 1.1`. Liquid publishes seven GGUF packs at
+`LiquidAI/LFM3-1.7B-GGUF@bad5729b` and ONNX builds at `LiquidAI/LFM3-1.7B-ONNX` and
+`onnx-community/LFM3-1.7B-ONNX`, all sharded.
+
+**The optimized kernels exist, but not as a kernels Space.** There is no `lfm3-webgpu-kernels`.
+The engine ships inside webml-community's coding-agent demo, `LFM3-1.7B-WebGPU-Pi@3ad7ce87`, as
+`dist/runtime/Lfm3ForCausalLM.js`, a 1.07 MB module from the same runtime family as the Gemma and
+Bonsai engines. It reads the GGUF directly. Its tensor check accepts types 0/2/12/14 only (F32,
+Q4_0, Q4_K, Q6_K), so `Q4_K_M` (1.10 GB, the Space's default) and `QAD-Q4_0` load and the other five
+packs are refused before download. The entry is `Q4_K_M`. No ONNX entry was added: the kernel path
+is what was asked for, and an onnxruntime twin would be a second 1.3–1.6 GB entry to keep loadable.
+
+**Its front door hides the session.** `from_pretrained()` returns a wrapper class whose only state
+is a private `#e` holding the loaded session. Its public API is `create_session()`, the engine's
+own agent loop, which renders the template, parses calls and hands back messages. That is the layer
+smolbox replaces, and the dialect needs the raw text. The session behind `#e` already has
+KernelSession's shape: public `model`, `generationState`, `eosTokenIds`, `tokenizer`, `reset()`,
+`deviceInfo()`. So `make lfm3-kernels` adds `get _session(){return this.#e}` to the wrapper
+(`lfm3-expose.ts`). The match is structural (`class{#x;constructor(y){this.#x=y}` immediately
+followed by `create_session(`) and must hit exactly once, which it does in the pinned artifact. The
+engine also tunes a decode pipeline depth at load, and only its own `streamTokens` passes it on, so
+`wrapSession` forwards `decodePipelineDepth` to every `streamTokenIdsFromCache` call.
+
+**The grammar is Qwen3.5's; the thinking shape is LFM2.5's.** The card and the template both write
+`<tool_call>\n<function=…>\n<parameter=…>\n…\n</parameter>\n</function>\n</tool_call>`, and the
+generation prompt ends with a bare `<think>` (no newline). That is exactly what `bonsai` parses, so
+`lfm3` reuses its parser. The real model writes no whitespace around `</think>`:
+`…ls -la /mnt/host`.</think><tool_call>`.
+
+**History is raw, not split, and that is the template's doing.** LFM3's template renders an
+assistant turn as `<think>` + reasoning + `</think>` + content + calls, adding no whitespace of its
+own. Rebuilding a turn from parsed parts (Bonsai's `replayReasoning`) would have to reproduce the
+model's whitespace exactly, and the parser trims. Replaying the completion verbatim reproduces it by
+construction: the template emits content as-is. The one byte missing is the `<think>` the prompt
+opened, and `prepareHistory` restores it on any turn that closed its scratchpad. Two more things
+keep the prefix stable:
+
+- The template drops every scratchpad before the latest user message unless `preserve_thinking` is
+  set, which would rewrite the middle of the prompt each time the user speaks. The codec renders
+  with `preserve_thinking: true`, and the engine's own chat policy does the same.
+- Tool results go in as plain `tool` messages; the template wraps them in `<tool_response>`.
+
+`lfm3.test.ts` checks the invariant against the real template over two user turns, with a control
+for each half.
+
+**Measured, on an RTX 4070 Ti SUPER (Vulkan, `subgroups`, no `shader-f16`), local build.** The load
+took 7.3 s cold. The first question ("How many files…, and which one is the largest?") took four
+tool calls and 9.1 s in total, and the follow-up ("What does hello.txt say?") took one call and
+0.8 s. Every call parsed and ran. Cache reuse per prompt: 0/635 (first), 730/866, **0/1705**,
+1902/1937, 2041/2084 (across the new user message), 2274/2291 and 2364/2396. The one miss was not a
+text mismatch: re-rendering the captured history shows an exact text prefix at every step. It is
+the tokenizer. Re-encoding one 2.6 KB completion produced different ids from the ones the model
+sampled, so the id-level prefix broke and that turn was prefilled whole (1705 tokens, under a
+second here). The engine's own `create_session` ledger avoids this by keeping the sampled ids
+whenever their decode is a prefix of the new text. That trick belongs in the worker's codec path
+(it would help Bonsai too) and is left as a follow-up rather than changed here untested on Bonsai.
+`make test-e2e-agent` passes with LFM3 as the default. The dialect is `verified`, with the captured
+turns as `CAPTURED:` cases.
+
+**The stat that lied, found by the capture.** The model's answer gave `hello.txt` (21 bytes) as
+"8,286,623,314,361,712,661 bytes (~8.2 exabytes)", dated Nov 13 2380, and the next run said
+11 691 344 632 653 807 637 bytes, Apr 26 2272. In hex the first is `0x7300000000000015`: the real
+size with junk in its top bytes. The cause is upstream. browser_wasi_shim 0.4.2's
+`Filestat.write_bytes` puts `atim`/`mtim`/`ctim` at offsets 38/46/52, where the WASI `filestat`
+layout has them at 40/48/56. So `atim`'s two low bytes overwrite bytes 38–39 of `size`, and the guest
+reads `mtim` from a window straddling two fields. This stayed hidden for as long as every timestamp
+was zero. §10.22 made the mount send a real `lastModified`, and from then on every file in the
+browser mount had a corrupt size and date. It escaped notice because:
+
+- the §10.22 conformance case asserts the year is "not 1970", which 2380 satisfies;
+- the unit tests inspected the `Filestat` object, never the bytes;
+- wazero, the other driver, never touches the shim.
+
+The fix is a `WasiFilestat` subclass in `worker-fd.ts` that writes the real layout. A byte-level unit
+test reads it back at the WASI offsets, fails with the fix reverted, and has the upstream class as a
+control. The control needed a realistic, non-round mtime: a round one's low 16 bits of nanoseconds
+are zero and hide the bug. A new conformance case, run by both drivers, pins `stat -c %s` at 21 and
+`ls -l`'s size column and year (< 2100). Conformance cases 25 → 26.

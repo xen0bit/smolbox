@@ -394,6 +394,32 @@
       ]
     },
     {
+      "name": "mount: a file's size and date survive alongside its modification time",
+      "requires": [
+        "mount"
+      ],
+      "steps": [
+        {
+          "request": {
+            "cmd": "stat -c %s /mnt/host/hello.txt"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout": "21\n"
+          }
+        },
+        {
+          "request": {
+            "cmd": "ls -l --time-style=+%Y /mnt/host/hello.txt | awk '{ print ($5 == 21 && $6 < 2100) }'"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout": "1\n"
+          }
+        }
+      ]
+    },
+    {
       "name": "mount: KNOWN GAP — readdir has no d_type, so find does not recurse",
       "requires": [
         "mount"
