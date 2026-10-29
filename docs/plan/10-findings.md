@@ -1712,11 +1712,51 @@ yet proven.
 
 Why nothing caught it: CI caches `smolbox.wasm` by a hash of `vm/Dockerfile`, `guest/**`,
 `build/Dockerfile.c2w` and `go.mod`/`go.sum`, while Alpine's packages float under the pinned
-`alpine:3.21` digest. So the next PR that touches any of those inputs will rebuild into this hang in
-CI. This branch does not touch them, so CI and Pages keep the cached build, and the local gates for
-this work ran on that same build (`curl` from the Pages site, sha256 `5e8a9658…`). **Before the next
-guest change:** pin the packages (`apk add pcre2=10.43-r0` will not resolve once the repository
-drops it, so the robust fix is probably a snapshot repository or a vendored `.apk`), or find and fix
-the hang. The fresh build is kept outside the tree for whoever picks this up. Separately, a guest
-that misses its own `timeout_ms` means the agent's timeout depends on the VM still scheduling. That
-is worth a guard of its own.
+`alpine:3.21` digest. So the deployed build had simply not been rebuilt since the pcre2 update.
+**The pcre2 bump was the trigger, not the cause. §10.32 has the cause and the fix.**
+
+### 10.32 The guest agent could sleep through its own command finishing (2026-10-29)
+
+§10.31's hang, run to ground. Pinning `pcre2` back to `10.43-r0` made the case pass (r0: twice in
+4.8 s; r1: every run hits the 3-minute cap). Pinning would have been the wrong fix, though: r1 is
+seven CVE backports, and the trigger proved far more fragile than one library. Through a
+throwaway harness probe on the r1 image:
+
+| command (no `timeout_ms`) | result |
+|---|---|
+| `grep -rn nested /mnt/host` | hangs |
+| `grep -rn nested /mnt/host < /dev/null` | hangs |
+| `grep -F -rn nested /mnt/host` | 472 ms |
+| `LC_ALL=C grep -rn nested /mnt/host` | 415 ms |
+| `exec grep -rn nested /mnt/host` | 542 ms |
+| `grep -rn hello /mnt/host` | 645 ms |
+| the hanging command **with** `timeout_ms: 5000` | 416 ms |
+| same-length commands without grep | ~250 ms |
+
+The same grep runs natively under Docker in 0.7 s. Nothing in that table is a grep or pcre2 bug. It
+is a race whose window moves with memory layout and timing, and the last row says where it is.
+
+**The cause is `smolagentd`, not the image.** With no `timeout_ms`, `exec()` waited on a bare
+`<-waitCh`. At that moment the agent's Go runtime had no timers armed and every goroutine was
+blocked, so it parked in `epoll_wait(-1)`, with sysmon asleep as well. Finishing the command then
+depended on one epoll notification: `cmd.Wait` returns only after its pipe-copy goroutines see EOF,
+and those are woken through epoll. Under the emulator that wakeup can be lost. When it was, PID 1
+slept until the next byte arrived on stdin, and the host was waiting for the response before it
+would send one. That is why the VM sat idle and missed its own `timeout_ms`. With a timeout set,
+the armed timer made every `epoll_wait` finite, and the next poll found the event.
+
+**The fix:** `awaitWithHeartbeat` waits with a 50 ms ticker armed, on both branches (the post-kill
+wait in the timeout path had the same unbounded `<-waitCh`). The runtime can no longer block
+without a deadline, and a lost wakeup costs at most one tick. Measured on the r1 image rebuilt with
+the fix:
+
+- the case passes 3/3 in 4.8 s;
+- the full conformance table passes in 162 s;
+- integration, 80 Chromium e2e, Firefox and the GPU agent suite all pass.
+
+pcre2 stays at the patched r1. The change touches `guest/`, so it also rolls CI's wasm cache key,
+and CI rebuilds and tests the image from current packages rather than the cached one.
+
+Why the epoll notification is lost at all (emulated interrupt delivery, or the guest kernel's
+epoll on a pipe) is not established. The fix does not depend on knowing. Any agent code that
+blocks while waiting on the guest should do so with a timer armed.

@@ -115,6 +115,13 @@ Keep stdin as a persistent `os.Pipe` whose write end stays open for the VM's lif
 path mishandles it. End the session with the `shutdown` op (`Session.Close`), not by closing stdin;
 closing stdin is only the forced-termination fallback.
 
+### The guest agent never blocks without a timer armed
+`smolagentd` is PID 1 inside an emulator that can lose an epoll wakeup. A bare `<-waitCh` with no
+timer armed let the Go runtime park in `epoll_wait(-1)`, and a lost notification then hung the VM
+past its own `timeout_ms`. A pcre2 security update made it reproducible (PLAN §10.31–§10.32). Wait
+through `awaitWithHeartbeat`, or anything else that keeps a ticker armed, never on a bare channel.
+Do not "fix" a hang like this by pinning a package back.
+
 ### The read-only mount is enforced at the host FS boundary
 `internal/vm` mounts a read-only wazero `DirFS` wrapped in `confinedFS` (`internal/vm/confine.go`);
 the browser uses an `ERRNO_ROFS`-returning `Fd`. Writes surface in the guest as `can't create ...:
