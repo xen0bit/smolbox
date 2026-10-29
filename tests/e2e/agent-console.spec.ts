@@ -18,6 +18,7 @@ const mountDir = fileURLToPath(new URL("../../testdata/mount", import.meta.url))
 type AgentGlobal = {
   __smolagent?: {
     useFake(scripts: unknown[]): void;
+    setModel(key: string): void;
     bootVm(timeoutMs?: number): Promise<{ version: string }>;
     loadModel(local?: boolean): Promise<{ source: string }>;
     send(text: string): Promise<unknown[]>;
@@ -32,6 +33,8 @@ async function openPage(page: Page): Promise<void> {
 
 async function useFakeModel(page: Page): Promise<void> {
   const scripts = JSON.parse(await readFile(scriptsPath, "utf8")).scripts as unknown[];
+  // LFM2-family captures, so their dialect rather than the registry default's.
+  await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.setModel("lfm2.5-2.6b"));
   await page.evaluate((s) => (globalThis as AgentGlobal).__smolagent!.useFake(s), scripts);
 }
 

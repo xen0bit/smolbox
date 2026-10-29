@@ -14,7 +14,7 @@
 // "load the saved value on startup".
 
 import { DEFAULTS, type ConversationOptions } from "./conversation.ts";
-import { ModelCache, type CacheEntry } from "./model-cache.ts";
+import { ModelCache, type CacheEntry, clearEngineCaches, engineCaches } from "./model-cache.ts";
 import { generationDefaults, maxPromptChars, type GenerationDefaults, type ModelEntry } from "./models.ts";
 
 const CONFIG_KEY = "smolbox.config";
@@ -361,8 +361,15 @@ export class Settings {
     }
 
     const rows = [...byRepo.entries()].sort((a, b) => b[1].size - a[1].size);
-    list.replaceChildren(...rows.map(([repo, group]) => this.cacheRow(repo, group)));
-    if (rows.length === 0) {
+    const nodes = rows.map(([repo, group]) => this.cacheRow(repo, group));
+    // The GGUF engines cache their weights themselves, outside the store above;
+    // listed so the gigabyte is visible and clearable from the same place.
+    const engines = typeof indexedDB === "undefined" ? [] : await engineCaches(indexedDB);
+    if (engines.length > 0) {
+      nodes.push(this.engineRow());
+    }
+    list.replaceChildren(...nodes);
+    if (nodes.length === 0) {
       const empty = document.createElement("p");
       empty.className = "hint";
       empty.textContent = "nothing cached yet — load a model.";
@@ -401,6 +408,33 @@ export class Settings {
     return row;
   }
 
+  private engineRow(): Element {
+    const row = document.createElement("div");
+    row.className = "cache-row";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = "kernel engines (LFM3, Bonsai) · their own GGUF cache";
+    row.appendChild(name);
+    const size = document.createElement("span");
+    size.className = "size";
+    size.textContent = "in origin total";
+    row.appendChild(size);
+    const drop = document.createElement("button");
+    drop.setAttribute("type", "button");
+    drop.textContent = "clear";
+    drop.addEventListener("click", async () => {
+      drop.disabled = true;
+      const msg = document.getElementById("cache-msg");
+      const outcome = await clearEngineCaches(indexedDB);
+      await this.renderCache();
+      if (msg && outcome === "pending") {
+        msg.textContent = "the loaded engine holds its cache open; it is deleted on the next reload";
+      }
+    });
+    row.appendChild(drop);
+    return row;
+  }
+
   private async usage(entries: CacheEntry[]): Promise<string> {
     const cached = entries.reduce((n, e) => n + e.size, 0);
     try {
@@ -420,9 +454,12 @@ export class Settings {
       msg.textContent = "clearing…";
     }
     const dropped = await this.cache.clear();
+    const engines = typeof indexedDB === "undefined" ? "deleted" : await clearEngineCaches(indexedDB);
     await this.renderCache();
     if (msg) {
-      msg.textContent = `cleared ${dropped} file${dropped === 1 ? "" : "s"}`;
+      msg.textContent =
+        `cleared ${dropped} file${dropped === 1 ? "" : "s"}` +
+        (engines === "pending" ? "; the loaded engine's cache goes on the next reload" : "");
     }
   }
 }

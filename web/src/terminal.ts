@@ -18,6 +18,7 @@
 import type { Caps, Request, Response } from "./protocol.ts";
 import { OpExec, OpInfo } from "./protocol.ts";
 import { ExportError, formatBytes, readGuestFile, saveBytes, statGuestFile } from "./export.ts";
+import { Follower } from "./follow.ts";
 
 /** How the terminal reaches the VM. Both pages' Sessions satisfy this. */
 export interface TerminalSession {
@@ -92,6 +93,10 @@ function loadHistory(key: string | undefined): string[] {
 
 export class Terminal {
   private readonly scroll: Element;
+  // Scrollback follows new output only while the reader is at the bottom, the
+  // same rule as the chat log (follow.ts): a long `find` used to drag anyone
+  // reading earlier output back down with every line.
+  private readonly follow: Follower;
   private readonly ps1: Element;
   private readonly input: Element;
   private readonly session: TerminalSession;
@@ -121,6 +126,24 @@ export class Terminal {
 
     this.scroll = document.createElement("div");
     this.scroll.className = "term-scroll";
+    this.follow = new Follower(this.scroll);
+    this.scroll.addEventListener("scroll", () => this.follow.onScroll(), { passive: true });
+    this.scroll.addEventListener(
+      "wheel",
+      (ev) => {
+        if ((ev.deltaY ?? 0) < 0) {
+          this.follow.onUserScrollUp();
+        }
+      },
+      { passive: true },
+    );
+    // Keys reach here from the input inside: ArrowUp is history and Home moves
+    // the caret, so PageUp is the only key that means "scroll up".
+    this.scroll.addEventListener("keydown", (ev) => {
+      if (ev.key === "PageUp") {
+        this.follow.onUserScrollUp();
+      }
+    });
 
     this.ps1 = document.createElement("span");
     this.ps1.className = "term-ps1";
@@ -208,7 +231,7 @@ export class Terminal {
     // Always above the prompt, which is the last child and stays there.
     this.scroll.insertBefore(el, this.scroll.querySelector(".term-prompt"));
     this.trim();
-    this.scroll.scrollTop = this.scroll.scrollHeight;
+    this.follow.update();
     return el;
   }
 
@@ -333,6 +356,7 @@ export class Terminal {
     }
     const cmd = this.input.value.trim();
     this.input.value = "";
+    this.follow.jump();
 
     const builtin = parseBuiltin(cmd);
 

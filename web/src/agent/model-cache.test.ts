@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type CacheEntry,
+  ENGINE_CACHE_DBS,
   type IdbDatabaseLike,
   type IdbFactoryLike,
   type IdbKeyRangeLike,
@@ -9,6 +10,8 @@ import {
   type IdbRequestLike,
   type IdbTransactionLike,
   ModelCache,
+  clearEngineCaches,
+  engineCaches,
 } from "./model-cache.ts";
 
 // An in-memory IndexedDB, because bun has none and the cache is nothing but
@@ -430,5 +433,43 @@ describe("model cache housekeeping", () => {
     expect(await cache.clear()).toBe(2);
     expect(await cache.entries()).toEqual([]);
     expect(db.rowsOf("chunks").size).toBe(0);
+  });
+});
+
+describe("the kernel engines' own caches", () => {
+  function factory(opts: { listed?: string[]; blocked?: boolean }) {
+    const deleted: string[] = [];
+    const f = {
+      open: () => {
+        throw new Error("not used");
+      },
+      deleteDatabase(name: string) {
+        deleted.push(name);
+        const req = { result: undefined, error: null, onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null } as {
+          onsuccess: (() => void) | null;
+          onblocked: (() => void) | null;
+        } & Record<string, unknown>;
+        queueMicrotask(() => (opts.blocked ? req.onblocked?.() : req.onsuccess?.()));
+        return req as never;
+      },
+      ...(opts.listed ? { databases: async () => opts.listed!.map((name) => ({ name })) } : {}),
+    } as unknown as IdbFactoryLike;
+    return { f, deleted };
+  }
+
+  test("only the engine databases that exist are reported", async () => {
+    expect(await engineCaches(factory({ listed: ["smolbox-models", "gguf-cache-v1"] }).f)).toEqual(["gguf-cache-v1"]);
+    expect(await engineCaches(factory({ listed: ["smolbox-models"] }).f)).toEqual([]);
+  });
+
+  test("without databases() every known name is assumed present", async () => {
+    expect(await engineCaches(factory({}).f)).toEqual([...ENGINE_CACHE_DBS]);
+  });
+
+  test("clearing deletes them, and says so when a loaded engine holds one open", async () => {
+    const ok = factory({ listed: ["gguf-cache-v1"] });
+    expect(await clearEngineCaches(ok.f)).toBe("deleted");
+    expect(ok.deleted).toEqual(["gguf-cache-v1"]);
+    expect(await clearEngineCaches(factory({ listed: ["gguf-cache-v1"], blocked: true }).f)).toBe("pending");
   });
 });

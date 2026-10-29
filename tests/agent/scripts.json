@@ -113,6 +113,15 @@
       ]
     },
     {
+      "name": "the wrap-up turn after the cap: asked to answer, it answers",
+      "when": "used all the tool calls",
+      "turns": [
+        {
+          "text": "I printed 1, 2 and 3 before running out of tool calls.</think>The commands printed 1, 2 and 3."
+        }
+      ]
+    },
+    {
       "name": "slow turn, for the stop button",
       "when": "take your time",
       "turns": [

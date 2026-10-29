@@ -598,6 +598,35 @@ Two things the e2e suites read that must keep working: the per-file model progre
 (`[smolagent] loading <file>: <pct>%`, counted by `model-cache.spec.ts`) and the chips'
 `data-state` attribute (`settings.spec.ts`, `agent-console.spec.ts`).
 
+### The chat log follows the reader, not the stream
+Both the chat log and the terminal follow new output **only while the reader is already at the
+bottom** (`web/src/follow.ts`, unit-tested). They used to set `scrollTop = scrollHeight` on every
+append, so a reader who scrolled up mid-answer was thrown back down with every token. Scrolling up,
+a wheel tick upward or PageUp detaches; reaching the bottom, sending a message or the "↓ latest"
+button re-attaches. A wheel tick detaches *immediately*, not on the following `scroll` event — a
+token landing in between would otherwise yank the view back. Never reintroduce an unconditional
+scroll-to-bottom; call `follower.update()` after changing the log instead.
+
+Streamed tokens are coalesced into one render per animation frame (`scheduleRender`); every render
+rebuilds the bubble from the whole turn, so per-token rendering spends a fast model's main thread on
+layout. Anything that finishes a turn (`assistant`, `tool-start`, `error`, `stopped`) must
+`cancelRender()` first, or a stale frame repaints the preview over the parsed result.
+
+**The model's prose is markdown, rendered from nodes, never markup** (`markdown.ts`): every
+answer there is model text written after reading the user's folder, so `innerHTML` on this path
+would execute whatever a README contains. Reasoning and tool output stay plain text. Tool cards show
+`toolView(rendered)` — the streams without the `exit_code`/`<stdout>` scaffolding, which the card's
+label already carries — and fall back to the rendered text verbatim for any shape it does not
+recognise; `tool-view.test.ts` runs it over every case in `tests/tool/render-cases.json`.
+
+### At the cap, ask for an answer
+When a turn uses `maxIterations` tool calls, `Conversation.wrapUp()` adds `WRAP_UP_PROMPT` as a user
+turn (in history, not emitted as a `user` event) and generates once more; any call in that turn is
+not run. Before this, a model that double-checked once too often — LFM3 does — ended the turn on a
+tool result with no answer at all. A scripted turn for it in `tests/agent/scripts.json` matches on
+the prompt's text, because `FakeModelClient` starts a new script whenever the user-message count
+changes.
+
 ### The VM's phase is named by the worker, not guessed from its log line
 `web/src/vm-status.ts` owns the mapping from a phase to what either page shows, and
 `web/src/worker.ts` tags the phase onto the log message it already posts. Both pages used to work

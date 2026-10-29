@@ -1627,3 +1627,96 @@ test reads it back at the WASI offsets, fails with the fix reverted, and has the
 control. The control needed a realistic, non-round mtime: a round one's low 16 bits of nanoseconds
 are zero and hide the bug. A new conformance case, run by both drivers, pins `stat -c %s` at 21 and
 `ls -l`'s size column and year (< 2100). Conformance cases 25 → 26.
+
+### 10.31 The agent page as a product: scrolling, rendering, and the turn that never answered (2026-10-29)
+
+Driven with LFM3 1.7B on the RTX 4070 Ti SUPER (§10.30) through a scripted Playwright session,
+screenshotted before and after at 1280×800 and 390×844, rather than reviewed from the code.
+
+**The scroll hijack, reproduced.** Two seconds into a streamed answer, a 2000 px wheel upward left
+the log at `scrollTop 236` with `scrollHeight 714` and `clientHeight 478`, which is the bottom.
+Both the chat log and the terminal set `scrollTop = scrollHeight` on every append, which is every
+token. `web/src/follow.ts` now follows only while the reader is at the bottom (within 32 px).
+Leaving it detaches; arriving back, sending, or the "↓ latest" button re-attaches. Two details came
+out of the unit tests, not the design:
+
+- A wheel tick has to detach **immediately**, because a token can land between the gesture and its
+  `scroll` event, and that token's update would pull the view back.
+- The `scroll` event echoing our own pin must not count as the reader, because more content may
+  already have arrived by the time it fires.
+
+After the change, the same gesture leaves the reader where they scrolled for the rest of the turn.
+
+**What else the screenshots showed**, and what changed:
+
+- **Markdown shown raw.** Every model here answers in markdown, and the log printed `**1 file**`
+  and pipe-drawn tables verbatim. `markdown.ts` renders the subset these answers use (paragraphs,
+  lists, fenced and inline code, bold and italic, tables, quotes, headings demoted under the page's
+  own) from DOM nodes only. Model text is never parsed as HTML; a test pins a `<script>` in an
+  answer as text. Partial input is the normal case, because it re-renders every frame: an
+  unclosed fence runs to the end, and an unmatched `**` stays literal rather than becoming an empty
+  `<em>` (a bug the tests caught).
+- **A note card on nearly every turn.** "measured this conversation's real characters-per-token…"
+  arrived between the question and the answer each turn, and an adapter-limits card on each load.
+  Both now go to the console. The recoveries (`prompt-too-long`, `device-lost`) still get cards,
+  because something did go wrong there.
+- **Tool cards repeated themselves.** The label said `exit 0` and the body opened with
+  `exit_code: 0` and `<stdout>` tags. The card now shows the streams (stderr in red) with flags and
+  errors as notes, and scrolls sideways instead of wrapping, so `ls -l` columns stay columns on a
+  phone. `toolView` is checked over every case in `render-cases.json`, and falls back to the text
+  verbatim for any shape it does not recognise.
+- **The layout was a document.** The log was a 60vh box inside a scrolling page, the composer
+  scrolled off on short windows, and the settings button wrapped onto its own row. It is now an app
+  shell: the header and toolbar share one row (the model dropdown gives way first), and on a narrow
+  screen the controls move to their own row. The log takes the remaining height and the composer
+  stays pinned. The composer is a textarea that grows to 12rem: Enter sends, Shift+Enter adds a
+  newline, Esc stops. Send and stop share one slot.
+- **Nothing to look at while it thinks.** The reasoning summary was `thinking… (672 chars)`. It now
+  shows the latest line of the scratchpad, live. A line under the composer gives the phase (reading
+  the prompt, thinking, writing a tool call, running `cmd`, answering), the elapsed time and
+  tokens/second, then "done in N s".
+- **An empty box on arrival.** The welcome card explains the page and offers three example
+  questions. A click asks one if the page is ready, and otherwise fills it in.
+- **No way to start over** without reloading the page, even though every turn re-reads the whole
+  history. There is now a "new chat" button.
+- **The engine's weight cache was invisible.** The GGUF engines cache their weights in their own
+  IndexedDB (`gguf-cache-v1`, read from the bundle), so the storage panel neither listed LFM3's
+  1.1 GB nor cleared it. It now lists that cache and clears it with everything else. If the loaded
+  engine holds the database open, the delete completes on the next reload, and the panel says so.
+
+**The turn that never answered.** In one real run LFM3 found the answer in its first two commands,
+checked it three more times and hit `maxIterations` (5). The turn ended on "stopped: hit the
+tool-call limit", with the answer in a tool card and nowhere in the chat. `Conversation.wrapUp()`
+now adds one user turn at the cap (`WRAP_UP_PROMPT`: no more tools, answer from what you have) and
+generates once. A call made in that turn is not run. The nudge stays in the history, because the
+model saw it, but is not shown as something the person typed. The note then says the model answered
+at the limit rather than that it stopped.
+
+**A rebuilt VM that hangs on `grep -r`: image drift, found by rebuilding.** This work rebuilt
+`dist/smolbox.wasm` from unchanged inputs. With that build, the conformance case
+`grep -rn nested /mnt/host` hangs past the guest's own `timeout_ms`, with the VM idle, until Go's
+10-minute test timeout, on every run. The cause is the image:
+
+- The same case against the **deployed** wasm (CI's cached build) passes in 4.6 s, and the whole
+  table passes in 156 s.
+- It is not this branch: it hangs identically from a `main` worktree, and from a CLI built before
+  §10.29's `confinedFS`.
+- It is not load. An early theory blamed concurrent GPU and Chromium runs, and an idle-machine
+  rerun of the full table hung on the same case.
+
+Through `bin/smolbox exec` the same command is intermittent (it hung twice and then passed three
+times), so the trigger is timing-sensitive inside the guest. But only the fresh image ever hangs.
+`apk info -v` diffs the two images to exactly `pcre2 10.43-r0 → r1` and
+`python3 3.12.15 → 3.12.16`. GNU grep links pcre2, so the pcre2 bump is the prime suspect, not
+yet proven.
+
+Why nothing caught it: CI caches `smolbox.wasm` by a hash of `vm/Dockerfile`, `guest/**`,
+`build/Dockerfile.c2w` and `go.mod`/`go.sum`, while Alpine's packages float under the pinned
+`alpine:3.21` digest. So the next PR that touches any of those inputs will rebuild into this hang in
+CI. This branch does not touch them, so CI and Pages keep the cached build, and the local gates for
+this work ran on that same build (`curl` from the Pages site, sha256 `5e8a9658…`). **Before the next
+guest change:** pin the packages (`apk add pcre2=10.43-r0` will not resolve once the repository
+drops it, so the robust fix is probably a snapshot repository or a vendored `.apk`), or find and fix
+the hang. The fresh build is kept outside the tree for whoever picks this up. Separately, a guest
+that misses its own `timeout_ms` means the agent's timeout depends on the VM still scheduling. That
+is worth a guard of its own.

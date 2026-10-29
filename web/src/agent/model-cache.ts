@@ -55,7 +55,9 @@ export interface IdbDatabaseLike {
 
 export interface IdbFactoryLike {
   open(name: string, version?: number): IdbOpenRequestLike;
-  deleteDatabase(name: string): IdbRequestLike<unknown>;
+  deleteDatabase(name: string): IdbOpenRequestLike | IdbRequestLike<unknown>;
+  /** Not in every engine yet; absent means "cannot tell what exists". */
+  databases?(): Promise<{ name?: string }[]>;
 }
 
 export interface IdbKeyRangeLike {
@@ -472,4 +474,49 @@ export function requestPersistence(): void {
   } catch {
     // Not available (or blocked by policy). Nothing to do about it.
   }
+}
+
+/**
+ * The IndexedDB databases the GGUF kernel engines keep their own weights in.
+ *
+ * The LFM3 and Bonsai engines fetch their GGUF themselves and cache it in
+ * chunks under this name, outside ModelCache — so the storage panel did not
+ * list a gigabyte it was holding, and "clear all" left it on disk. Read from
+ * the engine bundle (`cacheName ?? "gguf-cache-v1"`), not guessed.
+ */
+export const ENGINE_CACHE_DBS: readonly string[] = ["gguf-cache-v1"];
+
+/** Which engine caches exist; every name, when the browser cannot list databases. */
+export async function engineCaches(factory: IdbFactoryLike): Promise<string[]> {
+  if (!factory.databases) {
+    return [...ENGINE_CACHE_DBS];
+  }
+  try {
+    const present = new Set((await factory.databases()).map((d) => d.name));
+    return ENGINE_CACHE_DBS.filter((n) => present.has(n));
+  } catch {
+    return [...ENGINE_CACHE_DBS];
+  }
+}
+
+/**
+ * Deletes the engine caches. Resolves `"deleted"`, or `"pending"` when a loaded
+ * engine still holds the database open — the browser finishes the delete once
+ * that connection closes, which in practice is the next reload.
+ */
+export async function clearEngineCaches(factory: IdbFactoryLike): Promise<"deleted" | "pending"> {
+  const outcomes = await Promise.all(
+    (await engineCaches(factory)).map(
+      (name) =>
+        new Promise<"deleted" | "pending">((resolve) => {
+          const req = factory.deleteDatabase(name);
+          req.onsuccess = () => resolve("deleted");
+          req.onerror = () => resolve("deleted");
+          if ("onblocked" in req) {
+            req.onblocked = () => resolve("pending");
+          }
+        }),
+    ),
+  );
+  return outcomes.includes("pending") ? "pending" : "deleted";
 }
