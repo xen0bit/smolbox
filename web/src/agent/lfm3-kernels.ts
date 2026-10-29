@@ -13,6 +13,11 @@
 //    engine's own agent API passes it on. The forward pass here is driven
 //    through `streamTokenIdsFromCache` directly, so the tuned depth is handed
 //    over explicitly — without it, every token waits on a readback.
+//  - The load reports ready while it is still building prefill graphs in the
+//    background, on the same cache the first prompt runs on. The engine's own
+//    page leaves a person typing in that gap; this one sends the first prompt
+//    the moment the model is ready, so the load waits for those builds instead
+//    (PLAN §10.33).
 //
 // The template needs two things from the codec, both for the same reason as
 // Bonsai's replayReasoning: the cache is a hybrid of attention and
@@ -82,6 +87,8 @@ export interface Lfm3Model {
   streamTokenIdsFromCache(
     opts: Parameters<KernelModel["streamTokenIdsFromCache"]>[0] & { decode_pipeline_depth?: number },
   ): AsyncIterable<number>;
+  /** The prefill-graph builds `from_pretrained` starts and does not wait for. */
+  warmRemainingPrefill?(cache: GenerationState["cache"]): Promise<void>;
 }
 
 /** The loaded session behind the wrapper, as far as this file uses it. */
@@ -91,6 +98,8 @@ export interface Lfm3Session {
   readonly eosTokenIds: number[];
   readonly tokenizer: GgufTokenizer;
   readonly decodePipelineDepth?: number;
+  /** Resolves with the engine's DeviceLostError when its device goes. */
+  readonly lost?: Promise<unknown>;
   deviceInfo(): DeviceInfo;
   reset(): void;
   dispose(): unknown;
@@ -148,7 +157,22 @@ export function wrapSession(session: Lfm3Session): KernelEngine {
     dispose: () => {
       void Promise.resolve(session.dispose()).catch(() => {});
     },
+    ...(session.lost ? { lost: session.lost } : {}),
   });
+}
+
+/**
+ * Waits out the prefill-graph builds the load left running.
+ *
+ * Its builds are pooled per block length, so this joins the ones in flight and
+ * starts the rest, and the first prompt then finds every graph already built
+ * rather than building its own beside them. Measured locally at ~0.3 s.
+ *
+ * A failed build is swallowed, as the engine swallows it: a prompt that needs
+ * that block will build it again and fail where the failure can be reported.
+ */
+export async function finishWarmup(session: Lfm3Session): Promise<void> {
+  await session.model.warmRemainingPrefill?.(session.generationState.cache).catch(() => {});
 }
 
 /** The loaded engine: the shared forward-pass driver plus this backend's codec. */
@@ -167,5 +191,6 @@ export async function loadLfm3(modelUrl: string, onProgress: (p: Lfm3Progress) =
         "`make lfm3-kernels`, which adds it (lfm3-expose.ts)",
     );
   }
+  await finishWarmup(session);
   return { engine: wrapSession(session), codec: lfm3Codec(session.tokenizer) };
 }
