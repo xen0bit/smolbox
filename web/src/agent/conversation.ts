@@ -90,6 +90,16 @@ export type AgentEvent =
       was: number;
       chars: number;
     }
+  | {
+      /**
+       * The device died at `chars` characters of prompt and the loop is
+       * retrying at the same size, because this engine's memory does not depend
+       * on the prompt (`shrinkOnDeviceLoss` is off). The retry pays for a reload.
+       */
+      kind: "retry";
+      reason: "device-lost";
+      chars: number;
+    }
   | { kind: "stopped"; reason: "iteration-cap" | "cancelled" }
   | { kind: "error"; message: string };
 
@@ -118,6 +128,13 @@ export interface ConversationOptions {
    * page is in until someone opens the settings panel and changes something.
    */
   generation: Partial<GenerationDefaults>;
+  /**
+   * Whether a device loss lowers the prompt budget before the retry.
+   *
+   * Only meaningful where a shorter prompt allocates less (models.ts
+   * promptSizesAllocation); elsewhere the retry runs at the same size.
+   */
+  shrinkOnDeviceLoss: boolean;
 }
 
 // Budgets are counted in characters, not tokens: the tokenizer lives in the
@@ -127,6 +144,7 @@ export { CHARS_PER_TOKEN_ESTIMATE } from "./models.ts";
 
 export const DEFAULTS: Omit<ConversationOptions, "systemPrompt" | "tools" | "dialect"> = {
   generation: {},
+  shrinkOnDeviceLoss: true,
   maxIterations: 5,
   // Three orders of magnitude below the protocol's 1 MiB default. A model that
   // needs more than this from one command should narrow the command; `truncated`
@@ -460,6 +478,10 @@ export class Conversation {
             return undefined;
           }
           retried.add(code);
+          if (code === "device-lost" && !this.opts.shrinkOnDeviceLoss) {
+            this.emit({ kind: "retry", reason: code, chars: sent });
+            continue;
+          }
           this.shrinkBudget(code, err as ModelError, sent);
           continue;
         }

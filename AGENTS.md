@@ -323,6 +323,13 @@ entry without one. Do not restore a flat default shared across checkpoints; that
 every prompt. The worker's exact token check (`prompt-too-long`, which the loop elides to and retries
 once) is the guarantee; the character budget is only the guardrail in front of it.
 
+**That whole rule is about onnxruntime.** The kernel engines allocate their generation state at load
+and prefill through pre-built graphs, so a shorter prompt frees nothing there.
+`promptSizesAllocation(entry)` is false for them, and a device loss retries once at the same size
+without saving a ceiling. Halving it instead left LFM3 with a saved 1218-char budget, under its own
+system prompt (§10.34). `KernelEngine.stream` clamps `max_new_tokens` to the cache's remaining room,
+because the engine throws rather than stopping at the end.
+
 ### The agent loop: budgets belong to the request, not to the arguments
 `Conversation` caps output per call, but it passes the budget to the `ToolRunner` — it must never
 write `max_output` into the model's argument object. Template tools declare their own parameters and
@@ -435,6 +442,10 @@ loader sets `QWEN35_NO_PREFILL_GRAPH=1` on those adapters only (measured 37 → 
 - **A device loss can hide inside an `AggregateError`.** The pipelined decode wraps it with its
   cleanup failure, so classify failures with `isDeviceLoss` (`device-loss.ts`), which searches the
   whole error tree. Never test only `err.message`, or the reload-and-retry path never runs.
+- **The cache is allocated at load, for `LFM3_MAX_LENGTH` positions, and held.** That is
+  `AGENT_WORKING_TOKENS` plus one reply (10 240), not the Space's 32 768: the extra 22 528
+  positions were 528 MiB of GPU memory that no turn could reach (§10.34). Do not raise it without
+  raising the prompt ceiling it serves, and `lfm3-kernels.test.ts` holds the sum.
 
 The engine refuses any GGUF tensor type but F32, Q4_0, Q4_K and Q6_K, so of Liquid's seven packs
 only `Q4_K_M` (the entry) and `QAD-Q4_0` load.

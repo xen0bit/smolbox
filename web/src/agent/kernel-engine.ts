@@ -16,7 +16,12 @@
 import { commonPrefix } from "./prefix.ts";
 
 export interface GenerationState {
-  cache: { truncate(n: number): void };
+  /**
+   * `maxLength` is the positions the engine allocated at load. The engine
+   * refuses a run whose prompt plus `max_new_tokens` would pass it, rather than
+   * stopping at the end of the cache, so {@link KernelEngine.stream} clamps.
+   */
+  cache: { truncate(n: number): void; readonly maxLength?: number };
 }
 
 export interface KernelModel {
@@ -123,6 +128,11 @@ export class KernelEngine {
       // the forward pass, so start it over rather than prefill an empty batch.
       this.model.reset();
       fresh = promptIds.slice();
+    }
+
+    const capacity = this.model.generationState.cache.maxLength;
+    if (capacity !== undefined && capacity > promptIds.length) {
+      maxNewTokens = Math.min(maxNewTokens, capacity - promptIds.length);
     }
 
     const produced: number[] = [];

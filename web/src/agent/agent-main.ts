@@ -427,6 +427,15 @@ function onEvent(ev: AgentEvent): void {
           `${ev.chars}-char budget.`;
       }
       break;
+    case "retry":
+      cancelRender();
+      endStream();
+      status.model("loading", "rebuilding after a GPU error");
+      bubble("note", "gpu")!.textContent =
+        `the GPU device was lost running ~${ev.chars} chars of prompt, which takes the inference session ` +
+        `with it. Rebuilding it and retrying this turn once; this engine allocates the same memory ` +
+        `whatever the prompt, so the budget stays where it is.`;
+      break;
     case "stopped":
       cancelRender();
       endStream();

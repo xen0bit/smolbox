@@ -359,6 +359,32 @@ test.describe("agent chat loop", () => {
       await expect(page.locator(budgetInput)).toHaveValue(String(budget.chars!));
     });
 
+    // PLAN §10.34. The kernel engines allocate everything at load, so a loss
+    // there says nothing about prompt size; halving the budget used to leave
+    // LFM3 with 1218 chars, under its own system prompt, on that machine for good.
+    test("on an engine that allocates at load, a device loss retries at the same size", async ({ page }) => {
+      await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.setModel("lfm3-1.7b"));
+      const before = await page.locator(budgetInput).inputValue();
+      const events = await send(page, "gpu dies now");
+
+      expect(events.find((e) => e.kind === "assistant")?.text).toContain("second attempt");
+      expect(kinds(events)).not.toContain("error");
+      expect(kinds(events)).not.toContain("budget");
+      expect(kinds(events)).toContain("retry");
+      await expect(page.locator("#log .msg.note").last()).toContainText("the budget stays where it is");
+      await expect(page.locator(budgetInput)).toHaveValue(before);
+      expect(await learned(page)).toBeNull();
+    });
+
+    test("a ceiling an older build saved for a kernel engine is ignored", async ({ page }) => {
+      await page.evaluate(() => localStorage.setItem("smolbox.prefill-ceilings", JSON.stringify({ "lfm3-1.7b": 1218 })));
+      await page.reload();
+      await page.waitForFunction(() => Boolean((globalThis as AgentGlobal).__smolagent));
+      await page.evaluate(() => (globalThis as AgentGlobal).__smolagent!.setModel("lfm3-1.7b"));
+      // maxPromptTokens (8192) at CHARS_PER_TOKEN_ESTIMATE (4).
+      await expect(page.locator(budgetInput)).toHaveValue("32768");
+    });
+
     test("a refusal the estimate believed was in budget still shrinks the prompt", async ({ page }) => {
       const events = await send(page, "too long for you");
 

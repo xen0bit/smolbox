@@ -3,16 +3,24 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { type Lfm3Session, finishWarmup, wrapSession } from "./lfm3-kernels.ts";
+import {
+  LFM3_MAX_LENGTH,
+  LFM3_MAX_NEW_TOKENS,
+  type Lfm3Session,
+  finishWarmup,
+  wrapSession,
+} from "./lfm3-kernels.ts";
+import { maxPromptTokens, modelFor, promptSizesAllocation } from "./models.ts";
 
 function fakeSession(over: Partial<Lfm3Session> & { warm?: () => Promise<void> } = {}) {
-  const seen: { depth?: number; warmedOn?: unknown } = {};
-  const cache = { truncate: () => {} };
+  const seen: { depth?: number; maxNew?: number; warmedOn?: unknown } = {};
+  const cache: { truncate(): void; maxLength?: number } = { truncate: () => {} };
   const session: Lfm3Session = {
     model: {
       // eslint-disable-next-line require-yield
       async *streamTokenIdsFromCache(opts) {
         seen.depth = opts.decode_pipeline_depth;
+        seen.maxNew = opts.max_new_tokens;
       },
       warmRemainingPrefill: async (c) => {
         seen.warmedOn = c;
@@ -80,5 +88,40 @@ describe("finishWarmup", () => {
     const { session } = fakeSession();
     delete (session.model as { warmRemainingPrefill?: unknown }).warmRemainingPrefill;
     await expect(finishWarmup(session)).resolves.toBeUndefined();
+  });
+});
+
+describe("the generation state's size", () => {
+  // The engine allocates the whole cache at load, so every position past what a
+  // turn can reach is GPU memory held for nothing: 768 MiB at the Space's 32 768
+  // against 240 MiB here, measured (PLAN §10.34).
+  test("holds the longest prompt the worker sends plus one full reply, and no more", () => {
+    const entry = modelFor("lfm3-1.7b");
+    expect(entry.generation?.max_new_tokens).toBe(LFM3_MAX_NEW_TOKENS);
+    expect(LFM3_MAX_LENGTH).toBe(maxPromptTokens(entry) + LFM3_MAX_NEW_TOKENS);
+    expect(entry.contextTokens).toBe(LFM3_MAX_LENGTH);
+  });
+
+  test("a reply is clamped to the room the cache has left", async () => {
+    const { session, seen, cache } = fakeSession();
+    cache.maxLength = 10;
+    for await (const _ of wrapSession(session).stream([1, 2, 3, 4, 5, 6], 2048, () => false)) {
+      // nothing is yielded
+    }
+    expect(seen.maxNew).toBe(4);
+  });
+
+  test("a reply that fits is left alone", async () => {
+    const { session, seen, cache } = fakeSession();
+    cache.maxLength = LFM3_MAX_LENGTH;
+    for await (const _ of wrapSession(session).stream([1, 2], 2048, () => false)) {
+      // nothing is yielded
+    }
+    expect(seen.maxNew).toBe(2048);
+  });
+
+  test("a device loss on this engine is not a prompt-size problem", () => {
+    expect(promptSizesAllocation(modelFor("lfm3-1.7b"))).toBe(false);
+    expect(promptSizesAllocation(modelFor("lfm2.5-2.6b"))).toBe(true);
   });
 });
