@@ -580,6 +580,39 @@ describe("Conversation", () => {
     expect(events.some((e) => e.kind === "error")).toBe(false);
   });
 
+  // The LFM3 report: a bare "Test" lost the device, the retry halved a budget
+  // the prompt was never what filled, and the page saved 1218 chars for good —
+  // under the system prompt and tool schema alone (PLAN §10.34).
+  test("a device loss on an engine that allocates at load retries at the same size", async () => {
+    const events: AgentEvent[] = [];
+    const seen: number[] = [];
+    const convo = new Conversation(
+      { systemPrompt: "sys", tools: [], dialect: lfm2, ...DEFAULTS, promptBudgetChars: 12_580, shrinkOnDeviceLoss: false },
+      {
+        load: async () => ({ source: "fake", loadMs: 0 }),
+        generate: async (req) => {
+          seen.push(req.messages.reduce((n, m) => n + m.content.length, 0));
+          if (seen.length === 1) {
+            throw new ModelError("the GPU rejected this run", "device-lost");
+          }
+          return { text: "ok", tokens: 1, ms: 0, stopped: false };
+        },
+        cancel: () => {},
+      },
+      { run: async () => ({ text: "", exitCode: 0 }) },
+      (e) => events.push(e),
+    );
+
+    await convo.send("go");
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe(seen[0]);
+    expect(convo.options().promptBudgetChars).toBe(12_580);
+    expect(kinds(events)).not.toContain("budget");
+    expect(events).toContainEqual({ kind: "retry", reason: "device-lost", chars: seen[0]! + 2 });
+    expect(events.some((e) => e.kind === "assistant" && e.text === "ok")).toBe(true);
+  });
+
   test("a device that dies twice ends the turn instead of rebuilding forever", async () => {
     const events: AgentEvent[] = [];
     let calls = 0;

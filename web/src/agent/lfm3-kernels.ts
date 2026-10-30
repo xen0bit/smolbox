@@ -29,18 +29,25 @@ import { asset } from "../base.ts";
 import { type DeviceInfo, type GenerationState, type KernelModel, KernelEngine } from "./kernel-engine.ts";
 import { SESSION_ACCESSOR } from "./lfm3-expose.ts";
 import type { ChatMessage } from "./messages.ts";
+import { AGENT_WORKING_TOKENS } from "./models.ts";
 import { type GgufTokenizer, type PromptCodec, codecFor } from "./prompt-codec.ts";
 
 /** Where `make lfm3-kernels` puts the engine, under the site's base. */
 export const LFM3_BUNDLE_PATH = asset("kernels/lfm3/Lfm3ForCausalLM.js");
 
+/** The registry entry's `max_new_tokens`, which the capacity below must hold. */
+export const LFM3_MAX_NEW_TOKENS = 2048;
+
 /**
- * The generation state's capacity, in positions.
+ * The generation state's capacity, in positions: the longest prompt the worker
+ * will send (AGENT_WORKING_TOKENS) plus one full reply, and no more.
  *
- * The Space's own setting. The engine may lower it to fit the device; the agent
- * page's prompt ceiling (AGENT_WORKING_TOKENS) sits well under it either way.
+ * The engine allocates the whole KV cache for this many positions at load and
+ * holds it for the session, so every position past what a turn can reach is
+ * GPU memory spent on nothing. The Space's 32 768 cost 768 MiB of f32 cache;
+ * this costs 240 MiB. PLAN §10.34.
  */
-export const LFM3_MAX_LENGTH = 32_768;
+export const LFM3_MAX_LENGTH = AGENT_WORKING_TOKENS + LFM3_MAX_NEW_TOKENS;
 
 /** Template variables every prompt is rendered with. */
 export const LFM3_TEMPLATE_ARGS = {

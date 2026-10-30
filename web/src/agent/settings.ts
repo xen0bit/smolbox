@@ -15,7 +15,13 @@
 
 import { DEFAULTS, type ConversationOptions } from "./conversation.ts";
 import { ModelCache, type CacheEntry, clearEngineCaches, engineCaches } from "./model-cache.ts";
-import { generationDefaults, maxPromptChars, type GenerationDefaults, type ModelEntry } from "./models.ts";
+import {
+  generationDefaults,
+  maxPromptChars,
+  promptSizesAllocation,
+  type GenerationDefaults,
+  type ModelEntry,
+} from "./models.ts";
 
 const CONFIG_KEY = "smolbox.config";
 /**
@@ -127,6 +133,7 @@ export class Settings {
       // Only the overrides travel. Sending the model's own numbers back would
       // pin the next checkpoint to this one's sampling.
       generation: this.overrides(),
+      shrinkOnDeviceLoss: promptSizesAllocation(entry),
     };
     this.host.configure(patch);
     this.render(entry);
@@ -170,6 +177,12 @@ export class Settings {
         // prefill removed the allocation those reports were actually about, so
         // this should now only ever be the model's number — the learned one
         // stays because "should" is not a measurement.
+        // Never for an engine whose memory does not follow the prompt: a ceiling
+        // learned there is a loss the prompt did not cause (PLAN §10.34), and
+        // older builds saved one anyway.
+        if (!promptSizesAllocation(entry)) {
+          return maxPromptChars(entry);
+        }
         return Math.min(maxPromptChars(entry), this.ceilings.get(entry.key) ?? Infinity);
       default: {
         const value = generationDefaults(entry)[knob as keyof GenerationDefaults];
@@ -269,6 +282,9 @@ export class Settings {
    */
   recordDeviceCeiling(chars: number): void {
     const entry = this.host.model();
+    if (!promptSizesAllocation(entry)) {
+      return;
+    }
     const known = this.ceilings.get(entry.key);
     // Only ever downwards. A later, larger failure says nothing new: the small
     // number is the one that has survived, and a device that suddenly has more

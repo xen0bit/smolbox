@@ -1799,3 +1799,53 @@ that hardware. The decisive check is whether the engine's own Space
 (`webml-community/LFM3-1.7B-WebGPU-Pi`) survives the same prompt on the same machine. If it does
 not, the fault is upstream, and the recognised loss above is what keeps the page usable: reload,
 retry once, and a clear message if the retry dies too.
+
+### 10.34 LFM3 held 768 MiB of cache it could never reach, and a device loss starved its budget (2026-10-30)
+
+**The report.** The deployed site: LFM3 loads, the user sends "Test", and the device is lost
+(`Pipelined generation and in-flight cleanup both failed … mapAsync … Device is lost`). The page
+then said it was retrying "with a 1218-char budget; this model will start there on this machine
+from now on", and the retry died too. LFM2.5 2.6B keeps working for the same users. It read as a
+context that was too small. It was not: the prompt was ~2437 chars, nowhere near any ceiling.
+
+**What a session holds, measured.** RTX 4070 Ti SUPER (no `shader-f16`, so f32 cache), the same
+"Test" turn. Live GPU buffers were counted by wrapping `GPUDevice.prototype.createBuffer` in the
+model worker; VRAM is `nvidia-smi` over the idle baseline, sampled every 250 ms.
+
+| | live buffers after load | peak live buffers | VRAM peak |
+|---|---|---|---|
+| LFM2.5 2.6B q4 (onnxruntime) | 1769 MiB | ~2838 MiB | 2928 MiB |
+| LFM3 1.7B, `maxLength` 32 768 | 2034 MiB | 2034 MiB | 2146 MiB |
+| LFM3 1.7B, `maxLength` 10 240 | 1490 MiB | 1490 MiB | 1611 MiB |
+
+LFM3's 2034 MiB was 1062 MiB of weights (`tensor-output`, about the GGUF's size), **768 MiB of KV
+cache** (`llama-cache-keys`/`-values`, one buffer each), 147 MiB of prefill graph slots, and ~57 MiB
+of the rest. The cache is `6 full-attention layers × maxLength × 4 KV heads × 128 × 4 B`, twice,
+allocated by `from_pretrained` for the whole session. We asked for 32 768 positions. The worker
+never sends a prompt over `AGENT_WORKING_TOKENS` (8192), and a reply is 2048 tokens, so 22 528 of
+those positions could never be reached. `LFM3_MAX_LENGTH` is now `AGENT_WORKING_TOKENS +
+LFM3_MAX_NEW_TOKENS` = 10 240, which makes the cache 240 MiB, with `lfm3-kernels.test.ts` holding
+the sum to the registry. On this adapter LFM3 now peaks 45% under LFM2.5.
+
+Note that LFM3's peak was *already* under LFM2.5's here. The difference is shape, not total.
+onnxruntime grows into its peak per run and gives memory back, while the kernel engine holds all
+of it from load, including two single 384 MiB buffers. Whether that is what kills a smaller GPU,
+or the f16 kernels fault there on their own (§10.33), is still not established. Trimming the cache
+answers the part that was ours either way.
+
+**The budget that a device loss halved.** Shrinking the prompt after a loss is §10.10's answer to
+onnxruntime, where a run allocates in proportion to its prompt. The kernel engines allocate their
+generation state at load and prefill through pre-built graphs, so a shorter prompt frees nothing.
+Halving it there bought no memory. It also saved 1218 chars as this machine's ceiling, which is
+under the system prompt and tool schema alone, so every later LFM3 session on that browser would
+start starved. `promptSizesAllocation(entry)` (models.ts) now answers "does a shorter prompt
+allocate less", and is false for every kernel backend. Where it is false, the loop retries a
+device loss once at the same size, emits `retry` rather than `budget`, and records no ceiling.
+Settings also ignores a ceiling an older build already saved for such an entry.
+
+**A cache overflow the engine's own API avoids.** `streamTokenIdsFromCache` throws when `cache
+length + input + max_new_tokens > maxLength`, rather than stopping at the end of the cache. The
+engine's chat API clamps the reply first, but the forward pass we drive did not. Gemma 4 and Bonsai
+pass no `maxLength` and get the engine's default of 8192, so an 8192-token prompt with a 2048-token
+reply would have thrown there. `KernelEngine.stream` now clamps `max_new_tokens` to the room the
+cache has left.

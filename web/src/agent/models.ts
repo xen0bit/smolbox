@@ -269,8 +269,8 @@ export const models: ModelEntry[] = [
     dtypes: ["q4"],
     approxBytes: 1_099_627_808,
     // The generation state the loader asks for (LFM3_MAX_LENGTH), not the
-    // model's 262 144.
-    contextTokens: 32_768,
+    // model's 262 144: the engine allocates all of it at load. PLAN §10.34.
+    contextTokens: 10_240,
     dialect: "lfm3",
     backend: "lfm3-kernels",
     // It reasons before it calls. The card asks for temperature 0.1, top_k 50
@@ -677,6 +677,20 @@ export function prefillChunkTokens(
   }
   const fits = Math.floor(budgetBytes / (entry.vocabSize * BYTES_PER_LOGIT));
   return Math.min(AGENT_WORKING_TOKENS, Math.max(MIN_PREFILL_CHUNK_TOKENS, fits));
+}
+
+/**
+ * Whether a shorter prompt makes this checkpoint's runs allocate less.
+ *
+ * True for onnxruntime, which sizes each run's KV cache and activations to the
+ * prompt, so a device lost at one size may survive at a smaller one (§10.10).
+ * False for the kernel engines: they allocate their whole generation state for
+ * a fixed capacity at load and run prefill through pre-built graphs, so what a
+ * run holds does not depend on the prompt. Shrinking the budget after a loss
+ * there saves nothing and starves every later turn (PLAN §10.34).
+ */
+export function promptSizesAllocation(entry: ModelEntry): boolean {
+  return (entry.backend ?? "transformers") === "transformers";
 }
 
 /**
